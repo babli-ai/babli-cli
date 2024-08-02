@@ -706,6 +706,10 @@ var name = "babli";
 var version = "0.0.7";
 var type = "module";
 var license = "MIT";
+var repository = {
+	type: "git",
+	url: "https://github.com/babli-ai/babli-cli.git"
+};
 var bin = {
 	babli: "./dist/index.js"
 };
@@ -727,6 +731,7 @@ var packageJson = {
 	version: version,
 	type: type,
 	license: license,
+	repository: repository,
 	bin: bin,
 	scripts: scripts,
 	dependencies: dependencies
