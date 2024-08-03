@@ -703,7 +703,7 @@ ${Bold}Different translations were found on server and local:${Reset}`
 }
 
 var name = "babli";
-var version = "0.0.7";
+var version = "0.0.8";
 var type = "module";
 var license = "MIT";
 var repository = {

@@ -17,6 +17,11 @@ When you have new keys to translate. Add them to one of your translation files. 
 npm install -g babli
 ```
 
+## Use in CI
+
+- set `BABLI_API_KEY` env variable (find it in your project settings)
+- run `babli pull` to pull translations from babli.ai
+
 ## Automatic Setup (coming soon)
 
 create new Babli.ai project and connect it to your local project
