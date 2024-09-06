@@ -465,7 +465,7 @@ async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNames
               key: key.key,
               value: value ?? null,
               description: key.server?.description,
-              meta: {}
+              meta: key.local?.meta ?? {}
             });
           }
         }
@@ -503,14 +503,17 @@ async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNames
     keysToPullByFile
   )) {
     const res = generateTranslationFile(
-      keys.map(({ key, value, description, meta }) => [
-        key,
-        {
-          value,
-          description,
-          meta
-        }
-      ]),
+      keys.map(({ key, value, description, meta }) => {
+        console.log("META", meta);
+        return [
+          key,
+          {
+            value,
+            description,
+            meta
+          }
+        ];
+      }),
       fileFormat,
       lang,
       usedConfig
@@ -996,7 +999,7 @@ class AllLanguagesGatherer {
 }
 
 var name = "babli";
-var version = "0.0.9";
+var version = "0.0.10";
 var type = "module";
 var license = "MIT";
 var repository = {
