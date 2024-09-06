@@ -22,62 +22,54 @@
         "translationFiles": {
           "type": "array",
           "items": {
-            "anyOf": [
-              {
-                "type": "object",
-                "properties": {
-                  "pattern": {
-                    "type": "string"
-                  },
-                  "languages": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "required": [
-                  "pattern"
-                ],
-                "additionalProperties": false
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
               },
-              {
+              "languages": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "format": {
+                "type": "string",
+                "enum": [
+                  "json",
+                  "yaml",
+                  "flutterArb",
+                  "typescript"
+                ]
+              },
+              "nested": {
+                "type": "boolean",
+                "default": true
+              },
+              "topLevelLanguageCode": {
+                "type": "boolean",
+                "default": false
+              },
+              "pullWithEmptyValues": {
+                "type": "boolean",
+                "default": false
+              },
+              "yaml": {
                 "type": "object",
                 "properties": {
-                  "path": {
-                    "type": "string"
-                  },
-                  "language": {
+                  "version": {
                     "type": "string"
                   }
                 },
-                "required": [
-                  "path",
-                  "language"
-                ],
-                "additionalProperties": false
+                "additionalProperties": false,
+                "default": {}
               }
-            ]
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
           }
-        },
-        "fileFormat": {
-          "type": "string",
-          "enum": [
-            "json",
-            "json-nested",
-            "flutterArb",
-            "typescript",
-            "yaml-nested"
-          ]
-        },
-        "fileOptions": {
-          "type": "object",
-          "properties": {
-            "topLevelLanguageCode": {
-              "type": "boolean"
-            }
-          },
-          "additionalProperties": false
         },
         "defaultFile": {
           "type": "string"
@@ -92,8 +84,7 @@
       },
       "required": [
         "projectId",
-        "translationFiles",
-        "$schema"
+        "translationFiles"
       ],
       "additionalProperties": false
     }
