@@ -63,6 +63,15 @@
                 },
                 "additionalProperties": false,
                 "default": {}
+              },
+              "sortBy": {
+                "type": "string",
+                "enum": [
+                  "key",
+                  "value",
+                  "original"
+                ],
+                "default": "original"
               }
             },
             "required": [

@@ -3,19 +3,20 @@
 // THIS FILE IS GENERATED:
 // This project/repo is generated from Babli.ai internal monorepo. It is intended for read-only use. You can file issues here. PRs are welcome, but will need to be manually migrated to the monorepo.
 
-import fs from 'fs/promises';
+import * as fs from 'fs/promises';
+import fs__default from 'fs/promises';
 import Parser from 'web-tree-sitter';
 import yaml from 'js-yaml';
 import { stringify, parse } from 'yaml';
-import { confirm, select } from '@inquirer/prompts';
 import { Command } from 'commander';
-import { glob } from 'glob';
 import path from 'path';
 import * as minimatch from 'minimatch';
 import open from 'open';
 import { z } from 'zod';
 import { fromError } from 'zod-validation-error';
 import { env } from 'process';
+import { confirm, select } from '@inquirer/prompts';
+import { glob } from 'glob';
 
 const Reset = "\x1B[0m";
 const Bold = "\x1B[1m";
@@ -433,9 +434,32 @@ function generateFlutterArb(keys, localeCode) {
   return JSON.stringify(arbStructure, null, 2);
 }
 
+const KEY = 0;
+const VALUE = 1;
+function sortKeys({
+  sortBy,
+  keys
+}) {
+  if (sortBy === "original") {
+    return keys;
+  }
+  if (sortBy === "key") {
+    return keys.sort((a, b) => a[KEY].localeCompare(b[KEY]));
+  }
+  if (sortBy === "value") {
+    return keys.sort((a, b) => {
+      const aValue = a[VALUE].value ?? "";
+      const bValue = b[VALUE].value ?? "";
+      return aValue.localeCompare(bValue);
+    });
+  }
+  return keys;
+}
+
 async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNamespace, translationFilesConfig, allLanguages) {
   const keysToPullByFile = {};
   translationFilesConfig.forEach((fileConfig) => {
+    fileConfig.sortBy;
     const languages = fileConfig.languages ?? allLanguages.map((l) => l.code);
     languages.forEach((lang) => {
       const pathWithLang = fileConfig.path.replace("{{lang}}", lang);
@@ -502,9 +526,8 @@ async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNames
   for (const [file, { keys, lang, fileFormat, usedConfig }] of Object.entries(
     keysToPullByFile
   )) {
-    const res = generateTranslationFile(
-      keys.map(({ key, value, description, meta }) => {
-        console.log("META", meta);
+    const keysToUse = keys.map(
+      ({ key, value, description, meta }) => {
         return [
           key,
           {
@@ -513,7 +536,10 @@ async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNames
             meta
           }
         ];
-      }),
+      }
+    );
+    const res = generateTranslationFile(
+      sortKeys({ sortBy: usedConfig.sortBy, keys: keysToUse }),
       fileFormat,
       lang,
       usedConfig
@@ -671,7 +697,7 @@ function nonNullable(value) {
   return value !== null && value !== void 0;
 }
 
-async function push(comparison, pushToServer, projectInfo, appHost) {
+async function push(comparison, pushToServer, projectInfo, appHost, prompt, exit) {
   const {
     missingLanguagesOnServer,
     missingKeysOnServer,
@@ -683,20 +709,20 @@ async function push(comparison, pushToServer, projectInfo, appHost) {
   greenInfo(`${langs.length} languages will be pushed:`);
   printLimitedItems(langs);
   if (langs.length > 0) {
-    const answer = await confirm({ message: "Continue?" });
+    const answer = await prompt.confirm({ message: "Continue?" });
     if (!answer) {
       console.info("Aborting");
-      process.exit(0);
+      exit();
     }
   }
   const keys = Object.keys(missingKeysOnServer);
   greenInfo(`${keys.length} keys will be pushed:`);
   printLimitedItems(keys);
   if (keys.length > 0) {
-    const answer2 = await confirm({ message: "Continue?" });
+    const answer2 = await prompt.confirm({ message: "Continue?" });
     if (!answer2) {
       console.info("Aborting");
-      process.exit(0);
+      exit();
     }
   }
   Object.entries(missingTranslationsOnServerPerLanguage).forEach(
@@ -706,10 +732,10 @@ async function push(comparison, pushToServer, projectInfo, appHost) {
     }
   );
   if (Object.keys(missingTranslationsOnServerPerLanguage).length > 0) {
-    const answer3 = await confirm({ message: "Continue?" });
+    const answer3 = await prompt.confirm({ message: "Continue?" });
     if (!answer3) {
       console.info("Aborting");
-      process.exit(0);
+      exit();
     }
   }
   const keysWithDifferentTranslations = Object.keys(
@@ -733,7 +759,7 @@ Different translations were found on server and local:`);
       console.info(`Language: ${lang}`);
       console.info(`${FgBlue}Local:${Reset} ${local.value}`);
       console.info(`${FgBlue}Server:${Reset} ${server.currentValue}`);
-      const answer = await select({
+      const answer = await prompt.select({
         message: "Select version to push",
         choices: [
           {
@@ -753,10 +779,10 @@ Different translations were found on server and local:`);
       }
     }
   }
-  const answer4 = await confirm({ message: "Ready to push?" });
+  const answer4 = await prompt.confirm({ message: "Ready to push?" });
   if (!answer4) {
     console.info("Aborting");
-    process.exit(0);
+    exit();
   }
   console.info("PUSHING");
   await pushToServer({
@@ -800,19 +826,8 @@ Different translations were found on server and local:`);
   );
 }
 
-async function runCli({
-  action,
-  allFilesByPattern,
-  projectInfo,
-  allServerKeys,
-  getFilePatternOrPath,
-  writeFile,
-  pushToServer,
-  appHost,
-  fileOptions,
-  translationFilesConfig
-}) {
-  const langById = projectInfo.languages.reduce(
+function makeGetLangCode(languages) {
+  const langById = languages.reduce(
     (acc, lang) => {
       acc[lang.id] = lang.code;
       return acc;
@@ -826,6 +841,23 @@ async function runCli({
     }
     return code;
   }
+  return getLangCode;
+}
+
+async function runCli({
+  action,
+  allFilesByPattern,
+  projectInfo,
+  allServerKeys,
+  getFilePatternOrPath,
+  writeFile,
+  pushToServer,
+  appHost,
+  fileOptions,
+  translationFilesConfig,
+  prompt,
+  exit
+}) {
   const languagesOnServer = new Set(projectInfo.languages.map((l) => l.code));
   const {
     languagesOnLocal,
@@ -838,7 +870,7 @@ async function runCli({
   gatherServerKeys({
     allServerKeys,
     mergedKeysByKeyByNamespace,
-    getLangCode,
+    getLangCode: makeGetLangCode(projectInfo.languages),
     getFilePatternOrPath,
     mergedKeysInLocalOrder
   });
@@ -854,7 +886,7 @@ async function runCli({
     printStatus(comparison);
   }
   if (action === "push") {
-    await push(comparison, pushToServer, projectInfo, appHost);
+    await push(comparison, pushToServer, projectInfo, appHost, prompt, exit);
   }
   if (action === "pull") {
     console.info("PULLING");
@@ -894,14 +926,14 @@ var __publicField = (obj, key, value) => {
   __defNormalProp(obj, key + "" , value);
   return value;
 };
-async function gatherLocalFiles(translationFilesConfig, cwd) {
+async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
   const allFilesByPattern = {};
   const languagesInConfig = new AllLanguagesGatherer(translationFilesConfig);
   for (const fileConfig of translationFilesConfig) {
     const files = [];
     const pathPattern = fileConfig.path;
     const globPath = pathPattern.replace("{{lang}}", "*").replace("{{namespace}}", "**/*").replace("{{source}}", "**/*");
-    const foundFilePaths = await glob(globPath, {
+    const foundFilePaths = await fileAPI.glob(globPath, {
       cwd
     });
     for (const filePath of foundFilePaths) {
@@ -960,7 +992,7 @@ async function gatherLocalFiles(translationFilesConfig, cwd) {
         }
       }
       const fullPath = filePath;
-      const text = await fs.readFile(fullPath, "utf-8");
+      const text = await fileAPI.readFile(fullPath);
       const fileFormat = fileConfig.format;
       if (!fileFormat) {
         throw new Error(`File format not found`);
@@ -999,7 +1031,7 @@ class AllLanguagesGatherer {
 }
 
 var name = "babli";
-var version = "0.0.10";
+var version = "0.0.11";
 var type = "module";
 var license = "MIT";
 var repository = {
@@ -1044,7 +1076,8 @@ const zFileOptions = z.object({
   nested: z.boolean().default(true),
   topLevelLanguageCode: z.boolean().default(false),
   pullWithEmptyValues: z.boolean().default(false),
-  yaml: zYamlOptions.default({})
+  yaml: zYamlOptions.default({}),
+  sortBy: z.union([z.literal("key"), z.literal("value"), z.literal("original")]).default("original")
 });
 const zTranslationFileConfig = z.object({
   path: z.string(),
@@ -1096,34 +1129,25 @@ function detectFormatFromExtension(fileName) {
   }
 }
 
-async function loadConfigFile() {
+async function loadConfigFile(fileAPI) {
+  const configFiles = ["babli.json", "babli.yml", "babli.yaml"];
   let obj;
-  const jsonFileExists = await fs.access("babli.json").then(() => true).catch(() => false);
-  const ymlFileExists = await fs.access("babli.yml").then(() => true).catch(() => false);
-  const yamlFileExists = await fs.access("babli.yaml").then(() => true).catch(() => false);
-  if (!jsonFileExists && !ymlFileExists && !yamlFileExists) {
-    throw new Error("No config file found");
-  }
-  if (ymlFileExists || yamlFileExists) {
-    const text = await fs.readFile(
-      ymlFileExists ? "babli.yml" : "babli.yaml",
-      "utf-8"
-    );
-    obj = parse(text);
-  }
-  if (jsonFileExists) {
-    const text = await fs.readFile("babli.json", "utf-8");
-    obj = JSON.parse(text);
+  for (const file of configFiles) {
+    if (await fileAPI.fileExists(file)) {
+      const content = await fileAPI.readFile(file);
+      obj = file.endsWith(".json") ? JSON.parse(content) : parse(content);
+      break;
+    }
   }
   if (!obj) {
-    throw new Error("Failed to parse config file");
+    throw new Error("No config file found");
   }
   try {
     return parseAndExtendCliConfig(obj);
   } catch (err) {
-    console.error("Failed to parse config file (babli.json or babli.yml)");
+    console.error("Failed to parse config file (babli.json, babli.yml, or babli.yaml)");
     console.error(fromError(err).message);
-    process.exit(1);
+    throw err;
   }
 }
 function parseAndExtendCliConfig(obj) {
@@ -1167,90 +1191,10 @@ async function fetchKeyInLoop(host, requestCode) {
   throw new Error("Unexpected status");
 }
 
-const keyFilePath = path.join(import.meta.dirname, "babli_k");
-const program = new Command();
-program.command("login").description("Login to Babli.ai").action(async () => {
-  await run("login");
-});
-program.command("logout").description("Logout from Babli.ai").action(async () => {
-  await run("logout");
-});
-program.command("push").description(
-  "Push translations to Babli.ai. Pushes to server new languages, new keys, new translations. In case of different translations, it will ask you to choose which one to keep."
-).action(async () => {
-  await run("push");
-});
-program.command("pull").description("Pull translations from Babli.ai").action(async () => {
-  await run("pull");
-});
-program.command("status").description("Check status of translations").action(async () => {
-  await run("status");
-});
-program.version(packageJson.version);
-program.parse(process.argv);
-async function loadKeyOrTokenFile() {
-  const apiKey = process.env.BABLI_API_KEY;
-  if (apiKey) {
-    return apiKey;
-  }
-  const userToken = await fs.readFile(keyFilePath, "utf-8");
-  if (!userToken) {
-    throw new Error("Key file is empty");
-  }
-  return userToken;
-}
-async function run(action) {
-  try {
-    await runAction(action);
-  } catch (err) {
-    if (err instanceof Error && err.message.includes("User force closed the prompt")) {
-      console.info("Exiting...");
-      process.exit(0);
-    }
-    console.error(`${Bold}Oops, something went wrong:${Reset}`);
-    if (env.NODE_ENV === "development") {
-      console.error(err);
-    }
-    if (err instanceof Error) {
-      console.error(FgRed + err.message + Reset);
-    } else {
-      console.error(FgRed + String(err) + Reset);
-    }
-    process.exit(1);
-  }
-}
-async function runAction(action) {
-  const parsed = await loadConfigFile();
-  const { projectId, translationFiles: translationFilesConfig, host } = parsed;
-  if (action === "login") {
-    const requestCode = crypto.randomUUID();
-    console.info(
-      "Please approve the request in the browser to log in to Babli CLI"
-    );
-    setTimeout(() => {
-      open(`${host}/app/approve-access?request-code=${requestCode}`).catch(
-        (err) => {
-          console.error("Failed to open browser", err);
-        }
-      );
-      console.info("Waiting for approval...");
-    }, 1e3);
-    const key = await fetchKeyInLoop(host, requestCode);
-    await fs.writeFile(keyFilePath, key, "utf-8");
-    console.info("Logged in successfully.");
-    process.exit(0);
-  }
-  if (action === "logout") {
-    await fs.rm(keyFilePath);
-    console.info("Logged out successfully.");
-    process.exit(0);
-  }
-  const accessToken = await loadKeyOrTokenFile().catch((err) => {
-    console.info(
-      "You are not logged in. Please run `babli login` for local development. Use `BABLI_API_KEY` in CI."
-    );
-    process.exit(1);
-  });
+function analyzeFilePatterns({
+  translationFilesConfig,
+  defaultFilePattern
+}) {
   const translationFilesConfigsByLang = /* @__PURE__ */ new Map();
   for (const file of translationFilesConfig) {
     if ("languages" in file && file.languages) {
@@ -1287,7 +1231,7 @@ async function runAction(action) {
     if (file) {
       return file.path;
     } else {
-      const defaultPath = parsed.defaultFilePattern ?? firstFilePatternWithoutLanguage();
+      const defaultPath = defaultFilePattern ?? firstFilePatternWithoutLanguage();
       if (defaultPath) {
         return defaultPath;
       } else {
@@ -1296,10 +1240,151 @@ async function runAction(action) {
       }
     }
   }
+  return {
+    getFilePatternOrPath
+  };
+}
+
+function makePushToServer(host, accessToken) {
+  return async function pushToServer({
+    projectId,
+    newLanguages,
+    input
+  }) {
+    const res = await fetch(
+      `${host}/api/cli/${projectId}/addKeysAndTranslations`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`
+        },
+        body: JSON.stringify({
+          newLanguages,
+          input
+        })
+      }
+    );
+    if (res.ok) {
+      return res.json();
+    } else {
+      throw new Error("Failed to add keys and translations");
+    }
+  };
+}
+
+const CliFileApi = {
+  async readFile(path) {
+    return fs.readFile(path, "utf-8");
+  },
+  async fileExists(path) {
+    try {
+      await fs.access(path);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  async glob(pattern, options) {
+    return glob(pattern, { cwd: options?.cwd });
+  }
+};
+
+const keyFilePath = path.join(import.meta.dirname, "babli_k");
+const program = new Command();
+program.command("login").description("Login to Babli.ai").action(async () => {
+  await run("login");
+});
+program.command("logout").description("Logout from Babli.ai").action(async () => {
+  await run("logout");
+});
+program.command("push").description(
+  "Push translations to Babli.ai. Pushes to server new languages, new keys, new translations. In case of different translations, it will ask you to choose which one to keep."
+).action(async () => {
+  await run("push");
+});
+program.command("pull").description("Pull translations from Babli.ai").action(async () => {
+  await run("pull");
+});
+program.command("status").description("Check status of translations").action(async () => {
+  await run("status");
+});
+program.version(packageJson.version);
+program.parse(process.argv);
+async function loadKeyOrTokenFile() {
+  const apiKey = process.env.BABLI_API_KEY;
+  if (apiKey) {
+    return apiKey;
+  }
+  const userToken = await fs__default.readFile(keyFilePath, "utf-8");
+  if (!userToken) {
+    throw new Error("Key file is empty");
+  }
+  return userToken;
+}
+async function run(action) {
+  try {
+    await runAction(action);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("User force closed the prompt")) {
+      console.info("Exiting...");
+      process.exit(0);
+    }
+    console.error(`${Bold}Oops, something went wrong:${Reset}`);
+    if (env.NODE_ENV === "development") {
+      console.error(err);
+    }
+    if (err instanceof Error) {
+      console.error(FgRed + err.message + Reset);
+    } else {
+      console.error(FgRed + String(err) + Reset);
+    }
+    process.exit(1);
+  }
+}
+async function runAction(action) {
+  const parsed = await loadConfigFile(CliFileApi);
+  const { projectId, translationFiles: translationFilesConfig, host } = parsed;
+  if (action === "login") {
+    const requestCode = crypto.randomUUID();
+    console.info(
+      "Please approve the request in the browser to log in to Babli CLI"
+    );
+    setTimeout(() => {
+      open(`${host}/app/approve-access?request-code=${requestCode}`).catch(
+        (err) => {
+          console.error("Failed to open browser", err);
+        }
+      );
+      console.info("Waiting for approval...");
+    }, 1e3);
+    const key = await fetchKeyInLoop(host, requestCode);
+    await fs__default.writeFile(keyFilePath, key, "utf-8");
+    console.info("Logged in successfully.");
+    process.exit(0);
+  }
+  if (action === "logout") {
+    await fs__default.rm(keyFilePath);
+    console.info("Logged out successfully.");
+    process.exit(0);
+  }
+  const accessToken = await loadKeyOrTokenFile().catch((err) => {
+    console.info(
+      "You are not logged in. Please run `babli login` for local development. Use `BABLI_API_KEY` in CI."
+    );
+    process.exit(1);
+  });
   const projectInfo = await fetchProjectInfo(host, projectId, accessToken);
   const allServerKeys = await fetchServerKeys(host, projectId, accessToken);
   await pingServer(host);
-  const allFilesByPattern = await gatherLocalFiles(translationFilesConfig);
+  const allFilesByPattern = await gatherLocalFiles(
+    translationFilesConfig,
+    CliFileApi
+  );
+  const { getFilePatternOrPath } = analyzeFilePatterns({
+    translationFilesConfig,
+    defaultFilePattern: parsed.defaultFilePattern
+  });
   await runCli({
     action,
     allFilesByPattern,
@@ -1309,7 +1394,12 @@ async function runAction(action) {
     writeFile,
     pushToServer: makePushToServer(host, accessToken),
     appHost: host,
-    translationFilesConfig
+    translationFilesConfig,
+    prompt: {
+      confirm,
+      select
+    },
+    exit: () => process.exit(0)
   });
 }
 async function fetchServerKeys(host, projectId, accessToken) {
@@ -1342,33 +1432,6 @@ async function fetchProjectInfo(host, projectId, accessToken) {
     }
   });
 }
-function makePushToServer(host, accessToken) {
-  return async function pushToServer({
-    projectId,
-    newLanguages,
-    input
-  }) {
-    const res = await fetch(
-      `${host}/api/cli/${projectId}/addKeysAndTranslations`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`
-        },
-        body: JSON.stringify({
-          newLanguages,
-          input
-        })
-      }
-    );
-    if (res.ok) {
-      return res.json();
-    } else {
-      throw new Error("Failed to add keys and translations");
-    }
-  };
-}
 async function pingServer(host) {
   const res = await fetch(`${host}/api/cli/ping`);
   if (!res.ok) {
@@ -1383,5 +1446,5 @@ async function pingServer(host) {
   }
 }
 async function writeFile(file, content) {
-  await fs.writeFile(file, content, "utf-8");
+  await fs__default.writeFile(file, content, "utf-8");
 }
