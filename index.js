@@ -27,12 +27,9 @@ const FgBlue = "\x1B[34m";
 
 function gatherTranslationsFromMaybeNestedObject(source, projectSeparator) {
   const translations = /* @__PURE__ */ new Map();
-  if (typeof source !== "object")
-    return translations;
-  if (Array.isArray(source))
-    return translations;
-  if (source == null)
-    return translations;
+  if (typeof source !== "object") return translations;
+  if (Array.isArray(source)) return translations;
+  if (source == null) return translations;
   for (const [key, value] of Object.entries(source)) {
     if (typeof value === "string") {
       translations.set(key, {
@@ -172,8 +169,7 @@ const fileProcessors = {
     const translations = /* @__PURE__ */ new Map();
     const parsed = JSON.parse(fileContent);
     for (const [key, value] of Object.entries(parsed)) {
-      if (key.startsWith("@"))
-        continue;
+      if (key.startsWith("@")) continue;
       if (typeof value === "string") {
         const metadata = parsed[`@${key}`];
         const description = typeof metadata?.description === "string" ? metadata.description : void 0;
@@ -456,7 +452,7 @@ function sortKeys({
   return keys;
 }
 
-async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNamespace, translationFilesConfig, allLanguages) {
+async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNamespace, translationFilesConfig, allLanguages, onlyApproved) {
   const keysToPullByFile = {};
   translationFilesConfig.forEach((fileConfig) => {
     fileConfig.sortBy;
@@ -468,13 +464,14 @@ async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNames
         const keysInLocalOrder = mergedKeysInLocalOrder[path]?.keys;
         if (keysInLocalOrder) {
           console.info("Using local sorting for: ", path);
-          console.info(mergedKeysInLocalOrder[path]?.keys.length);
         } else {
           console.info("Using default sorting for: ", path);
         }
         for (const key of keysInLocalOrder ?? Object.values(keys)) {
           const translation = key.translations[lang];
-          const value = translation?.server?.currentValue;
+          console.log({ onlyApproved });
+          console.log("approved", translation?.server?.approved);
+          const value = onlyApproved ? translation?.server?.approved ? translation?.server?.currentValue : null : translation?.server?.currentValue;
           if (value != void 0 || fileConfig.pullWithEmptyValues) {
             if (!fileFormat) {
               throw new Error("Could not determine file format");
@@ -856,7 +853,8 @@ async function runCli({
   fileOptions,
   translationFilesConfig,
   prompt,
-  exit
+  exit,
+  pullOptions
 }) {
   const languagesOnServer = new Set(projectInfo.languages.map((l) => l.code));
   const {
@@ -894,7 +892,8 @@ async function runCli({
       mergedKeysInLocalOrder,
       mergedKeysByKeyByNamespace,
       translationFilesConfig,
-      projectInfo.languages
+      projectInfo.languages,
+      pullOptions?.onlyApproved ?? false
     );
     for (const [file, content] of Object.entries(filesToPull)) {
       await writeFile(file, content);
@@ -922,10 +921,7 @@ function namespaceFilePathToRegex(namespaceFilePath) {
 
 var __defProp = Object.defineProperty;
 var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
-var __publicField = (obj, key, value) => {
-  __defNormalProp(obj, key + "" , value);
-  return value;
-};
+var __publicField = (obj, key, value) => __defNormalProp(obj, key + "" , value);
 async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
   const allFilesByPattern = {};
   const languagesInConfig = new AllLanguagesGatherer(translationFilesConfig);
@@ -1031,7 +1027,7 @@ class AllLanguagesGatherer {
 }
 
 var name = "babli";
-var version = "0.0.11";
+var version = "0.0.12";
 var type = "module";
 var license = "MIT";
 var repository = {
@@ -1303,8 +1299,11 @@ program.command("push").description(
 ).action(async () => {
   await run("push");
 });
-program.command("pull").description("Pull translations from Babli.ai").action(async () => {
-  await run("pull");
+program.command("pull").description("Pull translations from Babli.ai").option(
+  "--only-approved",
+  "Only pull languages that are approved in the project settings"
+).action(async (options) => {
+  await run("pull", { onlyApproved: options.onlyApproved });
 });
 program.command("status").description("Check status of translations").action(async () => {
   await run("status");
@@ -1322,9 +1321,9 @@ async function loadKeyOrTokenFile() {
   }
   return userToken;
 }
-async function run(action) {
+async function run(action, options) {
   try {
-    await runAction(action);
+    await runAction(action, options);
   } catch (err) {
     if (err instanceof Error && err.message.includes("User force closed the prompt")) {
       console.info("Exiting...");
@@ -1342,7 +1341,7 @@ async function run(action) {
     process.exit(1);
   }
 }
-async function runAction(action) {
+async function runAction(action, options) {
   const parsed = await loadConfigFile(CliFileApi);
   const { projectId, translationFiles: translationFilesConfig, host } = parsed;
   if (action === "login") {
@@ -1399,7 +1398,10 @@ async function runAction(action) {
       confirm,
       select
     },
-    exit: () => process.exit(0)
+    exit: () => process.exit(0),
+    pullOptions: {
+      onlyApproved: options?.onlyApproved ?? false
+    }
   });
 }
 async function fetchServerKeys(host, projectId, accessToken) {
