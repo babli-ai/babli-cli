@@ -87,6 +87,13 @@
           "type": "string",
           "default": "https://www.babli.ai"
         },
+        "emptyValueString": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "$schema": {
           "type": "string"
         }

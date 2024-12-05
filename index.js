@@ -216,9 +216,17 @@ async function detectAndProcessTranslationFile({
   throw new Error(`Unsupported file format`);
 }
 
+function processLocalValue(value, emptyValueString) {
+  if (emptyValueString && value === emptyValueString) {
+    return null;
+  }
+  return value;
+}
+
 async function gatherLocalKeys({
   allFilesByPattern,
-  keySeparator
+  keySeparator,
+  emptyValueString
 }) {
   var _a, _b;
   const localAllFiles = [];
@@ -263,7 +271,7 @@ async function gatherLocalKeys({
             translations: {
               [file.lang]: {
                 local: {
-                  value: val.value
+                  value: processLocalValue(val.value, emptyValueString)
                 }
               }
             },
@@ -452,10 +460,9 @@ function sortKeys({
   return keys;
 }
 
-async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNamespace, translationFilesConfig, allLanguages, onlyApproved) {
+async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNamespace, translationFilesConfig, allLanguages, onlyApproved, emptyValueString) {
   const keysToPullByFile = {};
   translationFilesConfig.forEach((fileConfig) => {
-    fileConfig.sortBy;
     const languages = fileConfig.languages ?? allLanguages.map((l) => l.code);
     languages.forEach((lang) => {
       const pathWithLang = fileConfig.path.replace("{{lang}}", lang);
@@ -467,10 +474,8 @@ async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNames
         } else {
           console.info("Using default sorting for: ", path);
         }
-        for (const key of keysInLocalOrder ?? Object.values(keys)) {
+        for (const key of keysInLocalOrder ? uniq([...keysInLocalOrder, ...Object.values(keys)]) : Object.values(keys)) {
           const translation = key.translations[lang];
-          console.log({ onlyApproved });
-          console.log("approved", translation?.server?.approved);
           const value = onlyApproved ? translation?.server?.approved ? translation?.server?.currentValue : null : translation?.server?.currentValue;
           if (value != void 0 || fileConfig.pullWithEmptyValues) {
             if (!fileFormat) {
@@ -484,7 +489,7 @@ async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNames
             });
             keysToPullByFile[path].keys.push({
               key: key.key,
-              value: value ?? null,
+              value: value ?? emptyValueString,
               description: key.server?.description,
               meta: key.local?.meta ?? {}
             });
@@ -544,6 +549,9 @@ async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNames
     filesToPull[file] = res;
   }
   return filesToPull;
+}
+function uniq(arr) {
+  return [...new Set(arr)];
 }
 
 function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysByKeyByNamespace) {
@@ -850,11 +858,11 @@ async function runCli({
   writeFile,
   pushToServer,
   appHost,
-  fileOptions,
   translationFilesConfig,
   prompt,
   exit,
-  pullOptions
+  pullOptions,
+  emptyValueString
 }) {
   const languagesOnServer = new Set(projectInfo.languages.map((l) => l.code));
   const {
@@ -863,7 +871,8 @@ async function runCli({
     mergedKeysInLocalOrder
   } = await gatherLocalKeys({
     allFilesByPattern,
-    keySeparator: projectInfo.keySeparator
+    keySeparator: projectInfo.keySeparator,
+    emptyValueString
   });
   gatherServerKeys({
     allServerKeys,
@@ -893,7 +902,8 @@ async function runCli({
       mergedKeysByKeyByNamespace,
       translationFilesConfig,
       projectInfo.languages,
-      pullOptions?.onlyApproved ?? false
+      pullOptions?.onlyApproved ?? false,
+      emptyValueString
     );
     for (const [file, content] of Object.entries(filesToPull)) {
       await writeFile(file, content);
@@ -1027,7 +1037,7 @@ class AllLanguagesGatherer {
 }
 
 var name = "babli";
-var version = "0.0.12";
+var version = "0.0.13";
 var type = "module";
 var license = "MIT";
 var repository = {
@@ -1097,7 +1107,8 @@ const zConfigFileInternal = z.object({
   /**
    * for development only
    */
-  host: z.string().default("https://www.babli.ai")
+  host: z.string().default("https://www.babli.ai"),
+  emptyValueString: z.string().nullable().default(null)
 });
 const zTranslationFileConfigInput = zTranslationFileConfig.extend({
   /**
@@ -1401,23 +1412,25 @@ async function runAction(action, options) {
     exit: () => process.exit(0),
     pullOptions: {
       onlyApproved: options?.onlyApproved ?? false
-    }
+    },
+    emptyValueString: parsed.emptyValueString
   });
 }
 async function fetchServerKeys(host, projectId, accessToken) {
-  return await fetch(`${host}/api/cli/${projectId}/allKeys`, {
+  const res = await fetch(`${host}/api/cli/${projectId}/allKeys`, {
     headers: {
       Authorization: `Bearer ${accessToken}`
     }
-  }).then((res) => {
-    if (res.ok) {
-      return res.json();
+  }).then((res2) => {
+    if (res2.ok) {
+      return res2.json();
     } else {
       throw new Error(
-        "Failed to fetch project info. Status: " + res.statusText
+        "Failed to fetch project info. Status: " + res2.statusText
       );
     }
   });
+  return res;
 }
 async function fetchProjectInfo(host, projectId, accessToken) {
   return await fetch(`${host}/api/cli/${projectId}/projectInfo`, {
