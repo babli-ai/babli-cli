@@ -5,7 +5,8 @@
       "type": "object",
       "properties": {
         "projectId": {
-          "type": "string"
+          "type": "string",
+          "description": "The project ID. You can find it in the project settings."
         },
         "sortBy": {
           "type": "string",
@@ -14,10 +15,12 @@
             "value",
             "original"
           ],
-          "default": "original"
+          "default": "original",
+          "description": "How to sort the keys in the file"
         },
         "defaultFilePattern": {
-          "type": "string"
+          "type": "string",
+          "description": "HIDDEN"
         },
         "translationFiles": {
           "type": "array",
@@ -25,13 +28,15 @@
             "type": "object",
             "properties": {
               "path": {
-                "type": "string"
+                "type": "string",
+                "description": "The path to the translation file. Use {{lang}} placeholder to define the language code."
               },
               "languages": {
                 "type": "array",
                 "items": {
                   "type": "string"
-                }
+                },
+                "description": "Babli will autodetect languages by default, but in case you need different languages with different languages, you can define the languages here."
               },
               "format": {
                 "type": "string",
@@ -40,11 +45,13 @@
                   "yaml",
                   "flutterArb",
                   "typescript"
-                ]
+                ],
+                "description": "Babli will autodetect format from file extensions. But if using non-standard extensions, you can change format here."
               },
               "nested": {
                 "type": "boolean",
-                "default": true
+                "default": true,
+                "description": "Define if keys should be exported as nested values `{ \"a\": { \"b\": \"x\"}}` or not nested `{ \"a.b\": \"x\" }`"
               },
               "topLevelLanguageCode": {
                 "type": "boolean",
@@ -78,21 +85,25 @@
               "path"
             ],
             "additionalProperties": false
-          }
+          },
+          "description": "Source files for the translations."
         },
         "defaultFile": {
-          "type": "string"
+          "type": "string",
+          "description": "HIDDEN"
         },
         "host": {
           "type": "string",
-          "default": "https://www.babli.ai"
+          "default": "https://www.babli.ai",
+          "description": "HIDDEN"
         },
         "emptyValueString": {
           "type": [
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "description": "In case you use some specific value to mark the value is not translated yet,\nFor example 'NOT_TRANSLATED', You can define it here."
         },
         "$schema": {
           "type": "string"

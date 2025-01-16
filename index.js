@@ -5,6 +5,7 @@
 
 import * as fs from 'fs/promises';
 import fs__default from 'fs/promises';
+import fsSync from 'fs';
 import Parser from 'web-tree-sitter';
 import yaml from 'js-yaml';
 import { stringify, parse } from 'yaml';
@@ -17,13 +18,6 @@ import { fromError } from 'zod-validation-error';
 import { env } from 'process';
 import { confirm, select } from '@inquirer/prompts';
 import { glob } from 'glob';
-
-const Reset = "\x1B[0m";
-const Bold = "\x1B[1m";
-const FgRed = "\x1B[31m";
-const FgGreen = "\x1B[32m";
-const FgYellow = "\x1B[33m";
-const FgBlue = "\x1B[34m";
 
 function gatherTranslationsFromMaybeNestedObject(source, projectSeparator) {
   const translations = /* @__PURE__ */ new Map();
@@ -262,7 +256,7 @@ async function gatherLocalKeys({
         if (mergedKeysByKey[key]) {
           mergedKeysByKey[key].translations[file.lang] = {
             local: {
-              value: val.value
+              value: processLocalValue(val.value, emptyValueString)
             }
           };
         } else {
@@ -585,11 +579,11 @@ function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysBy
         missingOrDifferentKeysOnServer[key.key] = key;
       }
       for (const [lang, translation] of Object.entries(key.translations)) {
-        if (translation?.local?.value == void 0) {
+        if (translation?.local?.value == void 0 && translation?.server?.currentValue != void 0) {
           missingTranslationsOnLocalPerLanguage[lang] ?? (missingTranslationsOnLocalPerLanguage[lang] = []);
           missingTranslationsOnLocalPerLanguage[lang].push(key);
         }
-        if (translation?.server?.currentValue == void 0) {
+        if (translation?.server?.currentValue == void 0 && translation?.local?.value != void 0) {
           missingTranslationsOnServerPerLanguage[lang] ?? (missingTranslationsOnServerPerLanguage[lang] = []);
           missingTranslationsOnServerPerLanguage[lang].push(key);
           missingOrDifferentKeysOnServer[key.key] = key;
@@ -637,6 +631,13 @@ function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysBy
     missingOrDifferentKeysOnServer
   };
 }
+
+const Reset = "\x1B[0m";
+const Bold = "\x1B[1m";
+const FgRed = "\x1B[31m";
+const FgGreen = "\x1B[32m";
+const FgYellow = "\x1B[33m";
+const FgBlue = "\x1B[34m";
 
 function printLimitedItems(items, toPrint = 20) {
   if (items.length == 0) {
@@ -842,7 +843,7 @@ function makeGetLangCode(languages) {
   function getLangCode(id) {
     const code = langById[id];
     if (!code) {
-      throw new Error("Language not found");
+      throw new Error(`Language not found: ${id}`);
     }
     return code;
   }
@@ -850,7 +851,7 @@ function makeGetLangCode(languages) {
 }
 
 async function runCli({
-  action,
+  cliInput,
   allFilesByPattern,
   projectInfo,
   allServerKeys,
@@ -861,7 +862,6 @@ async function runCli({
   translationFilesConfig,
   prompt,
   exit,
-  pullOptions,
   emptyValueString
 }) {
   const languagesOnServer = new Set(projectInfo.languages.map((l) => l.code));
@@ -874,28 +874,7 @@ async function runCli({
     keySeparator: projectInfo.keySeparator,
     emptyValueString
   });
-  gatherServerKeys({
-    allServerKeys,
-    mergedKeysByKeyByNamespace,
-    getLangCode: makeGetLangCode(projectInfo.languages),
-    getFilePatternOrPath,
-    mergedKeysInLocalOrder
-  });
-  const comparison = compareLocalAndServer(
-    languagesOnServer,
-    languagesOnLocal,
-    mergedKeysByKeyByNamespace
-  );
-  if (!comparison.needPull && !comparison.needPush) {
-    console.info(`${Bold}Everything is up to date. ${Reset}`);
-  }
-  if (action === "status") {
-    printStatus(comparison);
-  }
-  if (action === "push") {
-    await push(comparison, pushToServer, projectInfo, appHost, prompt, exit);
-  }
-  if (action === "pull") {
+  async function pull(pullOptions) {
     console.info("PULLING");
     const filesToPull = await prepareFilesToPull(
       mergedKeysInLocalOrder,
@@ -909,6 +888,32 @@ async function runCli({
       await writeFile(file, content);
     }
     console.info("PULLING DONE");
+  }
+  gatherServerKeys({
+    allServerKeys,
+    mergedKeysByKeyByNamespace,
+    getLangCode: makeGetLangCode(projectInfo.languages),
+    getFilePatternOrPath,
+    mergedKeysInLocalOrder
+  });
+  const comparison = compareLocalAndServer(
+    languagesOnServer,
+    languagesOnLocal,
+    mergedKeysByKeyByNamespace
+  );
+  if (cliInput.action === "status") {
+    printStatus(comparison);
+  }
+  if (cliInput.action === "translate") {
+    console.info("TRANSLATING");
+    await push(comparison, pushToServer, projectInfo, appHost, prompt, exit);
+    await pull();
+  }
+  if (cliInput.action === "push") {
+    await push(comparison, pushToServer, projectInfo, appHost, prompt, exit);
+  }
+  if (cliInput.action === "pull") {
+    await pull(cliInput.options);
   }
 }
 
@@ -1036,79 +1041,53 @@ class AllLanguagesGatherer {
   }
 }
 
-var name = "babli";
-var version = "0.0.13";
-var type = "module";
-var license = "MIT";
-var repository = {
-	type: "git",
-	url: "https://github.com/babli-ai/babli-cli.git"
-};
-var bin = {
-	babli: "./dist/index.js"
-};
-var scripts = {
-	start: "node dist/index.js"
-};
-var dependencies = {
-	"@inquirer/prompts": "^5.3.2",
-	commander: "^12.1.0",
-	glob: "^10.4.1",
-	yaml: "^2.5.0",
-	"js-yaml": "^4.1.0",
-	lodash: "^4.17.21",
-	open: "^10.1.0",
-	"web-tree-sitter": "^0.22.6",
-	zod: "^3.23.8",
-	"zod-validation-error": "^3.3.1"
-};
-var packageJson = {
-	name: name,
-	version: version,
-	type: type,
-	license: license,
-	repository: repository,
-	bin: bin,
-	scripts: scripts,
-	dependencies: dependencies
-};
-
 const zFileFormat = z.enum(["json", "yaml", "flutterArb", "typescript"]);
 const zYamlOptions = z.object({
   version: z.string().optional()
 });
 z.object({});
 const zFileOptions = z.object({
-  nested: z.boolean().default(true),
+  nested: z.boolean().default(true).describe(
+    `Define if keys should be exported as nested values \`{ "a": { "b": "x"}}\` or not nested \`{ "a.b": "x" }\``
+  ),
   topLevelLanguageCode: z.boolean().default(false),
   pullWithEmptyValues: z.boolean().default(false),
   yaml: zYamlOptions.default({}),
   sortBy: z.union([z.literal("key"), z.literal("value"), z.literal("original")]).default("original")
 });
 const zTranslationFileConfig = z.object({
-  path: z.string(),
+  path: z.string().describe(
+    "The path to the translation file. Use {{lang}} placeholder to define the language code."
+  ),
   /**
    * when not provided, we will use all languages found by the pattern for push, and all languages not included in other patterns for pull
    */
-  languages: z.array(z.string()).optional(),
-  format: zFileFormat.optional()
+  languages: z.array(z.string()).describe(
+    "Babli will autodetect languages by default, but in case you need different languages with different languages, you can define the languages here."
+  ).optional(),
+  format: zFileFormat.optional().describe(
+    "Babli will autodetect format from file extensions. But if using non-standard extensions, you can change format here."
+  )
 }).merge(zFileOptions);
 const zConfigFileInternal = z.object({
-  projectId: z.string(),
-  sortBy: z.union([z.literal("key"), z.literal("value"), z.literal("original")]).default("original"),
+  projectId: z.string().describe("The project ID. You can find it in the project settings."),
+  sortBy: z.union([z.literal("key"), z.literal("value"), z.literal("original")]).default("original").describe("How to sort the keys in the file"),
   /**
    * this is needed for the case when we have multiple files with pattern
    */
-  defaultFilePattern: z.string().optional(),
-  translationFiles: z.array(zTranslationFileConfig),
+  defaultFilePattern: z.string().optional().describe("HIDDEN"),
+  translationFiles: z.array(zTranslationFileConfig).describe("Source files for the translations."),
   // defaultFormat: zFileFormat.optional(),
   // defaultOptions: zFileOptions.optional(),
-  defaultFile: z.string().optional(),
+  defaultFile: z.string().optional().describe("HIDDEN"),
   /**
    * for development only
    */
-  host: z.string().default("https://www.babli.ai"),
-  emptyValueString: z.string().nullable().default(null)
+  host: z.string().default("https://www.babli.ai").describe("HIDDEN"),
+  emptyValueString: z.string().nullable().default(null).describe(
+    `In case you use some specific value to mark the value is not translated yet,
+For example 'NOT_TRANSLATED', You can define it here.`
+  )
 });
 const zTranslationFileConfigInput = zTranslationFileConfig.extend({
   /**
@@ -1297,29 +1276,45 @@ const CliFileApi = {
   }
 };
 
+const packageJson = JSON.parse(
+  fsSync.readFileSync(new URL("./package.json", import.meta.url), "utf8")
+);
 const keyFilePath = path.join(import.meta.dirname, "babli_k");
 const program = new Command();
 program.command("login").description("Login to Babli.ai").action(async () => {
-  await run("login");
+  await run({ action: "login" });
 });
 program.command("logout").description("Logout from Babli.ai").action(async () => {
-  await run("logout");
+  await run({ action: "logout" });
 });
 program.command("push").description(
   "Push translations to Babli.ai. Pushes to server new languages, new keys, new translations. In case of different translations, it will ask you to choose which one to keep."
-).action(async () => {
-  await run("push");
+).action(async (options) => {
+  await run({
+    action: "push",
+    options: {
+      dryRun: options.dryRun,
+      archiveMissingKeys: options.archiveMissingKeys
+    }
+  });
 });
 program.command("pull").description("Pull translations from Babli.ai").option(
   "--only-approved",
   "Only pull languages that are approved in the project settings"
 ).action(async (options) => {
-  await run("pull", { onlyApproved: options.onlyApproved });
+  await run({
+    action: "pull",
+    options: {
+      onlyApproved: options.onlyApproved
+    }
+  });
 });
 program.command("status").description("Check status of translations").action(async () => {
-  await run("status");
+  await run({
+    action: "status"
+  });
 });
-program.version(packageJson.version);
+program.version(packageJson.version, "-V, -v, --version");
 program.parse(process.argv);
 async function loadKeyOrTokenFile() {
   const apiKey = process.env.BABLI_API_KEY;
@@ -1332,9 +1327,9 @@ async function loadKeyOrTokenFile() {
   }
   return userToken;
 }
-async function run(action, options) {
+async function run(cliInput) {
   try {
-    await runAction(action, options);
+    await runAction(cliInput);
   } catch (err) {
     if (err instanceof Error && err.message.includes("User force closed the prompt")) {
       console.info("Exiting...");
@@ -1352,10 +1347,10 @@ async function run(action, options) {
     process.exit(1);
   }
 }
-async function runAction(action, options) {
+async function runAction(cliInput) {
   const parsed = await loadConfigFile(CliFileApi);
   const { projectId, translationFiles: translationFilesConfig, host } = parsed;
-  if (action === "login") {
+  if (cliInput.action === "login") {
     const requestCode = crypto.randomUUID();
     console.info(
       "Please approve the request in the browser to log in to Babli CLI"
@@ -1373,7 +1368,7 @@ async function runAction(action, options) {
     console.info("Logged in successfully.");
     process.exit(0);
   }
-  if (action === "logout") {
+  if (cliInput.action === "logout") {
     await fs__default.rm(keyFilePath);
     console.info("Logged out successfully.");
     process.exit(0);
@@ -1396,7 +1391,7 @@ async function runAction(action, options) {
     defaultFilePattern: parsed.defaultFilePattern
   });
   await runCli({
-    action,
+    cliInput,
     allFilesByPattern,
     projectInfo,
     allServerKeys,
@@ -1410,9 +1405,6 @@ async function runAction(action, options) {
       select
     },
     exit: () => process.exit(0),
-    pullOptions: {
-      onlyApproved: options?.onlyApproved ?? false
-    },
     emptyValueString: parsed.emptyValueString
   });
 }
