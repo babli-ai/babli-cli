@@ -19,6 +19,17 @@ import { env } from 'process';
 import { confirm, select } from '@inquirer/prompts';
 import { glob } from 'glob';
 
+const nodeParts = process.versions.node.split(".").map(Number);
+const major = nodeParts[0] ?? 0;
+const minor = nodeParts[1] ?? 0;
+if (major < 20 || major === 20 && minor < 11) {
+  console.error(
+    "\x1B[31mError: Babli CLI requires Node.js version 20.11 or higher\x1B[0m"
+  );
+  console.error(`Current version: ${process.versions.node}`);
+  process.exit(1);
+}
+
 function gatherTranslationsFromMaybeNestedObject(source, projectSeparator) {
   const translations = /* @__PURE__ */ new Map();
   if (typeof source !== "object") return translations;
