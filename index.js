@@ -800,7 +800,7 @@ Different translations were found on server and local:`);
     })),
     input: {
       markAllAsPreferred: false,
-      removeMissingKeys: false,
+      keysToRemove: [],
       keys: Object.values(missingOrDifferentKeysOnServer).map((key) => {
         return {
           key: key.key,
@@ -942,7 +942,7 @@ async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
   const languagesInConfig = new AllLanguagesGatherer(translationFilesConfig);
   for (const fileConfig of translationFilesConfig) {
     const files = [];
-    const pathPattern = fileConfig.path;
+    const pathPattern = fileConfig.path.replace(/^\.\//, "");
     const globPath = pathPattern.replace("{{lang}}", "*").replace("{{namespace}}", "**/*").replace("{{source}}", "**/*");
     const foundFilePaths = await fileAPI.glob(globPath, {
       cwd
