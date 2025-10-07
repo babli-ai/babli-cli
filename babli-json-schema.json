@@ -44,7 +44,8 @@
                   "json",
                   "yaml",
                   "flutterArb",
-                  "typescript"
+                  "typescript",
+                  "po"
                 ],
                 "description": "Babli will autodetect format from file extensions. But if using non-standard extensions, you can change format here."
               },

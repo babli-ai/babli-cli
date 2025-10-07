@@ -1,6 +1,6 @@
 {
   "name": "babli",
-  "version": "0.0.16",
+  "version": "0.0.17",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -23,6 +23,8 @@
     "open": "^10.1.0",
     "web-tree-sitter": "^0.22.6",
     "zod": "^3.23.8",
-    "zod-validation-error": "^3.3.1"
+    "zod-validation-error": "^3.3.1",
+    "pofile": "^1.1.4",
+    "ignore": "^7.0.0"
   }
 }
