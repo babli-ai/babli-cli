@@ -19,7 +19,7 @@ import { parse, stringify } from 'yaml';
 import { fromError } from 'zod-validation-error';
 import yaml from 'js-yaml';
 import PO from 'pofile';
-import Parser from 'web-tree-sitter';
+import { Parser, Language } from 'web-tree-sitter';
 
 const nodeParts = process.versions.node.split(".").map(Number);
 const major = nodeParts[0] ?? 0;
@@ -1354,14 +1354,15 @@ async function typescriptProcessor(fileContent, projectSeparator) {
       }
     });
     const parser2 = new Parser();
-    const JavaScript2 = await Parser.Language.load(
-      "/parsers/tree-sitter-tsx.wasm"
-    );
+    const JavaScript2 = await Language.load("/parsers/tree-sitter-tsx.wasm");
     parser2.setLanguage(JavaScript2);
     initialized = { parser: parser2, JavaScript: JavaScript2 };
   }
   const { parser, JavaScript } = initialized;
   const tree = parser.parse(fileContent);
+  if (!tree) {
+    return { keys: /* @__PURE__ */ new Map(), fileFormat: "typescript" };
+  }
   let translations = /* @__PURE__ */ new Map();
   const startingNode = findStartingNode(tree.rootNode, JavaScript);
   if (startingNode) {
@@ -1415,12 +1416,12 @@ function extractObject(node) {
   }
   const obj = {};
   node.namedChildren.forEach((child) => {
-    if (child.type === "pair") {
+    if (child?.type === "pair") {
       const keyNode = child.namedChildren.find(
-        (n) => n.type === "property_identifier" || n.type === "string"
+        (n) => n?.type === "property_identifier" || n?.type === "string"
       );
       const valueNode = child.namedChildren.find(
-        (n) => n.type !== "property_identifier" && (n.type === "string" || n.type === "object")
+        (n) => n?.type !== "property_identifier" && (n?.type === "string" || n?.type === "object")
       );
       if (keyNode && valueNode) {
         const key = keyNode.text;
@@ -2336,7 +2337,7 @@ program.command("init").description("Initialize a new Babli project").option("--
     }
   });
 });
-program.version(packageJson.version, "-V, -v, --version");
+program.version(packageJson.version, "-V, --version");
 program.parse(process.argv);
 async function run(cliInput) {
   try {
