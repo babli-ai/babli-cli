@@ -1,4 +1,4 @@
-> Read-only mirror of the published `babli` CLI. Source lives in the [monorepo](https://github.com/infi-pc/babli). Install with `npm i -g babli`.
+> Read-only mirror of the published `babli` CLI. Source lives in the monorepo (infi-pc/babli). Install with `npm i -g babli`.
 
 # Babli CLI
 
@@ -101,6 +101,23 @@ Then add the returned `projectId` to your `babli.json` (see Manual Setup below).
    }
    ```
 4. Then you can push your keys from your project `babli push`
+
+### Empty translation placeholders
+
+If local translation files represent untranslated values with a sentinel, set
+`emptyValueString` so Babli synchronizes that value as an empty placeholder:
+
+```json
+{
+  "projectId": "<your projectId>",
+  "translationFiles": [{ "path": "src/translations/{{lang}}.json" }],
+  "emptyValueString": ""
+}
+```
+
+The empty string is supported, as are non-empty sentinels such as
+`"NOT_TRANSLATED"`. This setting applies to local file values; approved
+non-empty server translations are never overwritten automatically.
 
 
 

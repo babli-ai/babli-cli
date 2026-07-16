@@ -7,12 +7,12 @@ import fs__default from 'fs/promises';
 import { stdin, env } from 'process';
 import open from 'open';
 import path, { join, resolve } from 'path';
+import { z } from 'zod';
 import { glob } from 'glob';
 import ignore from 'ignore';
 import { pathToFileURL } from 'url';
 import * as minimatch from 'minimatch';
 import { minimatch as minimatch$1 } from 'minimatch';
-import { z } from 'zod';
 import { parse, stringify } from 'yaml';
 import { fromError } from 'zod-validation-error';
 import yaml from 'js-yaml';
@@ -154,7 +154,7 @@ const zConfigFileInternal = z.object({
   host: z.string().default(defaultHost).describe("HIDDEN"),
   emptyValueString: z.string().nullable().default(null).describe(
     `In case you use some specific value to mark the value is not translated yet,
-For example 'NOT_TRANSLATED', You can define it here.`
+For example 'NOT_TRANSLATED' or an empty string, You can define it here.`
   )
 });
 const zTranslationFileConfigInput = zTranslationFileConfig.extend({
@@ -181,7 +181,7 @@ function formatNamespacedKey(key) {
   return namespace ? `${key.key} [${namespace}]` : key.key;
 }
 
-function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysByKeyByNamespace) {
+function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysByKeyByNamespace, emptyValueString) {
   const missingLanguagesOnLocal = /* @__PURE__ */ new Set();
   const missingLanguagesOnServer = /* @__PURE__ */ new Set();
   for (const lang of languagesOnServer) {
@@ -211,7 +211,8 @@ function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysBy
         missingOrDifferentKeysOnServer[comparisonKey] = key;
       }
       for (const [lang, translation] of Object.entries(key.translations)) {
-        if (translation?.local?.value == void 0 && translation?.server?.currentValue != void 0) {
+        const configuredEmptyOnBothSides = emptyValueString === "" && translation?.local?.value == null && translation?.server?.currentValue === "";
+        if (translation?.local?.value == void 0 && translation?.server?.currentValue != void 0 && !configuredEmptyOnBothSides) {
           missingTranslationsOnLocalPerLanguage[lang] ?? (missingTranslationsOnLocalPerLanguage[lang] = []);
           missingTranslationsOnLocalPerLanguage[lang].push(key);
         }
@@ -1062,9 +1063,9 @@ function namespaceFilePathToRegex(namespaceFilePath) {
   return new RegExp(modified);
 }
 
-var __defProp = Object.defineProperty;
-var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
-var __publicField = (obj, key, value) => __defNormalProp(obj, key + "" , value);
+var __defProp$1 = Object.defineProperty;
+var __defNormalProp$1 = (obj, key, value) => key in obj ? __defProp$1(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField$1 = (obj, key, value) => __defNormalProp$1(obj, key + "" , value);
 async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
   const allFilesByPattern = {};
   const languagesInConfig = new AllLanguagesGatherer(translationFilesConfig);
@@ -1160,7 +1161,7 @@ async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
 class AllLanguagesGatherer {
   constructor(translationFilesConfig) {
     this.translationFilesConfig = translationFilesConfig;
-    __publicField(this, "allLanguagesInConfig", /* @__PURE__ */ new Set());
+    __publicField$1(this, "allLanguagesInConfig", /* @__PURE__ */ new Set());
     for (const fileConfig of this.translationFilesConfig) {
       if (fileConfig.languages) {
         for (const lang of fileConfig.languages) {
@@ -1432,7 +1433,7 @@ async function detectAndProcessTranslationFile({
 }
 
 function processLocalValue(value, emptyValueString) {
-  if (emptyValueString && value === emptyValueString) {
+  if (emptyValueString != null && value === emptyValueString) {
     return null;
   }
   return value;
@@ -2738,7 +2739,8 @@ async function runCli({
   const comparison = compareLocalAndServer(
     languagesOnServer,
     languagesOnLocal,
-    mergedKeysByKeyByNamespace
+    mergedKeysByKeyByNamespace,
+    emptyValueString
   );
   if (cliInput.action === "push" && cliInput.keysToRemove && cliInput.keysToRemove.length > 0) {
     comparison.keysToRemove = cliInput.keysToRemove;
@@ -2805,17 +2807,114 @@ async function runCli({
   };
 }
 
-async function fetchKeyInLoop(host, requestCode) {
-  const res = await fetch(
-    `${host}/api/cli/getAuthToken?requestCode=${requestCode}`
-  ).then((res2) => {
-    if (res2.ok) {
-      return res2.json();
-    } else {
-      console.error(res2.statusText);
-      throw new Error("Failed to get auth token");
-    }
+var __defProp = Object.defineProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+class CliRequestError extends Error {
+  constructor(input) {
+    super(input.message, { cause: input.cause });
+    __publicField(this, "code");
+    __publicField(this, "httpStatus");
+    this.name = "CliRequestError";
+    this.code = input.code;
+    this.httpStatus = input.httpStatus;
+  }
+}
+
+function getRetryAfterMs(value, now = Date.now()) {
+  if (!value) return void 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1e3;
+  const date = Date.parse(value);
+  if (!Number.isFinite(date) || date <= now) return void 0;
+  return date - now;
+}
+
+const errorBodySchema = z.object({
+  error: z.union([
+    z.string(),
+    z.object({
+      code: z.string().optional(),
+      message: z.string()
+    })
+  ])
+});
+async function readCliResponseError(response) {
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    body = void 0;
+  }
+  const parsed = errorBodySchema.safeParse(body);
+  if (parsed.success) {
+    const error = parsed.data.error;
+    return new CliRequestError({
+      message: typeof error === "string" ? error : error.message,
+      code: typeof error === "string" ? void 0 : error.code,
+      httpStatus: response.status
+    });
+  }
+  return new CliRequestError({
+    message: `Request failed. Status: ${response.statusText || response.status}`,
+    code: "request_failed",
+    httpStatus: response.status
   });
+}
+
+const retryDelays = [250, 750];
+const retryableStatuses = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504]);
+async function requestCliJson(url, init = {}) {
+  const method = (init.method ?? "GET").toUpperCase();
+  const canRetry = method === "GET" || method === "HEAD";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let response;
+    try {
+      response = await fetch(url, init);
+    } catch (cause) {
+      if (!canRetry || attempt === 2) {
+        throw new CliRequestError({
+          message: "Request failed due to a network error",
+          code: "network_error",
+          cause
+        });
+      }
+      await sleep$1(retryDelays[attempt] ?? 750);
+      continue;
+    }
+    if (canRetry && attempt < 2 && retryableStatuses.has(response.status)) {
+      await response.body?.cancel().catch(() => void 0);
+      const baseDelay = retryDelays[attempt] ?? 750;
+      const retryAfter = response.status === 429 || response.status === 503 ? getRetryAfterMs(response.headers.get("Retry-After")) : void 0;
+      const delay = Math.max(baseDelay, Math.min(retryAfter ?? 0, 5e3));
+      await sleep$1(delay);
+      continue;
+    }
+    if (!response.ok) throw await readCliResponseError(response);
+    try {
+      return await response.json();
+    } catch (cause) {
+      throw new CliRequestError({
+        message: "Server returned invalid JSON",
+        code: "invalid_response",
+        httpStatus: response.status,
+        cause
+      });
+    }
+  }
+  throw new CliRequestError({
+    message: "Request failed due to a network error",
+    code: "network_error"
+  });
+}
+function sleep$1(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchKeyInLoop(host, requestCode) {
+  const res = await requestCliJson(
+    `${host}/api/cli/getAuthToken?requestCode=${requestCode}`
+  );
   if (res.status === "not-found") {
     await new Promise((resolve) => setTimeout(resolve, 2e3));
     return fetchKeyInLoop(host, requestCode);
@@ -2988,38 +3087,25 @@ async function writeFile(file, content) {
 }
 
 async function fetchServerKeys(host, projectId, accessToken) {
-  const res = await fetch(`${host}/api/cli/${projectId}/allKeys`, {
+  return requestCliJson(`${host}/api/cli/${projectId}/allKeys`, {
     headers: {
       Authorization: `Bearer ${accessToken}`
     }
-  }).then((res2) => {
-    if (res2.ok) {
-      return res2.json();
-    } else {
-      throw new Error(
-        `Failed to fetch project info. Status: ${res2.statusText}`
-      );
-    }
   });
-  return res;
 }
 async function fetchProjectInfo(host, projectId, accessToken) {
-  return await fetch(`${host}/api/cli/${projectId}/projectInfo`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
+  const result = await requestCliJson(
+    `${host}/api/cli/${projectId}/project`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      }
     }
-  }).then((res) => {
-    if (res.ok) {
-      return res.json();
-    } else {
-      throw new Error(
-        `Failed to fetch project info. Status: ${res.statusText}`
-      );
-    }
-  });
+  );
+  return result.project;
 }
 async function requestTranslation(host, projectId, accessToken, keys, model = "production") {
-  const res = await fetch(`${host}/api/cli/${projectId}/translate`, {
+  return requestCliJson(`${host}/api/cli/${projectId}/translate`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -3027,16 +3113,9 @@ async function requestTranslation(host, projectId, accessToken, keys, model = "p
     },
     body: JSON.stringify({ keys, model })
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(
-      body.error ?? `Failed to start translation. Status: ${res.statusText}`
-    );
-  }
-  return await res.json();
 }
 async function estimateTranslation(host, projectId, accessToken, keys, model = "production") {
-  const res = await fetch(`${host}/api/cli/${projectId}/estimate`, {
+  return requestCliJson(`${host}/api/cli/${projectId}/estimate`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -3044,37 +3123,26 @@ async function estimateTranslation(host, projectId, accessToken, keys, model = "
     },
     body: JSON.stringify({ keys, model })
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(
-      body.error ?? `Failed to estimate translation. Status: ${res.statusText}`
-    );
-  }
-  return await res.json();
 }
 async function fetchJobStatus(host, projectId, accessToken, jobId) {
-  const res = await fetch(`${host}/api/cli/${projectId}/job/${jobId}`, {
+  const result = await requestCliJson(`${host}/api/cli/${projectId}/job/${jobId}`, {
     headers: {
       Authorization: `Bearer ${accessToken}`
     }
   });
-  if (!res.ok) {
-    throw new Error(`Failed to fetch job status. Status: ${res.statusText}`);
-  }
-  return await res.json();
+  return { ...result, failures: result.failures ?? [] };
 }
 async function fetchQuestions(host, projectId, accessToken) {
-  const res = await fetch(`${host}/api/cli/${projectId}/questions`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-  if (!res.ok) {
-    throw new Error(`Failed to fetch questions. Status: ${res.statusText}`);
-  }
-  const json = await res.json();
+  const json = await requestCliJson(
+    `${host}/api/cli/${projectId}/questions`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }
+  );
   return json.questions;
 }
 async function submitAnswers(host, projectId, accessToken, answers) {
-  const res = await fetch(`${host}/api/cli/${projectId}/answers`, {
+  return requestCliJson(`${host}/api/cli/${projectId}/answers`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -3082,28 +3150,18 @@ async function submitAnswers(host, projectId, accessToken, answers) {
     },
     body: JSON.stringify({ answers })
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(
-      body.error ?? `Failed to submit answers. Status: ${res.statusText}`
-    );
-  }
-  return await res.json();
 }
 async function fetchPendingReviews(host, projectId, accessToken) {
-  const res = await fetch(`${host}/api/cli/${projectId}/pendingReviews`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-  if (!res.ok) {
-    throw new Error(
-      `Failed to fetch pending reviews. Status: ${res.statusText}`
-    );
-  }
-  const json = await res.json();
+  const json = await requestCliJson(
+    `${host}/api/cli/${projectId}/pendingReviews`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }
+  );
   return json.pending;
 }
 async function approveTranslations(host, projectId, accessToken, translationIds) {
-  const res = await fetch(`${host}/api/cli/${projectId}/approve`, {
+  return requestCliJson(`${host}/api/cli/${projectId}/approve`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -3111,16 +3169,9 @@ async function approveTranslations(host, projectId, accessToken, translationIds)
     },
     body: JSON.stringify({ translationIds })
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(
-      body.error ?? `Failed to approve translations. Status: ${res.statusText}`
-    );
-  }
-  return await res.json();
 }
 async function requestProofread(host, projectId, accessToken, keyIds, languageId) {
-  const res = await fetch(`${host}/api/cli/${projectId}/proofread`, {
+  return requestCliJson(`${host}/api/cli/${projectId}/proofread`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -3128,21 +3179,18 @@ async function requestProofread(host, projectId, accessToken, keyIds, languageId
     },
     body: JSON.stringify({ keyIds, languageId })
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(
-      body.error ?? `Failed to start proofreading. Status: ${res.statusText}`
-    );
-  }
-  return await res.json();
 }
 async function pingServer(host, cliVersion) {
-  const res = await fetch(`${host}/api/cli/ping`);
-  if (!res.ok) {
-    console.error(`Could not connect to server at ${host}`);
-    process.exit(1);
+  let json;
+  try {
+    json = await requestCliJson(`${host}/api/cli/ping`);
+  } catch (error) {
+    if (error instanceof CliRequestError && error.httpStatus !== void 0) {
+      console.error(`Could not connect to server at ${host}`);
+      process.exit(1);
+    }
+    throw error;
   }
-  const json = await res.json();
   const baseVersion = (v) => v.replace(/[-+].*$/, "");
   if (baseVersion(json.cliVersion) !== baseVersion(cliVersion)) {
     console.warn(
@@ -3170,53 +3218,29 @@ async function addCliKey(host, projectId, accessToken, input) {
   return postCliJson(`${host}/api/cli/${projectId}/keys`, accessToken, input);
 }
 async function updateCliKey(host, projectId, accessToken, input) {
-  return patchCliJson(
-    `${host}/api/cli/${projectId}/keys/update`,
-    accessToken,
-    input
-  );
+  return patchCliJson(`${host}/api/cli/${projectId}/keys/update`, accessToken, input);
 }
 async function renameCliKey(host, projectId, accessToken, input) {
-  return patchCliJson(
-    `${host}/api/cli/${projectId}/keys/rename`,
-    accessToken,
-    input
-  );
+  return patchCliJson(`${host}/api/cli/${projectId}/keys/rename`, accessToken, input);
 }
 async function archiveCliKey(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/keys/archive`,
-    accessToken,
-    input
-  );
+  return postCliJson(`${host}/api/cli/${projectId}/keys/archive`, accessToken, input);
 }
 async function unarchiveCliKey(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/keys/unarchive`,
-    accessToken,
-    input
-  );
+  return postCliJson(`${host}/api/cli/${projectId}/keys/unarchive`, accessToken, input);
 }
 async function upsertCliTranslation(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/translations/upsert`,
-    accessToken,
-    input
-  );
+  return postCliJson(`${host}/api/cli/${projectId}/translations/upsert`, accessToken, input);
 }
 async function approveCliTranslation(host, projectId, accessToken, translationId) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/translations/approve`,
-    accessToken,
-    { translationId }
-  );
+  return postCliJson(`${host}/api/cli/${projectId}/translations/approve`, accessToken, {
+    translationId
+  });
 }
 async function unapproveCliTranslation(host, projectId, accessToken, translationId) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/translations/unapprove`,
-    accessToken,
-    { translationId }
-  );
+  return postCliJson(`${host}/api/cli/${projectId}/translations/unapprove`, accessToken, {
+    translationId
+  });
 }
 async function listCliOrganizations(host, accessToken) {
   return fetchCliJson(`${host}/api/cli/organizations`, {
@@ -3255,13 +3279,7 @@ async function patchCliJson(url, accessToken, body) {
   });
 }
 async function fetchCliJson(url, init) {
-  const res = await fetch(url, init);
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    const message = typeof body.error === "string" ? body.error : body.error?.message ?? `Request failed. Status: ${res.statusText}`;
-    throw new Error(message);
-  }
-  return await res.json();
+  return requestCliJson(url, init);
 }
 
 async function initProject(host, accessToken) {
@@ -3396,7 +3414,7 @@ function makePushToServer(host, accessToken) {
     newLanguages,
     input
   }) {
-    const res = await fetch(
+    return requestCliJson(
       `${host}/api/cli/${projectId}/addKeysAndTranslations`,
       {
         method: "POST",
@@ -3410,10 +3428,6 @@ function makePushToServer(host, accessToken) {
         })
       }
     );
-    if (!res.ok) {
-      throw new Error("Failed to add keys and translations");
-    }
-    return await res.json();
   };
 }
 
@@ -4082,16 +4096,13 @@ function computeTranslationWork(params) {
     targetLanguages,
     strategy,
     onlyExisting,
+    emptyValueString,
     languages,
     keys,
     namespaces
   } = params;
   const languageFilter = languages ? new Set(languages) : void 0;
-  const selectedKeys = keys && keys.length > 0 || namespaces && namespaces.length > 0 ? resolveSelectedKeys(
-    keys ?? [],
-    mergedKeysByKeyByNamespace,
-    namespaces ?? []
-  ) : void 0;
+  const selectedKeys = keys && keys.length > 0 || namespaces && namespaces.length > 0 ? resolveSelectedKeys(keys ?? [], mergedKeysByKeyByNamespace, namespaces ?? []) : void 0;
   const result = [];
   for (const keysInNamespace of Object.values(mergedKeysByKeyByNamespace)) {
     for (const key of Object.values(keysInNamespace)) {
@@ -4100,14 +4111,14 @@ function computeTranslationWork(params) {
       if (onlyExisting && !key.local) continue;
       if (selectedKeys && !selectedKeys.has(getComparisonKey(key))) continue;
       const hasApprovedReference = Object.values(key.translations).some(
-        (translation) => translation.server?.approved === true && translation.server.currentValue != void 0
+        (translation) => translation.server?.approved === true && translation.server.currentValue != null && translation.server.currentValue !== ""
       );
       if (!hasApprovedReference) continue;
       const missingLanguages = [];
       for (const lang of targetLanguages) {
         if (languageFilter && !languageFilter.has(lang)) continue;
         const serverTranslation = key.translations[lang]?.server;
-        const missing = serverTranslation?.currentValue == void 0;
+        const missing = serverTranslation?.currentValue == null || emptyValueString === "" && serverTranslation.currentValue === "";
         if (strategy === "missing") {
           if (missing) missingLanguages.push(lang);
         } else if (missing || serverTranslation?.approved !== true) {
@@ -4134,7 +4145,8 @@ async function pollTranslationJob(host, projectId, accessToken, jobId, timeoutSe
         progress: 0,
         total: 0,
         finished: 0,
-        failed: 0
+        failed: 0,
+        failures: []
       };
     }
     const status = await fetchJobStatus(host, projectId, accessToken, jobId);
@@ -4186,10 +4198,7 @@ ${Bold}  Sync & Translate${Reset}
       }
     }
   }
-  const pushedKeyIds = [
-    ...pushResult?.createdKeyIds ?? [],
-    ...pushResult?.updatedKeyIds ?? []
-  ];
+  const pushedKeyIds = [...pushResult?.createdKeyIds ?? [], ...pushResult?.updatedKeyIds ?? []];
   if (pushStatus === "pushed") {
     syncResult = await input.reFetchAndSync();
   }
@@ -4197,7 +4206,8 @@ ${Bold}  Sync & Translate${Reset}
     mergedKeysByKeyByNamespace: syncResult.mergedKeysByKeyByNamespace,
     targetLanguages: input.targetLanguages,
     strategy: "missing",
-    onlyExisting: input.onlyExisting
+    onlyExisting: input.onlyExisting,
+    emptyValueString: input.emptyValueString
   });
   const workKeyIds = new Set(workSet.map((w) => w.keyId));
   let translateSummary;
@@ -4277,7 +4287,8 @@ ${Bold}  Sync & Translate${Reset}
                 total: translateSummary?.total ?? 0,
                 finished: translateSummary?.finished ?? 0,
                 failed: translateSummary?.failed ?? 0
-              }
+              },
+              failures: translateSummary?.failures ?? []
             },
             pull: {
               status: pullStatus,
@@ -4294,9 +4305,15 @@ ${Bold}  Sync & Translate${Reset}
     );
     return translateSummary?.status === "failed" ? 2 : 0;
   }
-  console.info(`
+  if (translateSummary?.status === "failed") {
+    console.info(`
+${FgYellow}${Bold}  Translation finished with failures.${Reset}
+`);
+  } else {
+    console.info(`
 ${FgGreen}${Bold}  Done \u2014 your changes are synced.${Reset}
 `);
+  }
   return translateSummary?.status === "failed" ? 2 : 0;
 }
 function buildScoreMap(reviews) {
@@ -4403,12 +4420,7 @@ async function questionTranslateLoop(input) {
   ${Bold}Translating ${workSet.length} key${workSet.length !== 1 ? "s" : ""}...${Reset}`
       );
     }
-    const response = await requestTranslation(
-      host,
-      projectId,
-      accessToken,
-      keysToTranslate
-    );
+    const response = await requestTranslation(host, projectId, accessToken, keysToTranslate);
     const finalStatus = await pollTranslationJob(
       host,
       projectId,
@@ -4422,7 +4434,8 @@ async function questionTranslateLoop(input) {
       status: finalStatus.status,
       total: finalStatus.total,
       finished: finalStatus.finished,
-      failed: finalStatus.failed
+      failed: finalStatus.failed,
+      failures: finalStatus.failures
     };
     if (finalStatus.status === "complete") {
       if (!flags.json) {
@@ -4436,6 +4449,12 @@ async function questionTranslateLoop(input) {
           `  ${FgYellow}Translation finished with failures: ${finalStatus.failed}/${finalStatus.total} failed.${Reset}`
         );
       }
+      for (const failure of finalStatus.failures) {
+        if (!flags.json) {
+          console.info(`  ${failure.process_id}: ${failure.message}`);
+        }
+      }
+      break;
     } else {
       if (!flags.json) {
         console.info(
@@ -4485,7 +4504,9 @@ async function pullWithTierPicker(input) {
     console.info(`
   ${Bold}Keys to pull:${Reset}
 `);
-    const { text, hiddenCount } = renderKeyCards(uniquePullKeys, termWidth, { scores });
+    const { text, hiddenCount } = renderKeyCards(uniquePullKeys, termWidth, {
+      scores
+    });
     console.info(text);
     if (hiddenCount > 0) {
       console.info(`
@@ -4550,6 +4571,20 @@ async function pullFromDashboard(input) {
     pushedKeyIds: [],
     hasS2tContext: false
   });
+}
+
+function getTargetLanguageCodes(languages) {
+  return languages.filter((language) => !language.isSource).map((language) => language.code);
+}
+
+function serializeCliError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!(error instanceof CliRequestError)) return { message };
+  return {
+    message,
+    ...error.code ? { code: error.code } : {},
+    ...error.httpStatus !== void 0 ? { http_status: error.httpStatus } : {}
+  };
 }
 
 async function keyListCommand(ctx, options) {
@@ -4879,12 +4914,7 @@ async function jobCommand(ctx, options) {
     options.jobId,
     options.timeout,
     ctx.flags
-  ) : await fetchJobStatus(
-    ctx.host,
-    ctx.projectId,
-    ctx.accessToken,
-    options.jobId
-  );
+  ) : await fetchJobStatus(ctx.host, ctx.projectId, ctx.accessToken, options.jobId);
   if (ctx.flags.json) {
     console.info(
       JSON.stringify(
@@ -4898,7 +4928,8 @@ async function jobCommand(ctx, options) {
             finished: status.finished,
             failed: status.failed,
             progress: status.progress
-          }
+          },
+          failures: status.failures.length > 0 ? status.failures : void 0
         },
         null,
         2
@@ -4914,15 +4945,19 @@ async function jobCommand(ctx, options) {
     console.info(
       `${FgYellow}Job finished with failures: ${status.failed}/${status.total} failed.${Reset}`
     );
+    for (const failure of status.failures) {
+      console.info(`  ${failure.process_id}: ${failure.message}`);
+    }
   } else if (status.status === "timeout") {
-    console.info(
-      `${FgYellow}Still running. Job continues on server.${Reset}`
-    );
+    console.info(`${FgYellow}Still running. Job continues on server.${Reset}`);
     console.info(`Run ${Bold}babli job ${options.jobId}${Reset} to check again.`);
   } else {
-    console.info(
-      `Job ${status.status}: ${status.finished}/${status.total} processes finished.`
-    );
+    console.info(`Job ${status.status}: ${status.finished}/${status.total} processes finished.`);
+  }
+  if (status.status !== "failed") {
+    for (const failure of status.failures) {
+      console.info(`  ${failure.process_id}: ${failure.message}`);
+    }
   }
   return status.status === "failed" ? 2 : 0;
 }
@@ -4945,12 +4980,21 @@ function summarize(work, strategy) {
   };
 }
 async function translateCommand(input) {
-  validateLanguages(input);
+  try {
+    validateLanguages(input);
+  } catch (error) {
+    return reportFailure(input, void 0, error);
+  }
   const work = computeWork(input);
   const summary = summarize(work, input.strategy);
   if (work.length === 0) {
     if (input.flags.json) {
-      emitJson({ version: 1, command: "translate", status: "skipped", summary });
+      emitJson({
+        version: 1,
+        command: "translate",
+        status: "skipped",
+        summary
+      });
     } else {
       console.info(`${FgGreen}No missing translations to process.${Reset}`);
     }
@@ -4958,7 +5002,12 @@ async function translateCommand(input) {
   }
   if (input.dryRun) {
     if (input.flags.json) {
-      emitJson({ version: 1, command: "translate", status: "dry_run", summary });
+      emitJson({
+        version: 1,
+        command: "translate",
+        status: "dry_run",
+        summary
+      });
     } else {
       printDryRun(work, summary, input.flags.full);
     }
@@ -4999,9 +5048,7 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
       console.info(
         `${Dim}Job started: ${response.jobId} (${response.numberOfProcesses} processes)${Reset}`
       );
-      console.info(
-        `Run ${Bold}babli job ${response.jobId}${Reset} to check status.`
-      );
+      console.info(`Run ${Bold}babli job ${response.jobId}${Reset} to check status.`);
     }
     return 0;
   }
@@ -5033,7 +5080,8 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
         total: finalStatus.total,
         finished: finalStatus.finished,
         failed: finalStatus.failed
-      }
+      },
+      failures: finalStatus.failures.length > 0 ? finalStatus.failures : void 0
     });
   } else if (finalStatus.status === "complete") {
     console.info(
@@ -5043,13 +5091,14 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
     console.info(
       `${FgYellow}Translation finished with failures: ${finalStatus.failed}/${finalStatus.total} failed.${Reset}`
     );
+    for (const failure of finalStatus.failures) {
+      console.info(`  ${failure.process_id}: ${failure.message}`);
+    }
   } else {
     console.info(
       `${FgYellow}Translation timed out after ${input.timeout}s. Job continues on server.${Reset}`
     );
-    console.info(
-      `Run ${Bold}babli job ${response.jobId}${Reset} to check status.`
-    );
+    console.info(`Run ${Bold}babli job ${response.jobId}${Reset} to check status.`);
   }
   return finalStatus.status === "failed" ? 2 : 0;
 }
@@ -5106,10 +5155,11 @@ function reportFailure(input, jobId, err) {
       command: "translate",
       status: "failed",
       job_id: jobId,
-      counts: { total: 0, finished: 0, failed: 0 }
+      counts: { total: 0, finished: 0, failed: 0 },
+      error: serializeCliError(err)
     });
   } else {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = serializeCliError(err).message;
     console.error(`${FgRed}Translation failed: ${message}${Reset}`);
   }
   return 2;
@@ -5119,13 +5169,17 @@ function printDryRun(work, summary, full) {
     `
 ${Bold}Dry run \u2014 would translate ${summary.keys} key(s), ${summary.language_pairs} language pair(s).${Reset}`
   );
-  console.info(`${Dim}Languages: ${summary.languages.join(", ")} \xB7 strategy: ${summary.strategy}${Reset}`);
+  console.info(
+    `${Dim}Languages: ${summary.languages.join(", ")} \xB7 strategy: ${summary.strategy}${Reset}`
+  );
   const limit = full ? work.length : 10;
   for (const item of work.slice(0, limit)) {
     console.info(`  ${item.keyId}: ${item.languages.join(", ")}`);
   }
   if (work.length > limit) {
-    console.info(`  ${Dim}... and ${work.length - limit} more. Run with --full for the complete list.${Reset}`);
+    console.info(
+      `  ${Dim}... and ${work.length - limit} more. Run with --full for the complete list.${Reset}`
+    );
   }
 }
 function validateLanguages(input) {
@@ -5141,6 +5195,7 @@ function validateLanguages(input) {
 function computeWork(input) {
   if (input.keyIds && input.keyIds.length > 0) {
     const languages = input.languages ?? input.targetLanguages;
+    if (languages.length === 0) return [];
     return input.keyIds.map((keyId) => ({ keyId, languages }));
   }
   return computeTranslationWork({
@@ -5148,6 +5203,7 @@ function computeWork(input) {
     targetLanguages: input.targetLanguages,
     strategy: input.strategy,
     onlyExisting: input.onlyExisting,
+    emptyValueString: input.emptyValueString,
     languages: input.languages,
     keys: input.keys,
     namespaces: input.namespaces
@@ -5571,11 +5627,13 @@ function handleProgramError(err) {
   const error = err instanceof Error ? err : new Error(String(err));
   const isCommanderError = typeof code === "string" && code.startsWith("commander.");
   if (getGlobalFlags().json) {
+    const serialized = serializeCliError(error);
     console.info(
       JSON.stringify(
         {
           error: {
-            message: error.message.replace(/^error: /, "")
+            ...serialized,
+            message: serialized.message.replace(/^error: /, "")
           },
           status: "error",
           version: 1
@@ -5604,12 +5662,11 @@ async function run(cliInput) {
       process.exit(0);
     }
     if (getGlobalFlags().json) {
+      const error = serializeCliError(err);
       console.info(
         JSON.stringify(
           {
-            error: {
-              message: err instanceof Error ? err.message : String(err)
-            },
+            error,
             status: "error",
             version: 1
           },
@@ -5826,8 +5883,7 @@ async function runAction(cliInput, flags) {
   if (cliInput.action === "workflow" || cliInput.action === "sync-and-translate") {
     const projectInfo = await fetchProjectInfo(host, projectId, accessToken);
     const projectName = projectInfo.name;
-    const sourceLanguage = projectInfo.languages[0]?.code ?? "en";
-    const targetLanguages = projectInfo.languages.slice(1).map((l) => l.code);
+    const targetLanguages = getTargetLanguageCodes(projectInfo.languages);
     let questionsFetchFailed = false;
     const [result2, questions] = await Promise.all([
       doSync({ action: "status" }),
@@ -5842,8 +5898,8 @@ async function runAction(cliInput, flags) {
       accessToken,
       flags,
       syncResult: result2,
-      sourceLanguage,
       targetLanguages,
+      emptyValueString: parsed.emptyValueString,
       onlyExisting: cliInput.action === "sync-and-translate" ? cliInput.options.onlyExisting : false,
       doPush: (keysToRemove) => doSync({ action: "push", keysToRemove, quiet: true }),
       reFetchAndSync: () => doSync({ action: "status" }),
@@ -5951,7 +6007,7 @@ async function runAction(cliInput, flags) {
   }
   if (cliInput.action === "translate") {
     const projectInfo = await fetchProjectInfo(host, projectId, accessToken);
-    const targetLanguages = projectInfo.languages.slice(1).map((l) => l.code);
+    const targetLanguages = getTargetLanguageCodes(projectInfo.languages);
     const exitCode = await translateCommand({
       host,
       projectId,
@@ -5962,6 +6018,7 @@ async function runAction(cliInput, flags) {
       languages: cliInput.options.languages,
       strategy: cliInput.options.strategy,
       onlyExisting: cliInput.options.onlyExisting,
+      emptyValueString: parsed.emptyValueString,
       keys: cliInput.options.keys,
       namespaces: cliInput.options.namespaces,
       keyIds: cliInput.options.keyIds,

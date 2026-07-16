@@ -120,7 +120,7 @@
             "null"
           ],
           "default": null,
-          "description": "In case you use some specific value to mark the value is not translated yet,\nFor example 'NOT_TRANSLATED', You can define it here."
+          "description": "In case you use some specific value to mark the value is not translated yet,\nFor example 'NOT_TRANSLATED' or an empty string, You can define it here."
         },
         "$schema": {
           "type": "string"

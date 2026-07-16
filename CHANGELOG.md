@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-16
+
+### Added
+
+- Translation job JSON and terminal output now include safe per-process failure details.
+
+### Fixed
+
+- Honor `emptyValueString: ""` as an untranslated local placeholder without creating recurring sync debt.
+- Derive translation targets from project source-language metadata instead of language order.
+- Reject and retry incomplete AI translation output before saving it.
+- Stop `sync-and-translate` after a failed batch, pull successful partial results, and exit with code 2.
+- Retry transient CLI reads and preserve structured server error metadata without leaking response bodies.
+
 ## [0.6.0] - 2026-07-16
 
 ### Added
