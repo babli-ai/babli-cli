@@ -43,11 +43,27 @@
                 "enum": [
                   "json",
                   "yaml",
+                  "neon",
                   "flutterArb",
                   "typescript",
                   "po"
                 ],
                 "description": "Babli will autodetect format from file extensions. But if using non-standard extensions, you can change format here."
+              },
+              "namespace": {
+                "type": "string",
+                "description": "Fixed namespace for all keys from this file entry. Mutually exclusive with {{namespace}} in path."
+              },
+              "mapLocalToRemote": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Maps local file language codes to remote Babli language codes. E.g. { \"en\": \"en-US\", \"de\": \"de-DE\" }. Unmapped codes pass through as-is."
+              },
+              "transform": {
+                "type": "string",
+                "description": "Path to a custom transform file (.ts/.js) for non-standard file formats. The transform handles push/pull for all languages in a single file."
               },
               "nested": {
                 "type": "boolean",
