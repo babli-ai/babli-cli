@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-12
+
+### Added
+
+- Scoped translation coverage in `status` and namespaced work items.
+- Key, namespace, language, quality, credit-cap, and timeout options for `sync-and-translate`.
+- Translation/process counts, charged credits, and format-warning counts in JSON output.
+
+### Changed
+
+- Reuse saved question answers during subsequent translations.
+- Report message-format concerns as review warnings while preserving generated output.
+
+### Fixed
+
+- Keep duplicate key names in different namespaces distinct.
+- Validate scope and credit caps before atomically charging and creating jobs.
+- Preserve job identity/progress on timeout, pull partial results, and exit with code 2.
+- Preserve and report format warnings across `sync-and-translate` rounds, failures, and timeouts.
+
 ## [0.6.1] - 2026-07-16
 
 ### Added

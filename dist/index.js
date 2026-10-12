@@ -9,10 +9,11 @@ import open from 'open';
 import path, { join, resolve } from 'path';
 import { z } from 'zod';
 import { glob } from 'glob';
-import ignore from 'ignore';
-import { pathToFileURL } from 'url';
 import * as minimatch from 'minimatch';
 import { minimatch as minimatch$1 } from 'minimatch';
+import ignore from 'ignore';
+import { pathToFileURL } from 'url';
+import { readFile } from 'node:fs/promises';
 import { parse, stringify } from 'yaml';
 import { fromError } from 'zod-validation-error';
 import yaml from 'js-yaml';
@@ -1065,7 +1066,7 @@ function namespaceFilePathToRegex(namespaceFilePath) {
 
 var __defProp$1 = Object.defineProperty;
 var __defNormalProp$1 = (obj, key, value) => key in obj ? __defProp$1(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
-var __publicField$1 = (obj, key, value) => __defNormalProp$1(obj, key + "" , value);
+var __publicField$1 = (obj, key, value) => __defNormalProp$1(obj, typeof key !== "symbol" ? key + "" : key, value);
 async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
   const allFilesByPattern = {};
   const languagesInConfig = new AllLanguagesGatherer(translationFilesConfig);
@@ -1160,7 +1161,7 @@ async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
 }
 class AllLanguagesGatherer {
   constructor(translationFilesConfig) {
-    this.translationFilesConfig = translationFilesConfig;
+    __publicField$1(this, "translationFilesConfig", translationFilesConfig);
     __publicField$1(this, "allLanguagesInConfig", /* @__PURE__ */ new Set());
     for (const fileConfig of this.translationFilesConfig) {
       if (fileConfig.languages) {
@@ -1170,7 +1171,6 @@ class AllLanguagesGatherer {
       }
     }
   }
-  translationFilesConfig;
   has(lang) {
     return this.allLanguagesInConfig.has(lang);
   }
@@ -2512,7 +2512,7 @@ function matchNamespace(ns, pattern) {
   if (ns === "" && (pattern === "*" || pattern === "**")) return true;
   return minimatch$1(ns, pattern, MATCH_OPTS);
 }
-function matchKeyPattern(pattern, key, ns) {
+function matchKeyPattern(pattern, key, ns, matchBareKeyInAnyNamespace) {
   if (getComparisonKey(key) === pattern) return true;
   if (ns === "" && key.key === pattern) return true;
   const colon = pattern.indexOf(":");
@@ -2523,7 +2523,7 @@ function matchKeyPattern(pattern, key, ns) {
   }
   if (pattern === "*" || pattern === "**")
     return minimatch$1(key.key, pattern, MATCH_OPTS);
-  return ns === "" && minimatch$1(key.key, pattern, MATCH_OPTS);
+  return (matchBareKeyInAnyNamespace || ns === "") && minimatch$1(key.key, pattern, MATCH_OPTS);
 }
 function resolveSelectedKeys(requestedKeys, mergedKeysByKeyByNamespace, requestedNamespaces = []) {
   const allKeys = Object.values(mergedKeysByKeyByNamespace).flatMap(
@@ -2537,7 +2537,7 @@ function resolveSelectedKeys(requestedKeys, mergedKeysByKeyByNamespace, requeste
   for (const key of allKeys) {
     const ns = getNamespace$1(key);
     const matchedKeyPatterns = requestedKeys.filter(
-      (p) => matchKeyPattern(p, key, ns)
+      (p) => matchKeyPattern(p, key, ns, requestedNamespaces.length > 0)
     );
     const keyMatches = requestedKeys.length === 0 || matchedKeyPatterns.length > 0;
     const matchedNamespacePatterns = requestedNamespaces.filter(
@@ -2745,8 +2745,8 @@ async function runCli({
   if (cliInput.action === "push" && cliInput.keysToRemove && cliInput.keysToRemove.length > 0) {
     comparison.keysToRemove = cliInput.keysToRemove;
   }
-  const filterKeys = cliInput.action === "push" ? cliInput.keys : cliInput.action === "pull" ? cliInput.options.keys : void 0;
-  const filterNamespaces = cliInput.action === "push" ? cliInput.namespaces : cliInput.action === "pull" ? cliInput.options.namespaces : void 0;
+  const filterKeys = cliInput.action === "push" ? cliInput.keys : cliInput.action === "pull" ? cliInput.options.keys : cliInput.action === "status" ? cliInput.keys : void 0;
+  const filterNamespaces = cliInput.action === "push" ? cliInput.namespaces : cliInput.action === "pull" ? cliInput.options.namespaces : cliInput.action === "status" ? cliInput.namespaces : void 0;
   const hasSelectionFilter = (filterKeys?.length ?? 0) > 0 || (filterNamespaces?.length ?? 0) > 0;
   let selectedKeys;
   let pushFilterSummary;
@@ -3082,8 +3082,124 @@ function computeDashboard(status, questionsCount, projectName, options) {
   return { projectName, badges, menuItems, isInSync, warnings };
 }
 
+function computeTranslationWork(params) {
+  const {
+    mergedKeysByKeyByNamespace,
+    targetLanguages,
+    strategy,
+    onlyExisting,
+    emptyValueString,
+    languages,
+    keys,
+    namespaces
+  } = params;
+  const languageFilter = languages ? new Set(languages) : void 0;
+  const selectedKeys = keys && keys.length > 0 || namespaces && namespaces.length > 0 ? resolveSelectedKeys(
+    keys ?? [],
+    mergedKeysByKeyByNamespace,
+    namespaces ?? []
+  ) : void 0;
+  const result = [];
+  for (const keysInNamespace of Object.values(mergedKeysByKeyByNamespace)) {
+    for (const key of Object.values(keysInNamespace)) {
+      const serverId = key.server?.id;
+      if (!serverId) continue;
+      if (onlyExisting && !key.local) continue;
+      if (selectedKeys && !selectedKeys.has(getComparisonKey(key))) continue;
+      const hasApprovedReference = Object.values(key.translations).some(
+        (translation) => translation.server?.approved === true && translation.server.currentValue != null && translation.server.currentValue !== ""
+      );
+      if (!hasApprovedReference) continue;
+      const missingLanguages = [];
+      for (const lang of targetLanguages) {
+        if (languageFilter && !languageFilter.has(lang)) continue;
+        const serverTranslation = key.translations[lang]?.server;
+        const missing = serverTranslation?.currentValue == null || emptyValueString === "" && serverTranslation.currentValue === "";
+        if (strategy === "missing") {
+          if (missing) missingLanguages.push(lang);
+        } else if (missing || serverTranslation?.approved !== true) {
+          missingLanguages.push(lang);
+        }
+      }
+      if (missingLanguages.length > 0) {
+        result.push({
+          keyId: serverId,
+          key: key.key,
+          namespace: key.server?.namespace ?? key.local?.namespace ?? "",
+          languages: missingLanguages
+        });
+      }
+    }
+  }
+  return result;
+}
+
+function computeTranslationCoverage(input) {
+  const selected = (input.keys?.length ?? 0) > 0 || (input.namespaces?.length ?? 0) > 0 ? resolveSelectedKeys(
+    input.keys ?? [],
+    input.syncResult.mergedKeysByKeyByNamespace,
+    input.namespaces ?? []
+  ) : void 0;
+  const workItems = computeTranslationWork({
+    mergedKeysByKeyByNamespace: input.syncResult.mergedKeysByKeyByNamespace,
+    targetLanguages: input.targetLanguages,
+    strategy: "missing",
+    onlyExisting: false,
+    emptyValueString: input.emptyValueString,
+    keys: input.keys,
+    namespaces: input.namespaces
+  });
+  const workIds = new Set(workItems.map((item) => item.keyId));
+  const blockedItems = [];
+  let keysWithMissingTranslations = 0;
+  let missingLanguagePairs = 0;
+  for (const keysInNamespace of Object.values(
+    input.syncResult.mergedKeysByKeyByNamespace
+  )) {
+    for (const key of Object.values(keysInNamespace)) {
+      const keyId = key.server?.id;
+      if (!keyId || selected && !selected.has(getComparisonKey(key)))
+        continue;
+      const missingLanguages = input.targetLanguages.filter((language) => {
+        const value = key.translations[language]?.server?.currentValue;
+        return value == null || input.emptyValueString === "" && value === "";
+      });
+      if (missingLanguages.length === 0) continue;
+      keysWithMissingTranslations += 1;
+      missingLanguagePairs += missingLanguages.length;
+      if (!workIds.has(keyId)) {
+        blockedItems.push({
+          keyId,
+          key: key.key,
+          namespace: key.server?.namespace ?? key.local?.namespace ?? "",
+          missingLanguages,
+          reason: "no_approved_reference"
+        });
+      }
+    }
+  }
+  return {
+    strategy: "missing",
+    status: workItems.length > 0 ? "needs_translation" : blockedItems.length > 0 ? "blocked" : "complete",
+    keysWithMissingTranslations,
+    missingLanguagePairs,
+    translatableKeys: workItems.length,
+    translatableLanguagePairs: workItems.reduce(
+      (total, item) => total + item.languages.length,
+      0
+    ),
+    blockedKeys: blockedItems.length,
+    workItems,
+    blockedItems
+  };
+}
+
 async function writeFile(file, content) {
   await fs__default.writeFile(file, content, "utf-8");
+}
+
+function getTargetLanguageCodes(languages) {
+  return languages.filter((language) => !language.isSource).map((language) => language.code);
 }
 
 async function fetchServerKeys(host, projectId, accessToken) {
@@ -3104,25 +3220,31 @@ async function fetchProjectInfo(host, projectId, accessToken) {
   );
   return result.project;
 }
-async function requestTranslation(host, projectId, accessToken, keys, model = "production") {
-  return requestCliJson(`${host}/api/cli/${projectId}/translate`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ keys, model })
-  });
+async function requestTranslation(host, projectId, accessToken, keys, model = "production", maxCreditUnits) {
+  return requestCliJson(
+    `${host}/api/cli/${projectId}/translate`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ keys, model, maxCreditUnits })
+    }
+  );
 }
 async function estimateTranslation(host, projectId, accessToken, keys, model = "production") {
-  return requestCliJson(`${host}/api/cli/${projectId}/estimate`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ keys, model })
-  });
+  return requestCliJson(
+    `${host}/api/cli/${projectId}/estimate`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ keys, model })
+    }
+  );
 }
 async function fetchJobStatus(host, projectId, accessToken, jobId) {
   const result = await requestCliJson(`${host}/api/cli/${projectId}/job/${jobId}`, {
@@ -3142,14 +3264,17 @@ async function fetchQuestions(host, projectId, accessToken) {
   return json.questions;
 }
 async function submitAnswers(host, projectId, accessToken, answers) {
-  return requestCliJson(`${host}/api/cli/${projectId}/answers`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ answers })
-  });
+  return requestCliJson(
+    `${host}/api/cli/${projectId}/answers`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ answers })
+    }
+  );
 }
 async function fetchPendingReviews(host, projectId, accessToken) {
   const json = await requestCliJson(
@@ -3161,24 +3286,30 @@ async function fetchPendingReviews(host, projectId, accessToken) {
   return json.pending;
 }
 async function approveTranslations(host, projectId, accessToken, translationIds) {
-  return requestCliJson(`${host}/api/cli/${projectId}/approve`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ translationIds })
-  });
+  return requestCliJson(
+    `${host}/api/cli/${projectId}/approve`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ translationIds })
+    }
+  );
 }
 async function requestProofread(host, projectId, accessToken, keyIds, languageId) {
-  return requestCliJson(`${host}/api/cli/${projectId}/proofread`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ keyIds, languageId })
-  });
+  return requestCliJson(
+    `${host}/api/cli/${projectId}/proofread`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ keyIds, languageId })
+    }
+  );
 }
 async function pingServer(host, cliVersion) {
   let json;
@@ -3212,35 +3343,67 @@ async function listCliKeys(host, projectId, accessToken, options) {
   });
 }
 async function getCliKey(host, projectId, accessToken, input) {
-  return postCliJson(`${host}/api/cli/${projectId}/keys/get`, accessToken, input);
+  return postCliJson(
+    `${host}/api/cli/${projectId}/keys/get`,
+    accessToken,
+    input
+  );
 }
 async function addCliKey(host, projectId, accessToken, input) {
   return postCliJson(`${host}/api/cli/${projectId}/keys`, accessToken, input);
 }
 async function updateCliKey(host, projectId, accessToken, input) {
-  return patchCliJson(`${host}/api/cli/${projectId}/keys/update`, accessToken, input);
+  return patchCliJson(
+    `${host}/api/cli/${projectId}/keys/update`,
+    accessToken,
+    input
+  );
 }
 async function renameCliKey(host, projectId, accessToken, input) {
-  return patchCliJson(`${host}/api/cli/${projectId}/keys/rename`, accessToken, input);
+  return patchCliJson(
+    `${host}/api/cli/${projectId}/keys/rename`,
+    accessToken,
+    input
+  );
 }
 async function archiveCliKey(host, projectId, accessToken, input) {
-  return postCliJson(`${host}/api/cli/${projectId}/keys/archive`, accessToken, input);
+  return postCliJson(
+    `${host}/api/cli/${projectId}/keys/archive`,
+    accessToken,
+    input
+  );
 }
 async function unarchiveCliKey(host, projectId, accessToken, input) {
-  return postCliJson(`${host}/api/cli/${projectId}/keys/unarchive`, accessToken, input);
+  return postCliJson(
+    `${host}/api/cli/${projectId}/keys/unarchive`,
+    accessToken,
+    input
+  );
 }
 async function upsertCliTranslation(host, projectId, accessToken, input) {
-  return postCliJson(`${host}/api/cli/${projectId}/translations/upsert`, accessToken, input);
+  return postCliJson(
+    `${host}/api/cli/${projectId}/translations/upsert`,
+    accessToken,
+    input
+  );
 }
 async function approveCliTranslation(host, projectId, accessToken, translationId) {
-  return postCliJson(`${host}/api/cli/${projectId}/translations/approve`, accessToken, {
-    translationId
-  });
+  return postCliJson(
+    `${host}/api/cli/${projectId}/translations/approve`,
+    accessToken,
+    {
+      translationId
+    }
+  );
 }
 async function unapproveCliTranslation(host, projectId, accessToken, translationId) {
-  return postCliJson(`${host}/api/cli/${projectId}/translations/unapprove`, accessToken, {
-    translationId
-  });
+  return postCliJson(
+    `${host}/api/cli/${projectId}/translations/unapprove`,
+    accessToken,
+    {
+      translationId
+    }
+  );
 }
 async function listCliOrganizations(host, accessToken) {
   return fetchCliJson(`${host}/api/cli/organizations`, {
@@ -3256,7 +3419,11 @@ async function getCliProject(host, projectId, accessToken) {
   });
 }
 async function updateCliProject(host, projectId, accessToken, input) {
-  return patchCliJson(`${host}/api/cli/${projectId}/project`, accessToken, input);
+  return patchCliJson(
+    `${host}/api/cli/${projectId}/project`,
+    accessToken,
+    input
+  );
 }
 async function postCliJson(url, accessToken, body) {
   return fetchCliJson(url, {
@@ -3383,6 +3550,134 @@ Next steps:`);
   }
 }
 
+async function pollTranslationJob(host, projectId, accessToken, jobId, timeoutSeconds, flags) {
+  const startTime = Date.now();
+  const timeoutMs = timeoutSeconds * 1e3;
+  let interval = 2e3;
+  let lastStatus;
+  while (true) {
+    const elapsed = Date.now() - startTime;
+    if (elapsed > timeoutMs) {
+      return {
+        status: "timeout",
+        progress: lastStatus?.progress ?? 0,
+        total: lastStatus?.total ?? 0,
+        finished: lastStatus?.finished ?? 0,
+        failed: lastStatus?.failed ?? 0,
+        failures: lastStatus?.failures ?? [],
+        formatWarningCount: lastStatus?.formatWarningCount,
+        creditsCharged: lastStatus?.creditsCharged
+      };
+    }
+    const status = await fetchJobStatus(host, projectId, accessToken, jobId);
+    lastStatus = status;
+    if (!flags.json) {
+      process.stdout.write(
+        `\r  ${Dim}Progress: ${status.progress}% (${status.finished}/${status.total})${Reset}  `
+      );
+    }
+    if (status.status === "complete" || status.status === "failed") {
+      if (!flags.json) {
+        process.stdout.write("\n");
+      }
+      return { ...status, status: status.status };
+    }
+    await sleep(interval);
+    if (elapsed > 1e4) interval = 5e3;
+    if (elapsed > 6e4) interval = 1e4;
+  }
+}
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function reportFormatWarnings(count) {
+  if (count) {
+    console.info(
+      `${FgYellow}${count} message format warnings. Review the generated translations in Babli.${Reset}`
+    );
+  }
+}
+
+async function jobCommand(ctx, options) {
+  const status = options.wait ? await pollTranslationJob(
+    ctx.host,
+    ctx.projectId,
+    ctx.accessToken,
+    options.jobId,
+    options.timeout,
+    ctx.flags
+  ) : await fetchJobStatus(
+    ctx.host,
+    ctx.projectId,
+    ctx.accessToken,
+    options.jobId
+  );
+  if (ctx.flags.json) {
+    console.info(
+      JSON.stringify(
+        {
+          version: 1,
+          command: "job",
+          status: status.status,
+          job_id: options.jobId,
+          counts: {
+            total: status.total,
+            finished: status.finished,
+            failed: status.failed,
+            progress: status.progress
+          },
+          process_counts: {
+            total: status.total,
+            finished: status.finished,
+            failed: status.failed
+          },
+          credits_charged: status.creditsCharged ? {
+            units: status.creditsCharged.total,
+            monthly_units: status.creditsCharged.monthly,
+            persistent_units: status.creditsCharged.persistent,
+            unit_scale: 100,
+            display: status.creditsCharged.total / 100
+          } : void 0,
+          failures: status.failures.length > 0 ? status.failures : void 0,
+          format_warning_count: status.formatWarningCount ?? 0
+        },
+        null,
+        2
+      )
+    );
+    return status.status === "failed" || status.status === "timeout" ? 2 : 0;
+  }
+  if (status.status === "complete") {
+    console.info(
+      `${FgGreen}Job complete: ${status.finished}/${status.total} processes finished.${Reset}`
+    );
+  } else if (status.status === "failed") {
+    console.info(
+      `${FgYellow}Job finished with failures: ${status.failed}/${status.total} failed.${Reset}`
+    );
+    for (const failure of status.failures) {
+      console.info(`  ${failure.process_id}: ${failure.message}`);
+    }
+  } else if (status.status === "timeout") {
+    console.info(`${FgYellow}Still running. Job continues on server.${Reset}`);
+    console.info(
+      `Run ${Bold}babli job ${options.jobId} --wait${Reset} to keep waiting.`
+    );
+  } else {
+    console.info(
+      `Job ${status.status}: ${status.finished}/${status.total} processes finished.`
+    );
+  }
+  if (status.status !== "failed") {
+    for (const failure of status.failures) {
+      console.info(`  ${failure.process_id}: ${failure.message}`);
+    }
+  }
+  reportFormatWarnings(status.formatWarningCount);
+  return status.status === "failed" || status.status === "timeout" ? 2 : 0;
+}
+
 async function loadTransform(transformPath, cwd) {
   const absolutePath = resolve(cwd, transformPath);
   let loaded;
@@ -3429,6 +3724,22 @@ function makePushToServer(host, accessToken) {
       }
     );
   };
+}
+
+function parseCreditUnits(value) {
+  const match = /^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/.exec(value);
+  if (!match) {
+    throw new Error(
+      `Invalid credit limit: "${value}". Use a non-negative amount with at most two decimals.`
+    );
+  }
+  const whole = Number(match[1]);
+  const fraction = Number((match[2] ?? "").padEnd(2, "0"));
+  const units = whole * 100 + fraction;
+  if (!Number.isSafeInteger(units)) {
+    throw new Error(`Credit limit is too large: "${value}".`);
+  }
+  return units;
 }
 
 function printJson(value) {
@@ -3591,87 +3902,100 @@ ${Dim}Suggestions saved on server. Apply them in the Babli dashboard.${Reset}`
   }
 }
 
-async function questionsCommand(ctx) {
-  const questions = ctx.questions ?? await fetchQuestions(ctx.host, ctx.projectId, ctx.accessToken);
-  if (questions.length === 0) {
-    if (ctx.flags.json) {
-      const output = {
-        version: 1,
-        command: "questions",
-        status: "none",
-        summary: { total: 0, answered: 0 }
-      };
-      console.info(JSON.stringify(output, null, 2));
-    } else {
-      console.info(`${FgGreen}No unanswered questions.${Reset}`);
-    }
-    return;
-  }
-  if (ctx.flags.json && ctx.flags.noInteraction) {
-    const output = {
-      version: 1,
-      command: "questions",
-      status: "skipped",
-      summary: { total: questions.length, answered: 0 }
-    };
-    console.info(JSON.stringify(output, null, 2));
-    return;
-  }
-  if (!ctx.flags.json) {
-    console.info(`
-${Bold}${questions.length} unanswered question(s):${Reset}
-`);
-  }
-  const answersToSubmit = [];
-  for (const q of questions) {
-    if (!ctx.flags.json) {
-      console.info(`${Dim}[${q.languageCode}] ${q.keyName}${Reset}`);
-      console.info(`  ${q.question}`);
-    }
-    if (ctx.flags.noInteraction) continue;
-    const answer = await input({
-      message: "Your answer (press Enter to skip):"
-    });
-    if (answer.trim()) {
-      answersToSubmit.push({
-        keyId: q.keyId,
-        languageId: q.languageId,
-        questionText: q.question,
-        answer: answer.trim()
+const MAX_TRANSLATION_ANSWERS = 500;
+const translationAnswerInput = z.object({
+  keyId: z.string().uuid(),
+  languageId: z.string().uuid(),
+  questionText: z.string().min(1),
+  answer: z.string().trim().min(1)
+}).strict();
+const translationAnswersInput = z.object({
+  answers: z.array(translationAnswerInput).min(1).max(MAX_TRANSLATION_ANSWERS)
+}).strict().superRefine(({ answers }, ctx) => {
+  const seen = /* @__PURE__ */ new Set();
+  for (const [index, answer] of answers.entries()) {
+    const identity = JSON.stringify([
+      answer.keyId,
+      answer.languageId,
+      answer.questionText
+    ]);
+    if (seen.has(identity)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["answers", index],
+        message: "Duplicate question in answer batch"
       });
     }
+    seen.add(identity);
   }
-  if (answersToSubmit.length > 0) {
+});
+
+async function questionsCommand(ctx) {
+  const fileAnswers = ctx.answersFile === void 0 ? void 0 : translationAnswersInput.parse(
+    JSON.parse(await readFile(ctx.answersFile, "utf8"))
+  ).answers;
+  const questions = ctx.questions ?? await fetchQuestions(ctx.host, ctx.projectId, ctx.accessToken);
+  const answers = fileAnswers ?? [];
+  let answered = 0;
+  async function saveAnswers() {
     const result = await submitAnswers(
       ctx.host,
       ctx.projectId,
       ctx.accessToken,
-      answersToSubmit
+      [...answers]
     );
-    if (ctx.flags.json) {
-      const output = {
-        version: 1,
-        command: "questions",
-        status: "answered",
-        summary: { total: questions.length, answered: result.answered }
-      };
-      console.info(JSON.stringify(output, null, 2));
-    } else {
-      console.info(`
-${FgGreen}Submitted ${result.answered} answer(s). Quality scores will be recalculated.${Reset}`);
+    if (result.answered !== answers.length)
+      throw new Error(
+        `Server saved ${result.answered} of ${answers.length} answers. Fetch questions again before retrying.`
+      );
+    answered += result.answered;
+    answers.length = 0;
+    if (!ctx.flags.json) {
+      console.info(
+        `${FgGreen}Saved ${answered} answer(s). Retranslate the affected keys to apply them.${Reset}`
+      );
     }
-  } else {
-    if (ctx.flags.json) {
-      const output = {
-        version: 1,
-        command: "questions",
-        status: "skipped",
-        summary: { total: questions.length, answered: 0 }
-      };
-      console.info(JSON.stringify(output, null, 2));
-    } else if (!ctx.flags.noInteraction) {
-      console.info(`${FgYellow}No answers provided.${Reset}`);
+  }
+  if (!fileAnswers && !ctx.flags.json) {
+    console.info(
+      questions.length ? `
+${Bold}${questions.length} unanswered question(s):${Reset}
+` : `${FgGreen}No unanswered questions.${Reset}`
+    );
+    for (const question of questions) {
+      console.info(
+        `${Dim}[${question.languageCode}] ${question.keyName}${Reset}`
+      );
+      console.info(`  ${question.question}`);
+      if (ctx.flags.noInteraction) continue;
+      const answer = (await input({ message: "Your answer (press Enter to skip):" })).trim();
+      if (answer)
+        answers.push({
+          keyId: question.keyId,
+          languageId: question.languageId,
+          questionText: question.question,
+          answer
+        });
+      if (answers.length === MAX_TRANSLATION_ANSWERS) await saveAnswers();
     }
+  }
+  if (answers.length) await saveAnswers();
+  const remaining = answered ? await fetchQuestions(ctx.host, ctx.projectId, ctx.accessToken) : questions;
+  if (ctx.flags.json) {
+    console.info(
+      JSON.stringify(
+        {
+          version: 1,
+          command: "questions",
+          status: answered ? "answered" : questions.length ? "skipped" : "none",
+          summary: { total: questions.length, answered },
+          questions: remaining,
+          retranslationRequired: answered > 0
+        },
+        null,
+        2
+      )
+    );
   }
 }
 
@@ -3762,8 +4086,9 @@ function deduplicateByKey(grouped) {
   const seen = /* @__PURE__ */ new Map();
   for (const keys of Object.values(grouped)) {
     for (const key of keys) {
-      if (!seen.has(key.key)) {
-        seen.set(key.key, key);
+      const comparisonKey = getComparisonKey(key);
+      if (!seen.has(comparisonKey)) {
+        seen.set(comparisonKey, key);
       }
     }
   }
@@ -3778,7 +4103,9 @@ function renderSection(lines, keys, termWidth, full, options) {
   });
   lines.push(text);
   if (hiddenCount > 0) {
-    lines.push(`    ${Dim}... and ${hiddenCount} more. Run with --full for complete list.${Reset}`);
+    lines.push(
+      `    ${Dim}... and ${hiddenCount} more. Run with --full for complete list.${Reset}`
+    );
   }
 }
 function renderStatusHuman(comparison, status, opts) {
@@ -3797,18 +4124,25 @@ function renderStatusHuman(comparison, status, opts) {
   const newKeyNamesOnServer = new Set(
     newKeysOnServer.map((key) => getComparisonKey(key))
   );
-  const missingTranslationsKeys = deduplicateByKey(comparison.missingTranslationsOnServerPerLanguage).filter((k) => !newKeyNamesOnServer.has(getComparisonKey(k)));
-  const changedKeys = deduplicateByKey(comparison.differentTranslationsLanguage);
+  const missingTranslationsKeys = deduplicateByKey(
+    comparison.missingTranslationsOnServerPerLanguage
+  ).filter((k) => !newKeyNamesOnServer.has(getComparisonKey(k)));
+  const changedKeys = deduplicateByKey(
+    comparison.differentTranslationsLanguage
+  );
   const newKeysOnLocal = Object.values(comparison.missingKeysOnLocal);
   const newKeyNamesOnLocal = new Set(
     newKeysOnLocal.map((key) => getComparisonKey(key))
   );
-  const missingTranslationsLocalKeys = deduplicateByKey(comparison.missingTranslationsOnLocalPerLanguage).filter((k) => !newKeyNamesOnLocal.has(getComparisonKey(k)));
+  const missingTranslationsLocalKeys = deduplicateByKey(
+    comparison.missingTranslationsOnLocalPerLanguage
+  ).filter((k) => !newKeyNamesOnLocal.has(getComparisonKey(k)));
   const hasPush = newKeysOnServer.length > 0 || changedKeys.length > 0 || missingTranslationsKeys.length > 0;
   const hasPull = newKeysOnLocal.length > 0 || missingTranslationsLocalKeys.length > 0;
   if (!hasPush && !hasPull && status.languages.serverOnly.length === 0) {
     lines.push("");
-    lines.push(`  ${FgGreen}Everything is in sync.${Reset}`);
+    lines.push(`  ${FgGreen}Local files and Babli are in sync.${Reset}`);
+    renderCoverage(lines, opts.coverage, opts.full);
     lines.push("");
     return lines.join("\n");
   }
@@ -3823,16 +4157,25 @@ function renderStatusHuman(comparison, status, opts) {
     if (changedKeys.length > 0) {
       lines.push("");
       lines.push(`  ${FgYellow}${changedKeys.length} changed values:${Reset}`);
-      renderSection(lines, changedKeys, termWidth, opts.full, { showDiff: true, onlyChanges: true });
+      renderSection(lines, changedKeys, termWidth, opts.full, {
+        showDiff: true,
+        onlyChanges: true
+      });
     }
     if (missingTranslationsKeys.length > 0) {
-      const totalCount = Object.values(comparison.missingTranslationsOnServerPerLanguage).reduce(
+      const totalCount = Object.values(
+        comparison.missingTranslationsOnServerPerLanguage
+      ).reduce(
         (s, keys) => s + keys.filter((k) => !newKeyNamesOnServer.has(getComparisonKey(k))).length,
         0
       );
       lines.push("");
-      lines.push(`  ${FgGreen}${totalCount} missing translations across ${missingTranslationsKeys.length} keys:${Reset}`);
-      renderSection(lines, missingTranslationsKeys, termWidth, opts.full, { onlyChanges: true });
+      lines.push(
+        `  ${FgGreen}${totalCount} missing translations across ${missingTranslationsKeys.length} keys:${Reset}`
+      );
+      renderSection(lines, missingTranslationsKeys, termWidth, opts.full, {
+        onlyChanges: true
+      });
     }
   }
   if (hasPull) {
@@ -3840,27 +4183,38 @@ function renderStatusHuman(comparison, status, opts) {
     lines.push(`  ${FgBlue}${Bold}\u2B07 TO PULL${Reset}`);
     if (newKeysOnLocal.length > 0) {
       lines.push("");
-      lines.push(`  ${FgBlue}${newKeysOnLocal.length} new keys from server:${Reset}`);
+      lines.push(
+        `  ${FgBlue}${newKeysOnLocal.length} new keys from server:${Reset}`
+      );
       renderSection(lines, newKeysOnLocal, termWidth, opts.full);
     }
     if (missingTranslationsLocalKeys.length > 0) {
-      const totalCount = Object.values(comparison.missingTranslationsOnLocalPerLanguage).reduce(
+      const totalCount = Object.values(
+        comparison.missingTranslationsOnLocalPerLanguage
+      ).reduce(
         (s, keys) => s + keys.filter((k) => !newKeyNamesOnLocal.has(getComparisonKey(k))).length,
         0
       );
       lines.push("");
-      lines.push(`  ${FgBlue}${totalCount} translations available across ${missingTranslationsLocalKeys.length} keys:${Reset}`);
-      renderSection(lines, missingTranslationsLocalKeys, termWidth, opts.full, { onlyChanges: true });
+      lines.push(
+        `  ${FgBlue}${totalCount} translations available across ${missingTranslationsLocalKeys.length} keys:${Reset}`
+      );
+      renderSection(lines, missingTranslationsLocalKeys, termWidth, opts.full, {
+        onlyChanges: true
+      });
     }
   }
   if (status.languages.serverOnly.length > 0) {
     lines.push("");
-    lines.push(`  ${FgYellow}Languages on server not in local files: ${status.languages.serverOnly.join(", ")}${Reset}`);
+    lines.push(
+      `  ${FgYellow}Languages on server not in local files: ${status.languages.serverOnly.join(", ")}${Reset}`
+    );
   }
+  renderCoverage(lines, opts.coverage, opts.full);
   lines.push("");
   return lines.join("\n");
 }
-function renderStatusJson(status) {
+function renderStatusJson(status, coverage, filter) {
   const totalMissingTranslationsToPush = Object.values(
     status.toPush.missingTranslations
   ).reduce((sum, keys) => sum + keys.length, 0);
@@ -3870,7 +4224,13 @@ function renderStatusJson(status) {
   return JSON.stringify(
     {
       version: 1,
+      command: "status",
       status: status.needPush || status.needPull ? "has_changes" : "clean",
+      filter: {
+        applied: (filter?.keys.length ?? 0) > 0 || (filter?.namespaces.length ?? 0) > 0,
+        keys: filter?.keys ?? [],
+        namespaces: filter?.namespaces ?? []
+      },
       summary: {
         languages: status.languages.synced.concat(
           status.languages.localOnly,
@@ -3912,11 +4272,62 @@ function renderStatusJson(status) {
         missing_translations_to_push: totalMissingTranslationsToPush,
         missing_keys_to_pull: status.toPull.missingKeys.length,
         missing_translations_to_pull: totalMissingTranslationsToPull
-      }
+      },
+      translation_coverage: coverage ? {
+        strategy: coverage.strategy,
+        status: coverage.status,
+        summary: {
+          keys_with_missing_translations: coverage.keysWithMissingTranslations,
+          missing_language_pairs: coverage.missingLanguagePairs,
+          translatable_keys: coverage.translatableKeys,
+          translatable_language_pairs: coverage.translatableLanguagePairs,
+          blocked_keys: coverage.blockedKeys
+        },
+        work_items: coverage.workItems.map((item) => ({
+          key_id: item.keyId,
+          key: item.key,
+          namespace: item.namespace,
+          missing_languages: item.languages
+        })),
+        blocked_items: coverage.blockedItems.map((item) => ({
+          key_id: item.keyId,
+          key: item.key,
+          namespace: item.namespace,
+          missing_languages: item.missingLanguages,
+          reason: item.reason
+        }))
+      } : void 0
     },
     null,
     2
   );
+}
+function renderCoverage(lines, coverage, full) {
+  if (!coverage) return;
+  lines.push("");
+  lines.push(`  ${Bold}TRANSLATION COVERAGE${Reset}`);
+  if (coverage.status === "complete") {
+    lines.push(`  ${FgGreen}All target translations are present.${Reset}`);
+    return;
+  }
+  lines.push(
+    `  ${FgYellow}${coverage.missingLanguagePairs} missing language pair(s) across ${coverage.keysWithMissingTranslations} key(s).${Reset}`
+  );
+  const limit = full ? coverage.workItems.length : 10;
+  for (const item of coverage.workItems.slice(0, limit)) {
+    const label = item.namespace ? `${item.namespace}:${item.key}` : item.key;
+    lines.push(`    ${label}: ${item.languages.join(", ")}`);
+  }
+  if (coverage.workItems.length > limit) {
+    lines.push(
+      `    ${Dim}... and ${coverage.workItems.length - limit} more. Run with --full for the complete list.${Reset}`
+    );
+  }
+  if (coverage.blockedKeys > 0) {
+    lines.push(
+      `  ${FgYellow}${coverage.blockedKeys} key(s) are blocked because they have no approved reference translation.${Reset}`
+    );
+  }
 }
 function renderPushJson(pushPlan, filter) {
   const totalTranslations = Object.values(
@@ -3951,9 +4362,10 @@ function renderPushJson(pushPlan, filter) {
   );
 }
 function renderPullJson(status) {
-  const totalPulled = Object.values(
-    status.toPull.missingTranslations
-  ).reduce((sum, keys) => sum + keys.length, 0);
+  const totalPulled = Object.values(status.toPull.missingTranslations).reduce(
+    (sum, keys) => sum + keys.length,
+    0
+  );
   return JSON.stringify(
     {
       version: 1,
@@ -4088,493 +4500,6 @@ ${FgGreen}Auto-approved ${result.approved} translation(s) with score >= ${thresh
 function truncate(str, maxLen) {
   if (str.length <= maxLen) return str;
   return str.slice(0, maxLen - 3) + "...";
-}
-
-function computeTranslationWork(params) {
-  const {
-    mergedKeysByKeyByNamespace,
-    targetLanguages,
-    strategy,
-    onlyExisting,
-    emptyValueString,
-    languages,
-    keys,
-    namespaces
-  } = params;
-  const languageFilter = languages ? new Set(languages) : void 0;
-  const selectedKeys = keys && keys.length > 0 || namespaces && namespaces.length > 0 ? resolveSelectedKeys(keys ?? [], mergedKeysByKeyByNamespace, namespaces ?? []) : void 0;
-  const result = [];
-  for (const keysInNamespace of Object.values(mergedKeysByKeyByNamespace)) {
-    for (const key of Object.values(keysInNamespace)) {
-      const serverId = key.server?.id;
-      if (!serverId) continue;
-      if (onlyExisting && !key.local) continue;
-      if (selectedKeys && !selectedKeys.has(getComparisonKey(key))) continue;
-      const hasApprovedReference = Object.values(key.translations).some(
-        (translation) => translation.server?.approved === true && translation.server.currentValue != null && translation.server.currentValue !== ""
-      );
-      if (!hasApprovedReference) continue;
-      const missingLanguages = [];
-      for (const lang of targetLanguages) {
-        if (languageFilter && !languageFilter.has(lang)) continue;
-        const serverTranslation = key.translations[lang]?.server;
-        const missing = serverTranslation?.currentValue == null || emptyValueString === "" && serverTranslation.currentValue === "";
-        if (strategy === "missing") {
-          if (missing) missingLanguages.push(lang);
-        } else if (missing || serverTranslation?.approved !== true) {
-          missingLanguages.push(lang);
-        }
-      }
-      if (missingLanguages.length > 0) {
-        result.push({ keyId: serverId, languages: missingLanguages });
-      }
-    }
-  }
-  return result;
-}
-
-async function pollTranslationJob(host, projectId, accessToken, jobId, timeoutSeconds, flags) {
-  const startTime = Date.now();
-  const timeoutMs = timeoutSeconds * 1e3;
-  let interval = 2e3;
-  while (true) {
-    const elapsed = Date.now() - startTime;
-    if (elapsed > timeoutMs) {
-      return {
-        status: "timeout",
-        progress: 0,
-        total: 0,
-        finished: 0,
-        failed: 0,
-        failures: []
-      };
-    }
-    const status = await fetchJobStatus(host, projectId, accessToken, jobId);
-    if (!flags.json) {
-      process.stdout.write(
-        `\r  ${Dim}Progress: ${status.progress}% (${status.finished}/${status.total})${Reset}  `
-      );
-    }
-    if (status.status === "complete" || status.status === "failed") {
-      if (!flags.json) {
-        process.stdout.write("\n");
-      }
-      return { ...status, status: status.status };
-    }
-    await sleep(interval);
-    if (elapsed > 1e4) interval = 5e3;
-    if (elapsed > 6e4) interval = 1e4;
-  }
-}
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function syncAndTranslate(input) {
-  const { host, projectId, accessToken, flags } = input;
-  const json = flags.json;
-  let { syncResult } = input;
-  if (!json) console.info(`
-${Bold}  Sync & Translate${Reset}
-`);
-  let pushResult;
-  let pushStatus = "nothing_to_push";
-  if (syncResult.status.needPush) {
-    const keysToRemove = await collectKeysToRemove(input);
-    if (!json) console.info(`  Pushing...`);
-    syncResult = await input.doPush(keysToRemove);
-    pushResult = syncResult.pushResult;
-    pushStatus = "pushed";
-    const created = pushResult?.createdKeyIds.length ?? 0;
-    const updated = pushResult?.updatedKeyIds.length ?? 0;
-    if (!json) {
-      const parts = [];
-      if (created > 0) parts.push(`${created} new key${created !== 1 ? "s" : ""}`);
-      if (updated > 0) parts.push(`${updated} updated value${updated !== 1 ? "s" : ""}`);
-      if (parts.length > 0) {
-        console.info(`  ${FgGreen}\u2713 ${parts.join(", ")} pushed${Reset}`);
-      } else {
-        console.info(`  ${FgGreen}\u2713 Push complete${Reset}`);
-      }
-    }
-  }
-  const pushedKeyIds = [...pushResult?.createdKeyIds ?? [], ...pushResult?.updatedKeyIds ?? []];
-  if (pushStatus === "pushed") {
-    syncResult = await input.reFetchAndSync();
-  }
-  const workSet = computeTranslationWork({
-    mergedKeysByKeyByNamespace: syncResult.mergedKeysByKeyByNamespace,
-    targetLanguages: input.targetLanguages,
-    strategy: "missing",
-    onlyExisting: input.onlyExisting,
-    emptyValueString: input.emptyValueString
-  });
-  const workKeyIds = new Set(workSet.map((w) => w.keyId));
-  let translateSummary;
-  if (workSet.length > 0) {
-    translateSummary = await questionTranslateLoop({
-      host,
-      projectId,
-      accessToken,
-      flags,
-      workSet,
-      questionKeyIds: workKeyIds
-    });
-  } else if (!json) {
-    console.info(`
-  No translations needed.`);
-  }
-  syncResult = await input.reFetchAndSync();
-  let scores;
-  if (workKeyIds.size > 0 && !json) {
-    try {
-      const reviews = await fetchPendingReviews(host, projectId, accessToken);
-      const relevantReviews = reviews.filter((r) => workKeyIds.has(r.keyId));
-      if (relevantReviews.length > 0) {
-        scores = buildScoreMap(relevantReviews);
-      }
-    } catch {
-    }
-  }
-  const pullToPull = syncResult.status.toPull;
-  const pullKeysCount = pullToPull.missingKeys.length;
-  const pullTranslationsCount = Object.values(pullToPull.missingTranslations).reduce(
-    (sum, keys) => sum + keys.length,
-    0
-  );
-  let pullStatus = "nothing_to_pull";
-  if (syncResult.status.needPull) {
-    pullStatus = "pulled";
-    if (!flags.noInteraction && pushedKeyIds.length > 0) {
-      await pullWithTierPicker({
-        flags,
-        syncResult,
-        pushedKeyIds,
-        doPull: input.doPull,
-        hasS2tContext: true,
-        scores
-      });
-    } else {
-      if (!json) console.info(`
-  Pulling...`);
-      await input.doPull(input.onlyExisting ? { onlyExisting: true } : void 0);
-      if (!json) console.info(`  ${FgGreen}\u2713 Translations pulled${Reset}`);
-    }
-  } else if (!json) {
-    console.info(`
-  ${FgGreen}\u2713 Nothing new to pull.${Reset}`);
-  }
-  if (json) {
-    const overallStatus = translateSummary?.status === "failed" ? "failed" : translateSummary?.status === "timeout" ? "timeout" : "complete";
-    console.info(
-      JSON.stringify(
-        {
-          version: 1,
-          command: "sync-and-translate",
-          status: overallStatus,
-          job_id: translateSummary?.jobId,
-          phases: {
-            push: {
-              status: pushStatus,
-              counts: {
-                new_keys: pushResult?.createdKeyIds.length ?? 0,
-                updated_keys: pushResult?.updatedKeyIds.length ?? 0
-              }
-            },
-            translate: {
-              status: translateSummary?.status ?? "skipped",
-              counts: {
-                total: translateSummary?.total ?? 0,
-                finished: translateSummary?.finished ?? 0,
-                failed: translateSummary?.failed ?? 0
-              },
-              failures: translateSummary?.failures ?? []
-            },
-            pull: {
-              status: pullStatus,
-              counts: {
-                keys: pullKeysCount,
-                translations: pullTranslationsCount
-              }
-            }
-          }
-        },
-        null,
-        2
-      )
-    );
-    return translateSummary?.status === "failed" ? 2 : 0;
-  }
-  if (translateSummary?.status === "failed") {
-    console.info(`
-${FgYellow}${Bold}  Translation finished with failures.${Reset}
-`);
-  } else {
-    console.info(`
-${FgGreen}${Bold}  Done \u2014 your changes are synced.${Reset}
-`);
-  }
-  return translateSummary?.status === "failed" ? 2 : 0;
-}
-function buildScoreMap(reviews) {
-  const map = /* @__PURE__ */ new Map();
-  for (const r of reviews) {
-    map.set(`${r.keyId}:${r.languageCode}`, r.score);
-  }
-  return map;
-}
-async function collectKeysToRemove(input) {
-  const serverOnlyKeys = input.syncResult.status.issues.serverOnlyKeys;
-  if (serverOnlyKeys.length === 0) return [];
-  if (input.flags.noInteraction) return [];
-  const preview = serverOnlyKeys.slice(0, 5);
-  const remaining = serverOnlyKeys.length - preview.length;
-  const keyList = preview.map((key) => formatNamespacedKey(key)).join(", ") + (remaining > 0 ? `, ... +${remaining} more` : "");
-  console.info(
-    `
-  ${FgYellow}${serverOnlyKeys.length} key${serverOnlyKeys.length !== 1 ? "s" : ""} on server not in your local files:${Reset}`
-  );
-  console.info(`  ${Dim}${keyList}${Reset}
-`);
-  const action = await select({
-    message: "What to do with server-only keys?",
-    choices: [
-      { value: "keep", name: "Keep on server (do nothing)" },
-      { value: "select", name: "View and select which to remove" },
-      { value: "remove-all", name: "Remove all from server" }
-    ]
-  });
-  if (action === "keep") return [];
-  if (action === "remove-all") {
-    return serverOnlyKeys.map((key) => ({
-      key: key.key,
-      namespace: key.namespace
-    }));
-  }
-  if (action === "select") {
-    const removableKeys = new Map(
-      serverOnlyKeys.map((key) => [getComparisonKey(key), key])
-    );
-    const selected = await checkbox({
-      message: "Select keys to remove from server:",
-      choices: serverOnlyKeys.map((key) => ({
-        value: getComparisonKey(key),
-        name: formatNamespacedKey(key),
-        checked: false
-      }))
-    });
-    if (selected.length > 0) {
-      console.info(
-        `
-  ${Dim}${selected.length} key${selected.length !== 1 ? "s" : ""} selected for removal.${Reset}`
-      );
-      return selected.flatMap((comparisonKey) => {
-        const key = removableKeys.get(comparisonKey);
-        if (!key) return [];
-        return [{ key: key.key, namespace: key.namespace }];
-      });
-    }
-  }
-  return [];
-}
-async function questionTranslateLoop(input) {
-  const { host, projectId, accessToken, flags, workSet, questionKeyIds } = input;
-  let iteration = 0;
-  let summary;
-  while (true) {
-    iteration++;
-    const label = iteration === 1 ? "Checking for questions" : "Checking for new questions";
-    if (!flags.json) {
-      process.stdout.write(`
-  ${Dim}${label}...${Reset}`);
-    }
-    const questions = filterQuestionsForKeys(
-      await fetchQuestions(host, projectId, accessToken),
-      questionKeyIds
-    );
-    if (questions.length > 0) {
-      if (!flags.json) {
-        process.stdout.write(` ${questions.length} found.
-`);
-      }
-      if (!flags.noInteraction) {
-        await questionsCommand({
-          host,
-          projectId,
-          accessToken,
-          flags,
-          questions
-        });
-      }
-    } else {
-      if (!flags.json) {
-        process.stdout.write(` none.
-`);
-      }
-    }
-    const keysToTranslate = workSet;
-    if (keysToTranslate.length === 0) break;
-    if (!flags.json) {
-      console.info(
-        `
-  ${Bold}Translating ${workSet.length} key${workSet.length !== 1 ? "s" : ""}...${Reset}`
-      );
-    }
-    const response = await requestTranslation(host, projectId, accessToken, keysToTranslate);
-    const finalStatus = await pollTranslationJob(
-      host,
-      projectId,
-      accessToken,
-      response.jobId,
-      300,
-      flags
-    );
-    summary = {
-      jobId: response.jobId,
-      status: finalStatus.status,
-      total: finalStatus.total,
-      finished: finalStatus.finished,
-      failed: finalStatus.failed,
-      failures: finalStatus.failures
-    };
-    if (finalStatus.status === "complete") {
-      if (!flags.json) {
-        console.info(
-          `  ${FgGreen}\u2713 ${finalStatus.finished} translation${finalStatus.finished !== 1 ? "s" : ""} completed${Reset}`
-        );
-      }
-    } else if (finalStatus.status === "failed") {
-      if (!flags.json) {
-        console.info(
-          `  ${FgYellow}Translation finished with failures: ${finalStatus.failed}/${finalStatus.total} failed.${Reset}`
-        );
-      }
-      for (const failure of finalStatus.failures) {
-        if (!flags.json) {
-          console.info(`  ${failure.process_id}: ${failure.message}`);
-        }
-      }
-      break;
-    } else {
-      if (!flags.json) {
-        console.info(
-          `  ${FgYellow}Translation timed out. Your keys were pushed. Run \`babli pull\` later.${Reset}`
-        );
-      }
-      break;
-    }
-    if (flags.noInteraction) break;
-    if (iteration >= 3) break;
-    const newQuestions = filterQuestionsForKeys(
-      await fetchQuestions(host, projectId, accessToken),
-      questionKeyIds
-    );
-    if (newQuestions.length === 0) break;
-    if (!flags.json) {
-      console.info(
-        `
-  ${FgYellow}${newQuestions.length} new question${newQuestions.length !== 1 ? "s" : ""} found after translation.${Reset}`
-      );
-    }
-  }
-  return summary;
-}
-function filterQuestionsForKeys(questions, keyIds) {
-  return questions.filter((question) => keyIds.has(question.keyId));
-}
-async function pullWithTierPicker(input) {
-  const { flags, pushedKeyIds, doPull, hasS2tContext, scores } = input;
-  const comparison = input.syncResult.comparison;
-  const uniquePullKeys = deduplicatePullKeys(comparison);
-  function pushedKeysAsComparisonKeys() {
-    const pushedIdSet = new Set(pushedKeyIds);
-    return new Set(
-      uniquePullKeys.filter((k) => k.server && pushedIdSet.has(k.server.id)).map((k) => getComparisonKey(k))
-    );
-  }
-  if (flags.noInteraction) {
-    if (!flags.json) console.info(`
-  Pulling translations for pushed keys...`);
-    await doPull({ selectedKeys: pushedKeysAsComparisonKeys() });
-    if (!flags.json) console.info(`  ${FgGreen}\u2713 Translations pulled${Reset}`);
-    return;
-  }
-  if (uniquePullKeys.length > 0) {
-    const termWidth = process.stdout.columns ?? 80;
-    console.info(`
-  ${Bold}Keys to pull:${Reset}
-`);
-    const { text, hiddenCount } = renderKeyCards(uniquePullKeys, termWidth, {
-      scores
-    });
-    console.info(text);
-    if (hiddenCount > 0) {
-      console.info(`
-  ${Dim}... ${hiddenCount} more keys${Reset}`);
-    }
-  }
-  console.info("");
-  const choices = [];
-  if (hasS2tContext && pushedKeyIds.length > 0) {
-    choices.push({
-      value: "my-keys",
-      name: `Pull my translations only (${pushedKeyIds.length} just translated)`
-    });
-  }
-  const newCount = input.syncResult.status.toPull.missingKeys.length;
-  if (newCount > 0) {
-    const changedCount = new Set(
-      Object.values(input.syncResult.status.toPull.missingTranslations).flat()
-    ).size;
-    choices.push({
-      value: "only-existing",
-      name: `Pull only updates to existing keys (${changedCount} changed, skip ${newCount} new)`
-    });
-  }
-  choices.push({
-    value: "all",
-    name: "Pull all translations"
-  });
-  choices.push({ value: "skip", name: "Skip pull" });
-  const tier = await select({
-    message: "What to pull?",
-    choices
-  });
-  if (tier === "skip") return;
-  console.info(`
-  Pulling...`);
-  if (tier === "my-keys") {
-    await doPull({ selectedKeys: pushedKeysAsComparisonKeys() });
-  } else if (tier === "only-existing") {
-    await doPull({ onlyExisting: true });
-  } else {
-    await doPull();
-  }
-  console.info(`  ${FgGreen}\u2713 Translations pulled${Reset}`);
-}
-function deduplicatePullKeys(comparison) {
-  const pullKeys = [
-    ...Object.values(comparison.missingKeysOnLocal),
-    ...Object.values(comparison.missingTranslationsOnLocalPerLanguage).flat()
-  ];
-  const seen = /* @__PURE__ */ new Set();
-  return pullKeys.filter((k) => {
-    const ck = getComparisonKey(k);
-    if (seen.has(ck)) return false;
-    seen.add(ck);
-    return true;
-  });
-}
-async function pullFromDashboard(input) {
-  await pullWithTierPicker({
-    ...input,
-    pushedKeyIds: [],
-    hasS2tContext: false
-  });
-}
-
-function getTargetLanguageCodes(languages) {
-  return languages.filter((language) => !language.isSource).map((language) => language.code);
 }
 
 function serializeCliError(error) {
@@ -4906,60 +4831,515 @@ function formatKeyLine(key) {
   return `${namespace}${key.key} ${key.id}${archived}`;
 }
 
-async function jobCommand(ctx, options) {
-  const status = options.wait ? await pollTranslationJob(
-    ctx.host,
-    ctx.projectId,
-    ctx.accessToken,
-    options.jobId,
-    options.timeout,
-    ctx.flags
-  ) : await fetchJobStatus(ctx.host, ctx.projectId, ctx.accessToken, options.jobId);
-  if (ctx.flags.json) {
+async function syncAndTranslate(input) {
+  const { host, projectId, accessToken, flags } = input;
+  const json = flags.json;
+  let { syncResult } = input;
+  const invalidLanguages = (input.languages ?? []).filter(
+    (language) => !input.targetLanguages.includes(language)
+  );
+  if (invalidLanguages.length > 0) {
+    throw new Error(
+      `Invalid target language code(s): ${[...new Set(invalidLanguages)].join(", ")}.`
+    );
+  }
+  if (!json) console.info(`
+${Bold}  Sync & Translate${Reset}
+`);
+  let pushResult;
+  let pushStatus = "nothing_to_push";
+  if (syncResult.status.needPush) {
+    const keysToRemove = await collectKeysToRemove(input);
+    if (!json) console.info(`  Pushing...`);
+    syncResult = await input.doPush(keysToRemove);
+    pushResult = syncResult.pushResult;
+    pushStatus = "pushed";
+    const created = pushResult?.createdKeyIds.length ?? 0;
+    const updated = pushResult?.updatedKeyIds.length ?? 0;
+    if (!json) {
+      const parts = [];
+      if (created > 0)
+        parts.push(`${created} new key${created !== 1 ? "s" : ""}`);
+      if (updated > 0)
+        parts.push(`${updated} updated value${updated !== 1 ? "s" : ""}`);
+      if (parts.length > 0) {
+        console.info(`  ${FgGreen}\u2713 ${parts.join(", ")} pushed${Reset}`);
+      } else {
+        console.info(`  ${FgGreen}\u2713 Push complete${Reset}`);
+      }
+    }
+  }
+  const pushedKeyIds = [
+    ...pushResult?.createdKeyIds ?? [],
+    ...pushResult?.updatedKeyIds ?? []
+  ];
+  if (pushStatus === "pushed") {
+    syncResult = await input.reFetchAndSync();
+  }
+  const workSet = computeTranslationWork({
+    mergedKeysByKeyByNamespace: syncResult.mergedKeysByKeyByNamespace,
+    targetLanguages: input.targetLanguages,
+    strategy: "missing",
+    onlyExisting: input.onlyExisting,
+    emptyValueString: input.emptyValueString,
+    languages: input.languages,
+    keys: input.keys,
+    namespaces: input.namespaces
+  });
+  const workKeyIds = new Set(workSet.map((w) => w.keyId));
+  const workLanguages = [
+    ...new Set(workSet.flatMap((item) => item.languages))
+  ].sort();
+  const workSummary = {
+    keys: workSet.length,
+    language_pairs: workSet.reduce(
+      (total, item) => total + item.languages.length,
+      0
+    ),
+    languages: workLanguages,
+    strategy: "missing"
+  };
+  let translateSummary;
+  if (workSet.length > 0) {
+    translateSummary = await questionTranslateLoop({
+      host,
+      projectId,
+      accessToken,
+      flags,
+      workSet,
+      questionKeyIds: workKeyIds,
+      languages: input.languages,
+      model: input.model,
+      maxCreditUnits: input.maxCreditUnits,
+      timeout: input.timeout
+    });
+  } else if (!json) {
+    console.info(`
+  No translations needed.`);
+  }
+  if (!json) reportFormatWarnings(translateSummary?.formatWarningCount);
+  syncResult = await input.reFetchAndSync();
+  let scores;
+  if (workKeyIds.size > 0 && !json) {
+    try {
+      const reviews = await fetchPendingReviews(host, projectId, accessToken);
+      const relevantReviews = reviews.filter((r) => workKeyIds.has(r.keyId));
+      if (relevantReviews.length > 0) {
+        scores = buildScoreMap(relevantReviews);
+      }
+    } catch {
+    }
+  }
+  const pullToPull = syncResult.status.toPull;
+  const pullKeysCount = pullToPull.missingKeys.length;
+  const pullTranslationsCount = Object.values(
+    pullToPull.missingTranslations
+  ).reduce((sum, keys) => sum + keys.length, 0);
+  let pullStatus = "nothing_to_pull";
+  if (syncResult.status.needPull) {
+    pullStatus = "pulled";
+    if (!flags.noInteraction && pushedKeyIds.length > 0) {
+      await pullWithTierPicker({
+        flags,
+        syncResult,
+        pushedKeyIds,
+        doPull: input.doPull,
+        hasS2tContext: true,
+        scores
+      });
+    } else {
+      if (!json) console.info(`
+  Pulling...`);
+      await input.doPull(
+        input.onlyExisting ? { onlyExisting: true } : void 0
+      );
+      if (!json) console.info(`  ${FgGreen}\u2713 Translations pulled${Reset}`);
+    }
+  } else if (!json) {
+    console.info(`
+  ${FgGreen}\u2713 Nothing new to pull.${Reset}`);
+  }
+  if (json) {
+    const overallStatus = translateSummary?.status === "failed" ? "failed" : translateSummary?.status === "timeout" ? "timeout" : "complete";
     console.info(
       JSON.stringify(
         {
           version: 1,
-          command: "job",
-          status: status.status,
-          job_id: options.jobId,
-          counts: {
-            total: status.total,
-            finished: status.finished,
-            failed: status.failed,
-            progress: status.progress
-          },
-          failures: status.failures.length > 0 ? status.failures : void 0
+          command: "sync-and-translate",
+          status: overallStatus,
+          job_id: translateSummary?.jobId,
+          phases: {
+            push: {
+              status: pushStatus,
+              counts: {
+                new_keys: pushResult?.createdKeyIds.length ?? 0,
+                updated_keys: pushResult?.updatedKeyIds.length ?? 0
+              }
+            },
+            translate: {
+              status: translateSummary?.status ?? "skipped",
+              summary: workSummary,
+              counts: {
+                total: translateSummary?.total ?? 0,
+                finished: translateSummary?.finished ?? 0,
+                failed: translateSummary?.failed ?? 0
+              },
+              failures: translateSummary?.failures ?? [],
+              format_warning_count: translateSummary?.formatWarningCount ?? 0,
+              error: translateSummary?.error,
+              process_counts: {
+                total: translateSummary?.total ?? 0,
+                finished: translateSummary?.finished ?? 0,
+                failed: translateSummary?.failed ?? 0
+              },
+              billing: {
+                billable_processes: translateSummary?.billableProcesses ?? 0
+              },
+              credits_charged: translateSummary ? {
+                units: translateSummary.creditsCharged.total,
+                monthly_units: translateSummary.creditsCharged.monthly,
+                persistent_units: translateSummary.creditsCharged.persistent,
+                unit_scale: 100,
+                display: translateSummary.creditsCharged.total / 100
+              } : void 0
+            },
+            pull: {
+              status: pullStatus,
+              counts: {
+                keys: pullKeysCount,
+                translations: pullTranslationsCount
+              }
+            }
+          }
         },
         null,
         2
       )
     );
-    return status.status === "failed" ? 2 : 0;
+    return translateSummary?.status === "failed" || translateSummary?.status === "timeout" ? 2 : 0;
   }
-  if (status.status === "complete") {
-    console.info(
-      `${FgGreen}Job complete: ${status.finished}/${status.total} processes finished.${Reset}`
-    );
-  } else if (status.status === "failed") {
-    console.info(
-      `${FgYellow}Job finished with failures: ${status.failed}/${status.total} failed.${Reset}`
-    );
-    for (const failure of status.failures) {
-      console.info(`  ${failure.process_id}: ${failure.message}`);
-    }
-  } else if (status.status === "timeout") {
-    console.info(`${FgYellow}Still running. Job continues on server.${Reset}`);
-    console.info(`Run ${Bold}babli job ${options.jobId}${Reset} to check again.`);
+  if (translateSummary?.status === "failed" || translateSummary?.status === "timeout") {
+    const message = translateSummary.status === "timeout" ? "Translation is still running; completed results were pulled." : "Translation could not be started or finished; available results were pulled.";
+    console.info(`
+${FgYellow}${Bold}  ${message}${Reset}
+`);
   } else {
-    console.info(`Job ${status.status}: ${status.finished}/${status.total} processes finished.`);
+    console.info(
+      `
+${FgGreen}${Bold}  Done \u2014 your changes are synced.${Reset}
+`
+    );
   }
-  if (status.status !== "failed") {
-    for (const failure of status.failures) {
-      console.info(`  ${failure.process_id}: ${failure.message}`);
+  return translateSummary?.status === "failed" || translateSummary?.status === "timeout" ? 2 : 0;
+}
+function buildScoreMap(reviews) {
+  const map = /* @__PURE__ */ new Map();
+  for (const r of reviews) {
+    map.set(`${r.keyId}:${r.languageCode}`, r.score);
+  }
+  return map;
+}
+async function collectKeysToRemove(input) {
+  const serverOnlyKeys = input.syncResult.status.issues.serverOnlyKeys;
+  if (serverOnlyKeys.length === 0) return [];
+  if (input.flags.noInteraction) return [];
+  const preview = serverOnlyKeys.slice(0, 5);
+  const remaining = serverOnlyKeys.length - preview.length;
+  const keyList = preview.map((key) => formatNamespacedKey(key)).join(", ") + (remaining > 0 ? `, ... +${remaining} more` : "");
+  console.info(
+    `
+  ${FgYellow}${serverOnlyKeys.length} key${serverOnlyKeys.length !== 1 ? "s" : ""} on server not in your local files:${Reset}`
+  );
+  console.info(`  ${Dim}${keyList}${Reset}
+`);
+  const action = await select({
+    message: "What to do with server-only keys?",
+    choices: [
+      { value: "keep", name: "Keep on server (do nothing)" },
+      { value: "select", name: "View and select which to remove" },
+      { value: "remove-all", name: "Remove all from server" }
+    ]
+  });
+  if (action === "keep") return [];
+  if (action === "remove-all") {
+    return serverOnlyKeys.map((key) => ({
+      key: key.key,
+      namespace: key.namespace
+    }));
+  }
+  if (action === "select") {
+    const removableKeys = new Map(
+      serverOnlyKeys.map((key) => [getComparisonKey(key), key])
+    );
+    const selected = await checkbox({
+      message: "Select keys to remove from server:",
+      choices: serverOnlyKeys.map((key) => ({
+        value: getComparisonKey(key),
+        name: formatNamespacedKey(key),
+        checked: false
+      }))
+    });
+    if (selected.length > 0) {
+      console.info(
+        `
+  ${Dim}${selected.length} key${selected.length !== 1 ? "s" : ""} selected for removal.${Reset}`
+      );
+      return selected.flatMap((comparisonKey) => {
+        const key = removableKeys.get(comparisonKey);
+        if (!key) return [];
+        return [{ key: key.key, namespace: key.namespace }];
+      });
     }
   }
-  return status.status === "failed" ? 2 : 0;
+  return [];
+}
+async function questionTranslateLoop(input) {
+  const { host, projectId, accessToken, flags, workSet, questionKeyIds } = input;
+  let iteration = 0;
+  let summary;
+  let remainingCreditUnits = input.maxCreditUnits;
+  let billableProcesses = 0;
+  const creditsCharged = { total: 0, monthly: 0, persistent: 0 };
+  while (true) {
+    iteration++;
+    const label = iteration === 1 ? "Checking for questions" : "Checking for new questions";
+    if (!flags.json) {
+      process.stdout.write(`
+  ${Dim}${label}...${Reset}`);
+    }
+    const questions = filterQuestionsForKeys(
+      await fetchQuestions(host, projectId, accessToken),
+      questionKeyIds,
+      input.languages
+    );
+    if (questions.length > 0) {
+      if (!flags.json) {
+        process.stdout.write(` ${questions.length} found.
+`);
+      }
+      if (!flags.noInteraction) {
+        await questionsCommand({
+          host,
+          projectId,
+          accessToken,
+          flags,
+          questions
+        });
+      }
+    } else {
+      if (!flags.json) {
+        process.stdout.write(` none.
+`);
+      }
+    }
+    const keysToTranslate = workSet;
+    if (keysToTranslate.length === 0) break;
+    if (!flags.json) {
+      console.info(
+        `
+  ${Bold}Translating ${workSet.length} key${workSet.length !== 1 ? "s" : ""}...${Reset}`
+      );
+    }
+    let response;
+    try {
+      const apiWork = keysToTranslate.map(({ keyId, languages }) => ({
+        keyId,
+        languages
+      }));
+      response = remainingCreditUnits === void 0 ? await requestTranslation(
+        host,
+        projectId,
+        accessToken,
+        apiWork,
+        input.model
+      ) : await requestTranslation(
+        host,
+        projectId,
+        accessToken,
+        apiWork,
+        input.model,
+        remainingCreditUnits
+      );
+    } catch (error) {
+      return {
+        status: "failed",
+        total: summary?.total ?? 0,
+        finished: summary?.finished ?? 0,
+        failed: summary?.failed ?? 0,
+        failures: summary?.failures ?? [],
+        formatWarningCount: summary?.formatWarningCount ?? 0,
+        error: serializeCliError(error),
+        billableProcesses,
+        creditsCharged
+      };
+    }
+    billableProcesses += response.numberOfBillableProcesses ?? 0;
+    if (response.creditsCharged) {
+      creditsCharged.total += response.creditsCharged.total;
+      creditsCharged.monthly += response.creditsCharged.monthly;
+      creditsCharged.persistent += response.creditsCharged.persistent;
+      if (remainingCreditUnits !== void 0) {
+        remainingCreditUnits -= response.creditsCharged.total;
+      }
+    }
+    const finalStatus = await pollTranslationJob(
+      host,
+      projectId,
+      accessToken,
+      response.jobId,
+      input.timeout,
+      flags
+    );
+    summary = {
+      jobId: response.jobId,
+      status: finalStatus.status,
+      total: finalStatus.total,
+      finished: finalStatus.finished,
+      failed: finalStatus.failed,
+      failures: finalStatus.failures,
+      formatWarningCount: (summary?.formatWarningCount ?? 0) + (finalStatus.formatWarningCount ?? 0),
+      billableProcesses,
+      creditsCharged
+    };
+    if (finalStatus.status === "complete") {
+      if (!flags.json) {
+        console.info(
+          `  ${FgGreen}\u2713 ${finalStatus.finished} translation${finalStatus.finished !== 1 ? "s" : ""} completed${Reset}`
+        );
+      }
+    } else if (finalStatus.status === "failed") {
+      if (!flags.json) {
+        console.info(
+          `  ${FgYellow}Translation finished with failures: ${finalStatus.failed}/${finalStatus.total} failed.${Reset}`
+        );
+      }
+      for (const failure of finalStatus.failures) {
+        if (!flags.json) {
+          console.info(`  ${failure.process_id}: ${failure.message}`);
+        }
+      }
+      break;
+    } else {
+      if (!flags.json) {
+        console.info(
+          `  ${FgYellow}Translation timed out. The job is still running. Run \`babli job ${response.jobId} --wait\` to keep waiting.${Reset}`
+        );
+      }
+      break;
+    }
+    if (flags.noInteraction) break;
+    if (iteration >= 3) break;
+    const newQuestions = filterQuestionsForKeys(
+      await fetchQuestions(host, projectId, accessToken),
+      questionKeyIds,
+      input.languages
+    );
+    if (newQuestions.length === 0) break;
+    if (!flags.json) {
+      console.info(
+        `
+  ${FgYellow}${newQuestions.length} new question${newQuestions.length !== 1 ? "s" : ""} found after translation.${Reset}`
+      );
+    }
+  }
+  return summary;
+}
+function filterQuestionsForKeys(questions, keyIds, languages) {
+  const languageSet = languages ? new Set(languages) : void 0;
+  return questions.filter(
+    (question) => keyIds.has(question.keyId) && (!languageSet || languageSet.has(question.languageCode))
+  );
+}
+async function pullWithTierPicker(input) {
+  const { flags, pushedKeyIds, doPull, hasS2tContext, scores } = input;
+  const comparison = input.syncResult.comparison;
+  const uniquePullKeys = deduplicatePullKeys(comparison);
+  function pushedKeysAsComparisonKeys() {
+    const pushedIdSet = new Set(pushedKeyIds);
+    return new Set(
+      uniquePullKeys.filter((k) => k.server && pushedIdSet.has(k.server.id)).map((k) => getComparisonKey(k))
+    );
+  }
+  if (flags.noInteraction) {
+    if (!flags.json)
+      console.info(`
+  Pulling translations for pushed keys...`);
+    await doPull({ selectedKeys: pushedKeysAsComparisonKeys() });
+    if (!flags.json) console.info(`  ${FgGreen}\u2713 Translations pulled${Reset}`);
+    return;
+  }
+  if (uniquePullKeys.length > 0) {
+    const termWidth = process.stdout.columns ?? 80;
+    console.info(`
+  ${Bold}Keys to pull:${Reset}
+`);
+    const { text, hiddenCount } = renderKeyCards(uniquePullKeys, termWidth, {
+      scores
+    });
+    console.info(text);
+    if (hiddenCount > 0) {
+      console.info(`
+  ${Dim}... ${hiddenCount} more keys${Reset}`);
+    }
+  }
+  console.info("");
+  const choices = [];
+  if (hasS2tContext && pushedKeyIds.length > 0) {
+    choices.push({
+      value: "my-keys",
+      name: `Pull my translations only (${pushedKeyIds.length} just translated)`
+    });
+  }
+  const newCount = input.syncResult.status.toPull.missingKeys.length;
+  if (newCount > 0) {
+    const changedCount = new Set(
+      Object.values(input.syncResult.status.toPull.missingTranslations).flat()
+    ).size;
+    choices.push({
+      value: "only-existing",
+      name: `Pull only updates to existing keys (${changedCount} changed, skip ${newCount} new)`
+    });
+  }
+  choices.push({
+    value: "all",
+    name: "Pull all translations"
+  });
+  choices.push({ value: "skip", name: "Skip pull" });
+  const tier = await select({
+    message: "What to pull?",
+    choices
+  });
+  if (tier === "skip") return;
+  console.info(`
+  Pulling...`);
+  if (tier === "my-keys") {
+    await doPull({ selectedKeys: pushedKeysAsComparisonKeys() });
+  } else if (tier === "only-existing") {
+    await doPull({ onlyExisting: true });
+  } else {
+    await doPull();
+  }
+  console.info(`  ${FgGreen}\u2713 Translations pulled${Reset}`);
+}
+function deduplicatePullKeys(comparison) {
+  const pullKeys = [
+    ...Object.values(comparison.missingKeysOnLocal),
+    ...Object.values(comparison.missingTranslationsOnLocalPerLanguage).flat()
+  ];
+  const seen = /* @__PURE__ */ new Set();
+  return pullKeys.filter((k) => {
+    const ck = getComparisonKey(k);
+    if (seen.has(ck)) return false;
+    seen.add(ck);
+    return true;
+  });
+}
+async function pullFromDashboard(input) {
+  await pullWithTierPicker({
+    ...input,
+    pushedKeyIds: [],
+    hasS2tContext: false
+  });
 }
 
 function emitJson(output) {
@@ -4980,12 +5360,13 @@ function summarize(work, strategy) {
   };
 }
 async function translateCommand(input) {
+  let work;
   try {
     validateLanguages(input);
+    work = computeWork(input);
   } catch (error) {
     return reportFailure(input, void 0, error);
   }
-  const work = computeWork(input);
   const summary = summarize(work, input.strategy);
   if (work.length === 0) {
     if (input.flags.json) {
@@ -5006,7 +5387,8 @@ async function translateCommand(input) {
         version: 1,
         command: "translate",
         status: "dry_run",
-        summary
+        summary,
+        work_items: serializeWorkItems(work)
       });
     } else {
       printDryRun(work, summary, input.flags.full);
@@ -5024,12 +5406,20 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
   }
   let response;
   try {
-    response = await requestTranslation(
+    const apiWork = work.map(({ keyId, languages }) => ({ keyId, languages }));
+    response = input.maxCreditUnits === void 0 ? await requestTranslation(
       input.host,
       input.projectId,
       input.accessToken,
-      work,
+      apiWork,
       input.model
+    ) : await requestTranslation(
+      input.host,
+      input.projectId,
+      input.accessToken,
+      apiWork,
+      input.model,
+      input.maxCreditUnits
     );
   } catch (err) {
     return reportFailure(input, void 0, err);
@@ -5042,13 +5432,17 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
         command: "translate",
         status: "started",
         job_id: response.jobId,
-        summary
+        summary,
+        billing: response.numberOfBillableProcesses === void 0 ? void 0 : { billable_processes: response.numberOfBillableProcesses },
+        credits_charged: serializeChargedCredits(response.creditsCharged)
       });
     } else {
       console.info(
         `${Dim}Job started: ${response.jobId} (${response.numberOfProcesses} processes)${Reset}`
       );
-      console.info(`Run ${Bold}babli job ${response.jobId}${Reset} to check status.`);
+      console.info(
+        `Run ${Bold}babli job ${response.jobId} --wait${Reset} to wait for completion.`
+      );
     }
     return 0;
   }
@@ -5081,7 +5475,16 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
         finished: finalStatus.finished,
         failed: finalStatus.failed
       },
-      failures: finalStatus.failures.length > 0 ? finalStatus.failures : void 0
+      process_counts: {
+        total: finalStatus.total,
+        finished: finalStatus.finished,
+        failed: finalStatus.failed
+      },
+      summary,
+      billing: response.numberOfBillableProcesses === void 0 ? void 0 : { billable_processes: response.numberOfBillableProcesses },
+      credits_charged: serializeChargedCredits(response.creditsCharged),
+      failures: finalStatus.failures.length > 0 ? finalStatus.failures : void 0,
+      format_warning_count: finalStatus.formatWarningCount ?? 0
     });
   } else if (finalStatus.status === "complete") {
     console.info(
@@ -5098,9 +5501,12 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
     console.info(
       `${FgYellow}Translation timed out after ${input.timeout}s. Job continues on server.${Reset}`
     );
-    console.info(`Run ${Bold}babli job ${response.jobId}${Reset} to check status.`);
+    console.info(
+      `Run ${Bold}babli job ${response.jobId} --wait${Reset} to keep waiting.`
+    );
   }
-  return finalStatus.status === "failed" ? 2 : 0;
+  if (!input.flags.json) reportFormatWarnings(finalStatus.formatWarningCount);
+  return finalStatus.status === "failed" || finalStatus.status === "timeout" ? 2 : 0;
 }
 async function runEstimate(input, work, summary) {
   let estimate;
@@ -5109,7 +5515,7 @@ async function runEstimate(input, work, summary) {
       input.host,
       input.projectId,
       input.accessToken,
-      work,
+      work.map(({ keyId, languages }) => ({ keyId, languages })),
       input.model
     );
   } catch (err) {
@@ -5120,7 +5526,12 @@ async function runEstimate(input, work, summary) {
     monthly: estimate.creditsToUse.monthly,
     persistent: estimate.creditsToUse.persistent,
     has_enough: estimate.creditsToUse.hasEnough,
-    need_to_buy: estimate.creditsToUse.needToBuy
+    need_to_buy: estimate.creditsToUse.needToBuy,
+    unit_scale: 100,
+    display_total: estimate.creditsToUse.total / 100,
+    display_monthly: estimate.creditsToUse.monthly / 100,
+    display_persistent: estimate.creditsToUse.persistent / 100,
+    display_need_to_buy: estimate.creditsToUse.needToBuy / 100
   };
   if (input.flags.json) {
     emitJson({
@@ -5128,6 +5539,13 @@ async function runEstimate(input, work, summary) {
       command: "translate",
       status: "estimate",
       summary,
+      work_items: serializeWorkItems(work),
+      process_counts: {
+        total: estimate.numberOfProcesses,
+        finished: 0,
+        failed: 0
+      },
+      billing: estimate.numberOfBillableProcesses === void 0 ? void 0 : { billable_processes: estimate.numberOfBillableProcesses },
       credits
     });
   } else {
@@ -5136,17 +5554,27 @@ async function runEstimate(input, work, summary) {
 ${Bold}Estimate: ${summary.keys} key(s), ${summary.language_pairs} language pair(s).${Reset}`
     );
     console.info(
-      `${Dim}Credits needed: ${credits.total} (monthly ${credits.monthly}, persistent ${credits.persistent})${Reset}`
+      `${Dim}Credits needed: ${credits.display_total} (monthly ${credits.display_monthly}, persistent ${credits.display_persistent})${Reset}`
     );
     if (credits.has_enough) {
       console.info(`${FgGreen}You have enough credits.${Reset}`);
     } else {
       console.info(
-        `${FgYellow}Not enough credits \u2014 need to buy ${credits.need_to_buy} more.${Reset}`
+        `${FgYellow}Not enough credits \u2014 need to buy ${credits.display_need_to_buy} more.${Reset}`
       );
     }
   }
   return 0;
+}
+function serializeChargedCredits(credits) {
+  if (!credits) return void 0;
+  return {
+    units: credits.total,
+    monthly_units: credits.monthly,
+    persistent_units: credits.persistent,
+    unit_scale: 100,
+    display: credits.total / 100
+  };
 }
 function reportFailure(input, jobId, err) {
   if (input.flags.json) {
@@ -5174,7 +5602,8 @@ ${Bold}Dry run \u2014 would translate ${summary.keys} key(s), ${summary.language
   );
   const limit = full ? work.length : 10;
   for (const item of work.slice(0, limit)) {
-    console.info(`  ${item.keyId}: ${item.languages.join(", ")}`);
+    const label = item.namespace ? `${item.namespace}:${item.key}` : item.key;
+    console.info(`  ${label}: ${item.languages.join(", ")}`);
   }
   if (work.length > limit) {
     console.info(
@@ -5196,7 +5625,25 @@ function computeWork(input) {
   if (input.keyIds && input.keyIds.length > 0) {
     const languages = input.languages ?? input.targetLanguages;
     if (languages.length === 0) return [];
-    return input.keyIds.map((keyId) => ({ keyId, languages }));
+    const keysById = /* @__PURE__ */ new Map();
+    for (const keysInNamespace of Object.values(
+      input.syncResult.mergedKeysByKeyByNamespace
+    )) {
+      for (const key of Object.values(keysInNamespace)) {
+        if (!key.server || !input.keyIds.includes(key.server.id)) continue;
+        keysById.set(key.server.id, {
+          keyId: key.server.id,
+          key: key.key,
+          namespace: key.server.namespace,
+          languages
+        });
+      }
+    }
+    const invalidIds = input.keyIds.filter((keyId) => !keysById.has(keyId));
+    if (invalidIds.length > 0) {
+      throw new Error(`Invalid key id(s): ${invalidIds.join(", ")}.`);
+    }
+    return [...keysById.values()];
   }
   return computeTranslationWork({
     mergedKeysByKeyByNamespace: input.syncResult.mergedKeysByKeyByNamespace,
@@ -5208,6 +5655,14 @@ function computeWork(input) {
     keys: input.keys,
     namespaces: input.namespaces
   });
+}
+function serializeWorkItems(work) {
+  return work.map((item) => ({
+    key_id: item.keyId,
+    key: item.key,
+    namespace: item.namespace,
+    missing_languages: item.languages
+  }));
 }
 
 const packageJson = JSON.parse(
@@ -5328,7 +5783,10 @@ program.command("push").description("Push local keys and translations to server"
     namespaces: options.namespace
   });
 });
-program.command("pull").description("Pull translations from server to local files").option("--only-approved", "Only pull translations that are approved").option("--only-existing", "Only pull updates to keys that already exist locally").option(
+program.command("pull").description("Pull translations from server to local files").option("--only-approved", "Only pull translations that are approved").option(
+  "--only-existing",
+  "Only pull updates to keys that already exist locally"
+).option(
   "--key <pattern>",
   'Only pull keys matching this glob (repeatable; quote it; "namespace:key" or a glob like "auth:*")',
   collectOption,
@@ -5364,11 +5822,25 @@ Examples:
     });
   }
 );
-program.command("status").description("Show sync status between local files and server").addHelpText(
+program.command("status").description("Show sync status between local files and server").option(
+  "--key <pattern>",
+  'Only inspect keys matching this glob (repeatable; quote it; "namespace:key")',
+  collectOption,
+  []
+).option(
+  "--namespace <pattern>",
+  "Only inspect keys in namespaces matching this glob (repeatable)",
+  collectOption,
+  []
+).addHelpText(
   "after",
-  "\nExamples:\n  babli status              # grouped summary\n  babli status --full       # show all items\n  babli status --json       # JSON output for agents"
-).action(async () => {
-  await run({ action: "status" });
+  'Examples:\n  babli status                                      # file sync and translation coverage\n  babli status --full                               # show all items\n  babli status --json                               # JSON output for agents\n  babli status --namespace speech --key "mosquito.*" # scoped status'
+).action(async (options) => {
+  await run({
+    action: "status",
+    keys: options.key,
+    namespaces: options.namespace
+  });
 });
 program.command("translate").description("Trigger AI translation for missing translations").option(
   "--strategy <strategy>",
@@ -5377,7 +5849,10 @@ program.command("translate").description("Trigger AI translation for missing tra
 ).option(
   "--languages <codes>",
   "Only translate these languages (comma-separated)"
-).option("--only-existing", "Only translate keys that exist in your local files").option(
+).option(
+  "--only-existing",
+  "Only translate keys that exist in your local files"
+).option(
   "--key <pattern>",
   'Only translate keys matching this glob (repeatable; quote it; "namespace:key" or a glob like "auth:*")',
   collectOption,
@@ -5392,12 +5867,25 @@ program.command("translate").description("Trigger AI translation for missing tra
   "Translate this key id directly, bypassing local sync status (repeatable)",
   collectOption,
   []
-).option("--key-ids <ids>", "Translate these key ids (comma-separated)").option("--model <model>", "Translation model: production | preview", "production").option("--dry-run", "Print the work-set without spending credits or starting a job").option("--estimate", "Print the real credit cost without spending or starting a job").option(
+).option("--key-ids <ids>", "Translate these key ids (comma-separated)").option(
+  "--model <model>",
+  "Translation model: production | preview",
+  "production"
+).option(
+  "--dry-run",
+  "Print the work-set without spending credits or starting a job"
+).option(
+  "--estimate",
+  "Print the real credit cost without spending or starting a job"
+).option(
+  "--max-credits <amount>",
+  "Refuse to dispatch if the exact cost exceeds this credit amount"
+).option(
   "--wait",
   "Block and poll until the job finishes (non-interactive mode returns the job id immediately by default)"
 ).option("--timeout <seconds>", "Max wait time when polling", "300").addHelpText(
   "after",
-  '\nExamples:\n  babli translate                    # translate all missing, interactive\n  babli translate --languages cs,de  # only Czech and German\n  babli translate --strategy not-approved  # also re-translate unapproved drafts\n  babli translate --only-existing    # skip keys not in local files\n  babli translate --key "auth:*"     # only translate the auth namespace\n  babli translate --namespace checkout  # only translate the checkout namespace\n  babli translate --key-ids key_1,key_2 --no-interaction\n  babli translate --dry-run --json   # preview work-set, no spend\n  babli translate --estimate --json  # real credit cost, no spend\n  babli translate --json --no-interaction  # dispatch and return a job id\n  babli translate --json --no-interaction --wait  # dispatch and wait for the result\n\n--key and --namespace combine with AND (a key must match both).'
+  '\nExamples:\n  babli translate                    # translate all missing, interactive\n  babli translate --languages cs,de  # only Czech and German\n  babli translate --strategy not-approved  # also re-translate unapproved drafts\n  babli translate --only-existing    # skip keys not in local files\n  babli translate --key "auth:*"     # only translate the auth namespace\n  babli translate --namespace checkout  # only translate the checkout namespace\n  babli translate --key-ids key_1,key_2 --no-interaction\n  babli translate --dry-run --json   # complete work-set, no spend\n  babli translate --namespace speech --estimate --json\n  babli translate --namespace speech --max-credits 7.00 --wait --json\n  babli translate --json --no-interaction  # dispatch and return a job id\n\nOn timeout, run `babli job <job_id> --wait`; do not dispatch translate again.\n--key and --namespace combine with AND (a key must match both).'
 ).action(
   async (options) => {
     const timeout = parseInt(options.timeout, 10);
@@ -5438,6 +5926,7 @@ program.command("translate").description("Trigger AI translation for missing tra
         model: options.model,
         dryRun: options.dryRun === true,
         estimate: options.estimate === true,
+        maxCreditUnits: options.maxCredits === void 0 ? void 0 : parseCreditUnits(options.maxCredits),
         timeout,
         wait: options.wait === true
       }
@@ -5469,21 +5958,32 @@ withGlobalOptions(keyCommand.command("list")).description("List remote keys").op
     }
   });
 });
-withGlobalOptions(keyCommand.command("get")).description("Get one remote key").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").option("--include-archived", "Allow archived key lookup").action(async (options) => {
-  await run({
-    action: "key-get",
-    options: {
-      ...options,
-      includeArchived: options.includeArchived === true
-    }
-  });
-});
-withGlobalOptions(keyCommand.command("add")).description("Add one remote key").requiredOption("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace", "").option("--source <text>", "Source metadata", "").option("--description <text>", "Key description").option("--translation <code=value>", "Approved translation", collectOption, []).action(async (options) => {
-  await run({ action: "key-add", options });
-});
-withGlobalOptions(keyCommand.command("update")).description("Update key metadata").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Namespace for key lookup").option("--new-namespace <namespace>", "New namespace").option("--source <text>", "Source metadata").option("--description <text>", "Key description").action(async (options) => {
-  await run({ action: "key-update", options });
-});
+withGlobalOptions(keyCommand.command("get")).description("Get one remote key").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").option("--include-archived", "Allow archived key lookup").action(
+  async (options) => {
+    await run({
+      action: "key-get",
+      options: {
+        ...options,
+        includeArchived: options.includeArchived === true
+      }
+    });
+  }
+);
+withGlobalOptions(keyCommand.command("add")).description("Add one remote key").requiredOption("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace", "").option("--source <text>", "Source metadata", "").option("--description <text>", "Key description").option(
+  "--translation <code=value>",
+  "Approved translation",
+  collectOption,
+  []
+).action(
+  async (options) => {
+    await run({ action: "key-add", options });
+  }
+);
+withGlobalOptions(keyCommand.command("update")).description("Update key metadata").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Namespace for key lookup").option("--new-namespace <namespace>", "New namespace").option("--source <text>", "Source metadata").option("--description <text>", "Key description").action(
+  async (options) => {
+    await run({ action: "key-update", options });
+  }
+);
 withGlobalOptions(keyCommand.command("rename")).description("Rename one key").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").requiredOption("--to <new-key>", "New key name").action(async (options) => {
   await run({ action: "key-rename", options });
 });
@@ -5494,12 +5994,14 @@ withGlobalOptions(keyCommand.command("unarchive")).description("Unarchive one ke
   await run({ action: "key-unarchive", options });
 });
 const translationCommand = program.command("translation").description("Manage remote translations");
-withGlobalOptions(translationCommand.command("upsert")).description("Create or update one translation").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").requiredOption("--language <code>", "Language code").option("--value <text>", "Translation value").option("--value-file <path>", "Read translation value from a file or -").option("--approve", "Approve the translation").action(async (options) => {
-  await run({
-    action: "translation-upsert",
-    options: { ...options, approve: options.approve === true }
-  });
-});
+withGlobalOptions(translationCommand.command("upsert")).description("Create or update one translation").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").requiredOption("--language <code>", "Language code").option("--value <text>", "Translation value").option("--value-file <path>", "Read translation value from a file or -").option("--approve", "Approve the translation").action(
+  async (options) => {
+    await run({
+      action: "translation-upsert",
+      options: { ...options, approve: options.approve === true }
+    });
+  }
+);
 withGlobalOptions(translationCommand.command("approve")).description("Approve one translation").argument("<translation-id>").action(async (translationId) => {
   await run({ action: "translation-approve", translationId });
 });
@@ -5513,32 +6015,82 @@ withGlobalOptions(projectCommand.command("get")).description("Get remote project
 withGlobalOptions(projectCommand.command("list")).description("List projects across your organizations").option("--organization <id>", "Filter to one organization").action(async (options) => {
   await run({ action: "project-list", options });
 });
-withGlobalOptions(projectCommand.command("create")).description("Create a new project").requiredOption("--name <name>", "Project name").requiredOption("--organization <id>", "Organization id").option("--type <type>", "Project type: key | document", "key").option("--description <text>", "Project description").option("--languages <codes>", "Comma-separated language codes; first is the source").action(async (options) => {
-  await run({ action: "project-create", options });
-});
-withGlobalOptions(projectCommand.command("update")).description("Update remote project metadata").option("--name <name>", "Project name").option("--description <text>", "Project description").option("--description-file <path>", "Read project description from a file or -").option("--instructions <text>", "Project translation instructions").option("--instructions-file <path>", "Read project instructions from a file or -").action(async (options) => {
-  await run({ action: "project-update", options });
-});
+withGlobalOptions(projectCommand.command("create")).description("Create a new project").requiredOption("--name <name>", "Project name").requiredOption("--organization <id>", "Organization id").option("--type <type>", "Project type: key | document", "key").option("--description <text>", "Project description").option(
+  "--languages <codes>",
+  "Comma-separated language codes; first is the source"
+).action(
+  async (options) => {
+    await run({ action: "project-create", options });
+  }
+);
+withGlobalOptions(projectCommand.command("update")).description("Update remote project metadata").option("--name <name>", "Project name").option("--description <text>", "Project description").option(
+  "--description-file <path>",
+  "Read project description from a file or -"
+).option("--instructions <text>", "Project translation instructions").option(
+  "--instructions-file <path>",
+  "Read project instructions from a file or -"
+).action(
+  async (options) => {
+    await run({ action: "project-update", options });
+  }
+);
 program.command("sync-and-translate").description("Push local changes, translate, and pull results").option(
   "--resolve <strategy>",
   "Resolve push conflicts non-interactively: local | server"
 ).option(
   "--only-existing",
   "Only translate and pull keys that exist in your local files"
+).option(
+  "--languages <codes>",
+  "Only translate these languages (comma-separated)"
+).option(
+  "--key <pattern>",
+  'Only sync keys matching this glob (repeatable; quote it; "namespace:key")',
+  collectOption,
+  []
+).option(
+  "--namespace <pattern>",
+  "Only sync keys in namespaces matching this glob (repeatable)",
+  collectOption,
+  []
+).option(
+  "--model <model>",
+  "Translation model: production | preview",
+  "production"
+).option("--max-credits <amount>", "Maximum cumulative credit charge").option("--timeout <seconds>", "Max wait time when polling", "300").addHelpText(
+  "after",
+  'Examples:\n  babli sync-and-translate --json --no-interaction # complete agent workflow; waits automatically\n  babli sync-and-translate                         # interactive\n  babli sync-and-translate --only-existing         # skip keys not in local files\n  babli sync-and-translate --namespace speech --key "mosquito.*" --max-credits 7.00'
+).action(
+  async (options) => {
+    if (options.model !== "production" && options.model !== "preview") {
+      throw new Error(`Invalid --model value: "${options.model}"`);
+    }
+    const timeout = parseInt(options.timeout, 10);
+    if (Number.isNaN(timeout) || timeout <= 0) {
+      throw new Error(`Invalid --timeout value: "${options.timeout}"`);
+    }
+    await run({
+      action: "sync-and-translate",
+      options: {
+        onlyExisting: options.onlyExisting === true,
+        keys: options.key,
+        namespaces: options.namespace,
+        languages: options.languages?.split(",").map((language) => language.trim()).filter(Boolean),
+        model: options.model,
+        maxCreditUnits: options.maxCredits === void 0 ? void 0 : parseCreditUnits(options.maxCredits),
+        timeout
+      }
+    });
+  }
+);
+program.command("questions").description("Show and answer unanswered translation questions").option(
+  "--answers-file <path>",
+  "Submit a JSON answers file without prompting (requires a user token)"
 ).addHelpText(
   "after",
-  "\nExamples:\n  babli sync-and-translate                    # interactive\n  babli sync-and-translate --no-interaction   # non-interactive\n  babli sync-and-translate --only-existing    # skip keys not in local files\n  babli sync-and-translate --json             # for AI agents"
-).action(async (options) => {
-  await run({
-    action: "sync-and-translate",
-    options: { onlyExisting: options.onlyExisting === true }
-  });
-});
-program.command("questions").description("Show and answer unanswered translation questions").addHelpText(
-  "after",
   "\nExamples:\n  babli questions                    # interactive\n  babli questions --json             # JSON output for agents"
-).action(async () => {
-  await run({ action: "questions" });
+).action(async (options) => {
+  await run({ action: "questions", answersFile: options.answersFile });
 });
 program.command("review").description("Review and approve translations").option(
   "--score-threshold <score>",
@@ -5550,7 +6102,9 @@ program.command("review").description("Review and approve translations").option(
 ).action(async (options) => {
   const scoreThreshold = parseInt(options.scoreThreshold, 10);
   if (Number.isNaN(scoreThreshold) || scoreThreshold < 0 || scoreThreshold > 100) {
-    throw new Error(`Invalid --score-threshold value: "${options.scoreThreshold}"`);
+    throw new Error(
+      `Invalid --score-threshold value: "${options.scoreThreshold}"`
+    );
   }
   await run({
     action: "review",
@@ -5885,8 +6439,15 @@ async function runAction(cliInput, flags) {
     const projectName = projectInfo.name;
     const targetLanguages = getTargetLanguageCodes(projectInfo.languages);
     let questionsFetchFailed = false;
+    const workflowKeys = cliInput.action === "sync-and-translate" ? cliInput.options.keys : [];
+    const workflowNamespaces = cliInput.action === "sync-and-translate" ? cliInput.options.namespaces : [];
+    const statusInput = {
+      action: "status",
+      keys: workflowKeys,
+      namespaces: workflowNamespaces
+    };
     const [result2, questions] = await Promise.all([
-      doSync({ action: "status" }),
+      doSync(statusInput),
       fetchQuestions(host, projectId, accessToken).catch(() => {
         questionsFetchFailed = true;
         return [];
@@ -5901,12 +6462,29 @@ async function runAction(cliInput, flags) {
       targetLanguages,
       emptyValueString: parsed.emptyValueString,
       onlyExisting: cliInput.action === "sync-and-translate" ? cliInput.options.onlyExisting : false,
-      doPush: (keysToRemove) => doSync({ action: "push", keysToRemove, quiet: true }),
-      reFetchAndSync: () => doSync({ action: "status" }),
+      keys: workflowKeys,
+      namespaces: workflowNamespaces,
+      languages: cliInput.action === "sync-and-translate" ? cliInput.options.languages : void 0,
+      model: cliInput.action === "sync-and-translate" ? cliInput.options.model : "production",
+      maxCreditUnits: cliInput.action === "sync-and-translate" ? cliInput.options.maxCreditUnits : void 0,
+      timeout: cliInput.action === "sync-and-translate" ? cliInput.options.timeout : 300,
+      doPush: (keysToRemove) => doSync({
+        action: "push",
+        keysToRemove,
+        quiet: true,
+        keys: workflowKeys,
+        namespaces: workflowNamespaces
+      }),
+      reFetchAndSync: () => doSync(statusInput),
       doPull: async (options) => {
         await doSync({
           action: "pull",
-          options: { onlyApproved: false, ...options }
+          options: {
+            onlyApproved: false,
+            keys: workflowKeys,
+            namespaces: workflowNamespaces,
+            ...options
+          }
         });
       }
     };
@@ -5914,12 +6492,22 @@ async function runAction(cliInput, flags) {
       const exitCode = await syncAndTranslate(s2tInput);
       return { needPush: false, needPull: false, exitCode };
     }
-    const dashboard = computeDashboard(result2.status, questions.length, projectName, {
-      questionsFetchFailed
-    });
+    const dashboard = computeDashboard(
+      result2.status,
+      questions.length,
+      projectName,
+      {
+        questionsFetchFailed
+      }
+    );
     if (flags.json) {
-      console.info(renderDashboardJson(dashboard, result2.status, questions.length));
-      return { needPush: result2.status.needPush, needPull: result2.status.needPull };
+      console.info(
+        renderDashboardJson(dashboard, result2.status, questions.length)
+      );
+      return {
+        needPush: result2.status.needPush,
+        needPull: result2.status.needPull
+      };
     }
     console.info(renderDashboardHuman(dashboard));
     if (dashboard.isInSync) {
@@ -5948,12 +6536,20 @@ async function runAction(cliInput, flags) {
     } else if (choice === "questions") {
       await questionsCommand({ host, projectId, accessToken, flags });
     } else if (choice === "details") {
-      console.info(renderStatusHuman(result2.comparison, result2.status, { full: false }));
+      console.info(
+        renderStatusHuman(result2.comparison, result2.status, { full: false })
+      );
     }
     return { needPush: false, needPull: false };
   }
   if (cliInput.action === "questions") {
-    await questionsCommand({ host, projectId, accessToken, flags });
+    await questionsCommand({
+      host,
+      projectId,
+      accessToken,
+      flags,
+      answersFile: cliInput.answersFile
+    });
     return { needPush: false, needPull: false };
   }
   if (cliInput.action === "review") {
@@ -5992,10 +6588,27 @@ async function runAction(cliInput, flags) {
     }
   }
   if (cliInput.action === "status") {
+    const projectInfo = await fetchProjectInfo(host, projectId, accessToken);
+    const coverage = computeTranslationCoverage({
+      syncResult: result,
+      targetLanguages: getTargetLanguageCodes(projectInfo.languages),
+      emptyValueString: parsed.emptyValueString,
+      keys: cliInput.keys,
+      namespaces: cliInput.namespaces
+    });
+    const filter = {
+      keys: cliInput.keys ?? [],
+      namespaces: cliInput.namespaces ?? []
+    };
     if (flags.json) {
-      console.info(renderStatusJson(result.status));
+      console.info(renderStatusJson(result.status, coverage, filter));
     } else {
-      console.info(renderStatusHuman(result.comparison, result.status, { full: flags.full }));
+      console.info(
+        renderStatusHuman(result.comparison, result.status, {
+          full: flags.full,
+          coverage
+        })
+      );
     }
   }
   if (cliInput.action === "push" && flags.json) {
@@ -6025,6 +6638,7 @@ async function runAction(cliInput, flags) {
       model: cliInput.options.model,
       dryRun: cliInput.options.dryRun,
       estimate: cliInput.options.estimate,
+      maxCreditUnits: cliInput.options.maxCreditUnits,
       timeout: cliInput.options.timeout,
       wait: cliInput.options.wait
     });

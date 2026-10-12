@@ -6,12 +6,47 @@ Use Babli.ai from your commandline. Sync your project with Babli.
 
 ## Use
 
-When you have new keys to translate. Add them to one of your translation files. And then
+For the complete agent workflow, add new keys to your translation files and run:
 
-- run `babli login` if you haven't already
-- `babli push` - push new keys/translations to Babli.ai
-- translate them on [babli.ai](https://www.babli.ai/app)
-- `babli pull` - pull the new translations to your project
+```bash
+babli sync-and-translate --json --no-interaction
+```
+
+This pushes, waits for translation, and pulls completed results. For a cost-controlled operation on existing remote keys:
+
+```bash
+babli translate --namespace speech --estimate --json
+babli translate --namespace speech --max-credits 7.00 --wait --json
+babli pull --namespace speech --json --no-interaction
+```
+
+Push new local keys before requesting an exact estimate. If waiting times out, use the returned job id with `babli job <job_id> --wait`; do not dispatch `translate` again.
+
+### Answer questions from an agent
+
+```bash
+babli questions --json
+babli questions --answers-file answers.json --json --no-interaction
+```
+
+JSON listing never prompts. It includes each question's `keyId`, `languageId`, `languageCode`, `keyName`, and `question`. Build `answers.json` from those identifiers:
+
+```json
+{
+  "answers": [{
+    "keyId": "<key UUID from questions>",
+    "languageId": "<language UUID from questions>",
+    "questionText": "<exact question text>",
+    "answer": "Use formal address."
+  }]
+}
+```
+
+Answer submission requires a user token from `babli login`; project API keys can list questions but cannot submit answers. A batch of up to 500 answers is validated and saved atomically. Unknown questions, duplicate entries, and blank answers are rejected.
+
+The response contains remaining questions and `retranslationRequired`. Retranslate the affected keys and languages to use the answers. Saving an answer clears their cached scores; earlier jobs cannot restore those scores without the saved answers in their input. Answers apply only to their key and language.
+
+Generation and saving check ICU arguments, format specifiers, select branches, explicit plural selectors, rich-text component tags, and common `{{name}}` placeholders. Locale-specific plural categories may change. Invalid output is retried during generation and rejected before saving. These checks do not establish linguistic correctness; arbitrary HTML, printf syntax, and custom template formats are not covered.
 
 ## Install
 
@@ -77,7 +112,7 @@ If the version is a prerelease such as `0.1.0-beta.1`, CI publishes it under the
 ## Use in CI
 
 - set `BABLI_API_KEY` env variable (find it in your project settings)
-- run `babli pull` to pull translations from babli.ai
+- run `babli sync-and-translate --json --no-interaction` to safely push, wait, and pull
 
 ## Create a project from the CLI
 
