@@ -48,6 +48,70 @@ The response contains remaining questions and `retranslationRequired`. Retransla
 
 Generation and saving check ICU arguments, format specifiers, select branches, explicit plural selectors, rich-text component tags, and common `{{name}}` placeholders. Locale-specific plural categories may change. Invalid output is retried during generation and rejected before saving. These checks do not establish linguistic correctness; arbitrary HTML, printf syntax, and custom template formats are not covered.
 
+### Write key descriptions from code context
+
+Export active keys with one language's text and current descriptions:
+
+```bash
+babli key export --language en --output keys.json --json --no-interaction
+```
+
+The export has `version`, `projectId`, `language`, and `keys`. Each key contains
+`keyId`, `key`, `namespace`, `sourceText`, `sourceVersionId`, and `description`.
+Missing source translations have null text/version fields and need source text
+before drafting. Export reads pages of up to 500 keys, without loading other
+languages. Pages are read separately; export again if keys change during the run.
+
+An agent can inspect local code usages and write a descriptions file:
+
+```json
+{
+  "version": 1,
+  "projectId": "<project UUID from export>",
+  "language": "en",
+  "items": [
+    {
+      "keyId": "<key UUID from export>",
+      "expectedDescription": null,
+      "expectedSourceVersionId": "<source version UUID from export>",
+      "description": "Button that submits the booking and opens the payment step.",
+      "status": "drafted"
+    },
+    {
+      "keyId": "<another key UUID from export>",
+      "status": "unresolved",
+      "reason": "No reliable usage context found."
+    }
+  ]
+}
+```
+
+Copy both expected values exactly from the export. Keep existing descriptions
+unless deliberately revising them. Describe where the text appears, what it
+means, and any placeholders or wording constraints. Skip keys whose meaning is
+unclear; absence of collected usages does not establish that a key is unused.
+Code excerpts, evidence paths, and other drafting metadata stay local.
+
+```bash
+babli key update --file descriptions.json --dry-run --json --no-interaction
+babli key update --file descriptions.json --json --no-interaction
+```
+
+The CLI validates the complete file and project before sending changes, skips
+unresolved entries, and sends descriptions in batches of at most 100. Each batch
+is atomic: a changed source version or unexpected description rejects that whole
+batch. Earlier successful batches remain saved. Dry-run checks current state
+without reserving it; applying checks again.
+
+On failure, the command exits with code 2 and reports completed batches and the
+error. After resolving conflicts, rerun the file: descriptions already set to the
+requested value are unchanged, provided their source version still matches.
+Saving descriptions does not start translation jobs or upload local code usages.
+
+These commands require the key-context export and description-batch API routes.
+Deploy the updated Babli server before releasing the CLI version that includes
+them. Existing single-key commands continue to work.
+
 ## Install
 
 ```bash

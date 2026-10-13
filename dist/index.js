@@ -12,8 +12,10 @@ import { glob } from 'glob';
 import * as minimatch from 'minimatch';
 import { minimatch as minimatch$1 } from 'minimatch';
 import ignore from 'ignore';
+import fs$1, { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import path$1 from 'node:path';
 import { pathToFileURL } from 'url';
-import { readFile } from 'node:fs/promises';
 import { parse, stringify } from 'yaml';
 import { fromError } from 'zod-validation-error';
 import yaml from 'js-yaml';
@@ -1064,9 +1066,9 @@ function namespaceFilePathToRegex(namespaceFilePath) {
   return new RegExp(modified);
 }
 
-var __defProp$1 = Object.defineProperty;
-var __defNormalProp$1 = (obj, key, value) => key in obj ? __defProp$1(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
-var __publicField$1 = (obj, key, value) => __defNormalProp$1(obj, typeof key !== "symbol" ? key + "" : key, value);
+var __defProp$2 = Object.defineProperty;
+var __defNormalProp$2 = (obj, key, value) => key in obj ? __defProp$2(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField$2 = (obj, key, value) => __defNormalProp$2(obj, typeof key !== "symbol" ? key + "" : key, value);
 async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
   const allFilesByPattern = {};
   const languagesInConfig = new AllLanguagesGatherer(translationFilesConfig);
@@ -1161,8 +1163,8 @@ async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
 }
 class AllLanguagesGatherer {
   constructor(translationFilesConfig) {
-    __publicField$1(this, "translationFilesConfig", translationFilesConfig);
-    __publicField$1(this, "allLanguagesInConfig", /* @__PURE__ */ new Set());
+    __publicField$2(this, "translationFilesConfig", translationFilesConfig);
+    __publicField$2(this, "allLanguagesInConfig", /* @__PURE__ */ new Set());
     for (const fileConfig of this.translationFilesConfig) {
       if (fileConfig.languages) {
         for (const lang of fileConfig.languages) {
@@ -2807,17 +2809,19 @@ async function runCli({
   };
 }
 
-var __defProp = Object.defineProperty;
-var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
-var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+var __defProp$1 = Object.defineProperty;
+var __defNormalProp$1 = (obj, key, value) => key in obj ? __defProp$1(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField$1 = (obj, key, value) => __defNormalProp$1(obj, typeof key !== "symbol" ? key + "" : key, value);
 class CliRequestError extends Error {
   constructor(input) {
     super(input.message, { cause: input.cause });
-    __publicField(this, "code");
-    __publicField(this, "httpStatus");
+    __publicField$1(this, "code");
+    __publicField$1(this, "httpStatus");
+    __publicField$1(this, "details");
     this.name = "CliRequestError";
     this.code = input.code;
     this.httpStatus = input.httpStatus;
+    this.details = input.details;
   }
 }
 
@@ -2835,7 +2839,8 @@ const errorBodySchema = z.object({
     z.string(),
     z.object({
       code: z.string().optional(),
-      message: z.string()
+      message: z.string(),
+      details: z.unknown().optional()
     })
   ])
 });
@@ -2852,7 +2857,8 @@ async function readCliResponseError(response) {
     return new CliRequestError({
       message: typeof error === "string" ? error : error.message,
       code: typeof error === "string" ? void 0 : error.code,
-      httpStatus: response.status
+      httpStatus: response.status,
+      details: typeof error === "string" ? void 0 : error.details
     });
   }
   return new CliRequestError({
@@ -3678,6 +3684,305 @@ async function jobCommand(ctx, options) {
   return status.status === "failed" || status.status === "timeout" ? 2 : 0;
 }
 
+var __defProp = Object.defineProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField = (obj, key, value) => __defNormalProp(obj, key + "" , value);
+class KeyDescriptionBatchError extends Error {
+  constructor(report, cause) {
+    super(
+      `Description batch ${report.failure.batch} failed after ${report.completed_batches} completed batches: ${report.error.message}. ${report.failure.recovery}`,
+      { cause }
+    );
+    __publicField(this, "report", report);
+    this.name = "KeyDescriptionBatchError";
+  }
+}
+
+const nonblankStringSchema = z.string().refine((value) => value.trim().length > 0, "Must not be blank");
+const languageSchema = z.string().trim().min(1);
+const descriptionSchema = z.string().max(2e4);
+const descriptionItemSchema = z.object({
+  keyId: z.string().uuid(),
+  expectedDescription: z.string().nullable(),
+  expectedSourceVersionId: z.string().uuid(),
+  description: descriptionSchema.refine(
+    (value) => value.trim().length > 0,
+    "Description must not be blank"
+  )
+});
+function validateUniqueKeyIds({ items }, context) {
+  const seen = /* @__PURE__ */ new Set();
+  for (const [index, item] of items.entries()) {
+    const identity = item.keyId.toLowerCase();
+    if (seen.has(identity)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["items", index, "keyId"],
+        message: "Duplicate key ID"
+      });
+    }
+    seen.add(identity);
+  }
+}
+z.object({
+  language: languageSchema,
+  dryRun: z.boolean(),
+  items: z.array(descriptionItemSchema).min(1).max(100)
+}).superRefine(validateUniqueKeyIds);
+const keyDescriptionBatchResultSchema = z.object({
+  items: z.array(
+    z.object({
+      keyId: z.string().uuid(),
+      status: z.enum(["updated", "would_update", "unchanged"])
+    })
+  )
+});
+z.object({
+  conflicts: z.array(
+    z.object({
+      keyId: z.string().uuid(),
+      reason: z.enum([
+        "key_not_found",
+        "source_changed",
+        "description_changed"
+      ])
+    })
+  )
+});
+const unresolvedItemSchema = z.object({
+  keyId: z.string().uuid(),
+  status: z.literal("unresolved"),
+  reason: nonblankStringSchema,
+  description: z.never().optional()
+}).refine((item) => !Object.hasOwn(item, "description"), {
+  path: ["description"],
+  message: "Unresolved items must not contain a description"
+}).transform(({ keyId, status, reason }) => ({ keyId, status, reason }));
+const keyDescriptionFileSchema = z.object({
+  version: z.literal(1),
+  projectId: z.string().uuid(),
+  language: languageSchema,
+  items: z.array(
+    z.union([
+      descriptionItemSchema.extend({
+        status: z.literal("drafted").optional()
+      }),
+      unresolvedItemSchema
+    ])
+  ).max(1e5)
+}).superRefine(validateUniqueKeyIds);
+
+function printJson(value) {
+  console.info(JSON.stringify(value, null, 2));
+}
+
+function serializeCliError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!(error instanceof CliRequestError)) return { message };
+  return {
+    message,
+    ...error.code ? { code: error.code } : {},
+    ...error.httpStatus !== void 0 ? { http_status: error.httpStatus } : {},
+    ...error.details !== void 0 ? { details: error.details } : {}
+  };
+}
+
+async function keyDescriptionFileCommand(ctx, options) {
+  const parsed = keyDescriptionFileSchema.safeParse(
+    JSON.parse(await fs$1.readFile(options.file, "utf8"))
+  );
+  if (!parsed.success) {
+    throw new CliRequestError({
+      message: "Invalid descriptions file.",
+      code: "invalid_description_file",
+      details: parsed.error.issues
+    });
+  }
+  const file = parsed.data;
+  if (file.projectId.toLowerCase() !== ctx.projectId.toLowerCase()) {
+    throw new CliRequestError({
+      message: "The descriptions file projectId does not match babli.json.",
+      code: "project_mismatch"
+    });
+  }
+  const items = [];
+  for (const item of file.items) {
+    if (item.status === "unresolved") continue;
+    items.push({
+      keyId: item.keyId,
+      expectedDescription: item.expectedDescription,
+      expectedSourceVersionId: item.expectedSourceVersionId,
+      description: item.description
+    });
+  }
+  const report = {
+    version: 1,
+    command: "key_update",
+    status: options.dryRun ? "dry_run" : "updated",
+    project_id: ctx.projectId,
+    language: file.language,
+    dry_run: options.dryRun,
+    completed_batches: 0,
+    total_batches: Math.ceil(items.length / 100),
+    counts: {
+      total: file.items.length,
+      skipped_unresolved: file.items.length - items.length,
+      updated: 0,
+      would_update: 0,
+      unchanged: 0,
+      pending: items.length
+    }
+  };
+  for (let offset = 0; offset < items.length; offset += 100) {
+    const batch = items.slice(offset, offset + 100);
+    try {
+      const body = await requestCliJson(
+        `${ctx.host}/api/cli/${ctx.projectId}/keys/descriptions`,
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${ctx.accessToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            language: file.language,
+            dryRun: options.dryRun,
+            items: batch
+          })
+        }
+      );
+      const result = keyDescriptionBatchResultSchema.safeParse(body);
+      if (!result.success) throw invalidResult();
+      const expectedIds = new Set(batch.map((item) => item.keyId));
+      for (const item of result.data.items) {
+        if (!expectedIds.delete(item.keyId) || (options.dryRun ? item.status === "updated" : item.status === "would_update"))
+          throw invalidResult();
+      }
+      if (expectedIds.size !== 0) throw invalidResult();
+      for (const item of result.data.items) report.counts[item.status]++;
+      report.counts.pending -= batch.length;
+      report.completed_batches++;
+    } catch (cause) {
+      throw new KeyDescriptionBatchError(
+        {
+          ...report,
+          status: "error",
+          error: serializeCliError(cause),
+          failure: {
+            batch: report.completed_batches + 1,
+            key_ids: batch.map((item) => item.keyId),
+            recovery: "Rerun the same file to resume; for conflicts, export fresh keys and review changed entries before retrying."
+          }
+        },
+        cause
+      );
+    }
+  }
+  if (ctx.flags.json) {
+    printJson(report);
+  } else {
+    console.info(
+      `${report.counts.updated} updated, ${report.counts.would_update} would update, ${report.counts.unchanged} unchanged, ${report.counts.skipped_unresolved} unresolved skipped (${report.completed_batches} batches).`
+    );
+  }
+}
+function invalidResult() {
+  return new CliRequestError({
+    message: "Invalid description batch response; batch outcome is unconfirmed.",
+    code: "invalid_response"
+  });
+}
+
+const keyContextSchema = z.object({
+  keyId: z.string().uuid(),
+  key: z.string(),
+  namespace: z.string(),
+  description: z.string().nullable(),
+  sourceText: z.string().nullable(),
+  sourceVersionId: z.string().uuid().nullable()
+});
+const keyContextPageSchema = z.object({
+  keys: z.array(keyContextSchema),
+  nextCursor: z.string().uuid().nullable()
+});
+z.object({
+  version: z.literal(1),
+  projectId: z.string().uuid(),
+  language: z.string().trim().min(1),
+  keys: z.array(keyContextSchema)
+});
+
+async function keyExportCommand(ctx, options) {
+  const language = options.language.trim();
+  if (!language || !options.output.trim()) {
+    throw new Error("Provide nonblank --language and --output values.");
+  }
+  const keys = [];
+  const keyIds = /* @__PURE__ */ new Set();
+  const cursors = /* @__PURE__ */ new Set();
+  let cursor = null;
+  do {
+    const query = new URLSearchParams({
+      language,
+      limit: "500"
+    });
+    if (cursor !== null) query.set("cursor", cursor);
+    const body = await requestCliJson(
+      `${ctx.host}/api/cli/${ctx.projectId}/keys/export?${query}`,
+      { headers: { Authorization: `Bearer ${ctx.accessToken}` } }
+    );
+    const parsed = keyContextPageSchema.safeParse(body);
+    if (!parsed.success || parsed.data.keys.length > 500) {
+      throw invalidResponse("Invalid key export response.");
+    }
+    const page = parsed.data;
+    for (const key of page.keys) {
+      if (keyIds.has(key.keyId))
+        throw invalidResponse(`Duplicate exported key: ${key.keyId}`);
+      keyIds.add(key.keyId);
+      keys.push(key);
+    }
+    cursor = page.nextCursor;
+    if (cursor !== null) {
+      if (page.keys.length === 0 || cursors.has(cursor)) {
+        throw invalidResponse("Key export pagination did not advance.");
+      }
+      cursors.add(cursor);
+    }
+  } while (cursor !== null);
+  const exported = {
+    version: 1,
+    projectId: ctx.projectId,
+    language,
+    keys
+  };
+  const output = path$1.resolve(options.output);
+  const temporary = `${output}.${randomUUID()}.tmp`;
+  try {
+    await fs$1.writeFile(temporary, `${JSON.stringify(exported, null, 2)}
+`, {
+      flag: "wx"
+    });
+    await fs$1.rename(temporary, output);
+  } finally {
+    await fs$1.rm(temporary, { force: true });
+  }
+  if (ctx.flags.json) {
+    printJson({
+      version: 1,
+      command: "key_export",
+      status: "exported",
+      output,
+      count: keys.length
+    });
+  } else {
+    console.info(`Exported ${keys.length} keys to ${output}.`);
+  }
+}
+function invalidResponse(message) {
+  return new CliRequestError({ message, code: "invalid_response" });
+}
+
 async function loadTransform(transformPath, cwd) {
   const absolutePath = resolve(cwd, transformPath);
   let loaded;
@@ -3740,10 +4045,6 @@ function parseCreditUnits(value) {
     throw new Error(`Credit limit is too large: "${value}".`);
   }
   return units;
-}
-
-function printJson(value) {
-  console.info(JSON.stringify(value, null, 2));
 }
 
 async function projectListCommand(ctx, options) {
@@ -4500,16 +4801,6 @@ ${FgGreen}Auto-approved ${result.approved} translation(s) with score >= ${thresh
 function truncate(str, maxLen) {
   if (str.length <= maxLen) return str;
   return str.slice(0, maxLen - 3) + "...";
-}
-
-function serializeCliError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  if (!(error instanceof CliRequestError)) return { message };
-  return {
-    message,
-    ...error.code ? { code: error.code } : {},
-    ...error.httpStatus !== void 0 ? { http_status: error.httpStatus } : {}
-  };
 }
 
 async function keyListCommand(ctx, options) {
@@ -5665,6 +5956,28 @@ function serializeWorkItems(work) {
   }));
 }
 
+function validateKeyUpdateOptions(options) {
+  if (options.file !== void 0) {
+    if (!options.file.trim())
+      throw new Error("Provide a nonblank --file path.");
+    const singleKeyFlags = [
+      options.keyId,
+      options.key,
+      options.namespace,
+      options.newNamespace,
+      options.source,
+      options.description
+    ];
+    if (singleKeyFlags.some((value) => value !== void 0)) {
+      throw new Error(
+        "Use --file separately from single-key lookup and update flags."
+      );
+    }
+  } else if (options.dryRun) {
+    throw new Error("--dry-run requires --file.");
+  }
+}
+
 const packageJson = JSON.parse(
   fsSync.readFileSync(new URL("../package.json", import.meta.url), "utf8")
 );
@@ -5709,6 +6022,7 @@ Commands:
 
   key list                     List remote keys
   key get                      Get one remote key
+  key export                   Export compact key context
   key add                      Add a remote key
   key update                   Update key metadata/source text
   key rename                   Rename a remote key
@@ -5969,6 +6283,9 @@ withGlobalOptions(keyCommand.command("get")).description("Get one remote key").o
     });
   }
 );
+withGlobalOptions(keyCommand.command("export")).description("Export compact key context for a source language").requiredOption("--language <code>", "Source language code").requiredOption("--output <path>", "Output JSON file").action(async (options) => {
+  await run({ action: "key-export", options });
+});
 withGlobalOptions(keyCommand.command("add")).description("Add one remote key").requiredOption("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace", "").option("--source <text>", "Source metadata", "").option("--description <text>", "Key description").option(
   "--translation <code=value>",
   "Approved translation",
@@ -5979,11 +6296,14 @@ withGlobalOptions(keyCommand.command("add")).description("Add one remote key").r
     await run({ action: "key-add", options });
   }
 );
-withGlobalOptions(keyCommand.command("update")).description("Update key metadata").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Namespace for key lookup").option("--new-namespace <namespace>", "New namespace").option("--source <text>", "Source metadata").option("--description <text>", "Key description").action(
-  async (options) => {
-    await run({ action: "key-update", options });
-  }
-);
+withGlobalOptions(keyCommand.command("update")).description("Update key metadata").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Namespace for key lookup").option("--new-namespace <namespace>", "New namespace").option("--source <text>", "Source metadata").option("--description <text>", "Key description").option(
+  "--file <path>",
+  "Validated description draft file (separate from single-key flags)"
+).option("--dry-run", "Check a description file without writing changes").action(async (options) => {
+  options.dryRun = options.dryRun === true;
+  validateKeyUpdateOptions(options);
+  await run({ action: "key-update", options });
+});
 withGlobalOptions(keyCommand.command("rename")).description("Rename one key").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").requiredOption("--to <new-key>", "New key name").action(async (options) => {
   await run({ action: "key-rename", options });
 });
@@ -6216,6 +6536,10 @@ async function run(cliInput) {
       process.exit(0);
     }
     if (getGlobalFlags().json) {
+      if (err instanceof KeyDescriptionBatchError) {
+        console.info(JSON.stringify(err.report, null, 2));
+        process.exit(2);
+      }
       const error = serializeCliError(err);
       console.info(
         JSON.stringify(
@@ -6376,12 +6700,23 @@ async function runAction(cliInput, flags) {
     await keyGetCommand(surgicalCtx, cliInput.options);
     return { needPush: false, needPull: false };
   }
+  if (cliInput.action === "key-export") {
+    await keyExportCommand(surgicalCtx, cliInput.options);
+    return { needPush: false, needPull: false };
+  }
   if (cliInput.action === "key-add") {
     await keyAddCommand(surgicalCtx, cliInput.options);
     return { needPush: false, needPull: false };
   }
   if (cliInput.action === "key-update") {
-    await keyUpdateCommand(surgicalCtx, cliInput.options);
+    if (cliInput.options.file !== void 0) {
+      await keyDescriptionFileCommand(surgicalCtx, {
+        file: cliInput.options.file,
+        dryRun: cliInput.options.dryRun
+      });
+    } else {
+      await keyUpdateCommand(surgicalCtx, cliInput.options);
+    }
     return { needPush: false, needPull: false };
   }
   if (cliInput.action === "key-rename") {

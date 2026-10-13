@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-13
+
+### Added
+
+- `key export --language <code> --output <file>` to export active keys, descriptions, source text and source versions without loading other languages.
+- `key update --file <file>` with dry runs, guarded 100-key batches, resumable uploads and structured conflict reports for agent-authored descriptions.
+
+### Changed
+
+- Faster translation estimates while preserving existing translation plans.
+
 ## [0.7.0] - 2026-10-12
 
 ### Added
