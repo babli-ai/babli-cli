@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-20
+
+### Added
+
+- `key rename --file` atomically renames keys, moves namespaces, and changes source-file placement. Supports dry runs and safe retries. Rejects unpushed local changes by default (`--allow-unpushed` overrides), nested-key collisions, and conflicting destination paths. Run `pull` after applying a rename.
+- `key export` includes each key's `source`.
+- `push --prune` and `sync-and-translate --prune` archive server keys absent from all configured local translation files, respecting key and namespace filters. Archived keys retain their translations. When no local files are found, pruning requires `--allow-empty-prune`.
+- `push --dry-run` previews uploads and archives without changing the server.
+- `quality check`, `show`, `decide`, and `retry` provide linguistic review of existing translations, with estimates, findings, decisions, and rechecks. Submitting a review requires an explicit `--max-credits` cap.
+- `questions` supports `--job`, `--key`, `--namespace`, `--key-id`, and `--languages` filters.
+- Translation completion, job status, sync, and saved question answers include `follow_up` information with question status and scoped next actions.
+- `pull --keep-local-only` preserves keys that exist only locally.
+
+### Changed
+
+- **Full pulls now remove local-only keys from standard translation files, including never-pushed keys.** Interactive runs ask first; noninteractive runs remove them automatically. Push local additions before pulling, or use `--keep-local-only`. Scoped pulls preserve local-only keys and content outside their scope. JSON output lists removals in `removed_keys`.
+- Pull follows current source and namespace placement, removes obsolete names, and deletes emptied source or namespace files. Output collisions are rejected before writing. Custom transforms require manual rename cleanup.
+- CLI guidance now requires agents to prepare and save key descriptions before translating.
+
+### Fixed
+
+- `sync-and-translate` handles server-only keys even when there is nothing to upload, and pushes containing only removals are processed correctly.
+- Noninteractive sync no longer recreates local keys that were intentionally kept only on the server.
+- Large `--json` output is no longer truncated when piped to another command.
+
 ## [0.8.0] - 2026-10-13
 
 ### Added

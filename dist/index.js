@@ -1,26 +1,402 @@
 #!/usr/bin/env node
+import { randomUUID } from 'node:crypto';
+import fs$1, { readFile } from 'node:fs/promises';
+import { z } from 'zod';
+import { setTimeout as setTimeout$1 } from 'node:timers/promises';
 import { select, input, checkbox, confirm } from '@inquirer/prompts';
+import * as minimatch from 'minimatch';
+import { minimatch as minimatch$1 } from 'minimatch';
 import { Command, Help } from 'commander';
 import fsSync from 'fs';
 import * as fs from 'fs/promises';
 import fs__default from 'fs/promises';
-import { stdin, env } from 'process';
+import { stdin as stdin$1, env } from 'process';
 import open from 'open';
 import path, { join, resolve } from 'path';
-import { z } from 'zod';
 import { glob } from 'glob';
-import * as minimatch from 'minimatch';
-import { minimatch as minimatch$1 } from 'minimatch';
-import ignore from 'ignore';
-import fs$1, { readFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
 import path$1 from 'node:path';
-import { pathToFileURL } from 'url';
+import ignore from 'ignore';
+import { stdin } from 'node:process';
+import PO from 'pofile';
 import { parse, stringify } from 'yaml';
+import { pathToFileURL } from 'url';
 import { fromError } from 'zod-validation-error';
 import yaml from 'js-yaml';
-import PO from 'pofile';
 import { Parser, Language, Query } from 'web-tree-sitter';
+
+const reviewModel = z.enum([
+  "gpt-4.1",
+  "gemini-3.1-pro",
+  "gemini-3-flash"
+]);
+const reviewSelection = z.object({
+  jobId: z.string().uuid().optional(),
+  keys: z.array(z.string().min(1)).max(500).default([]),
+  namespaces: z.array(z.string()).max(500).default([]),
+  keyIds: z.array(z.string().uuid()).max(500).optional(),
+  translationIds: z.array(z.string().uuid()).max(500).optional(),
+  languages: z.array(z.string().min(1)).max(200).optional(),
+  source: z.string().min(1).optional(),
+  type: z.literal("").default(""),
+  model: reviewModel.default("gpt-4.1"),
+  recheck: z.string().uuid().optional()
+}).strict();
+reviewSelection.extend({
+  requestId: z.string().uuid(),
+  maxCreditUnits: z.number().int().nonnegative()
+});
+const reviewFinding = z.object({
+  id: z.string().min(1).max(100),
+  category: z.enum([
+    "format",
+    "meaning",
+    "omission",
+    "addition",
+    "terminology",
+    "grammar",
+    "locale",
+    "style",
+    "ambiguity",
+    "context_conflict"
+  ]),
+  importance: z.enum(["defect", "question", "suggestion"]),
+  explanation: z.string().min(1).max(4e3),
+  evidence: z.array(z.object({ path: z.string().min(1), quote: z.string().min(1) })).min(1).max(12),
+  replacement: z.string().max(32e3).nullable(),
+  question: z.string().max(2e3).nullable()
+}).strict();
+const reviewChecks = z.enum([
+  "meaning",
+  "completeness",
+  "terminology",
+  "fluency",
+  "locale",
+  "requirements"
+]);
+z.object({
+  resultId: z.string().uuid(),
+  checks: z.array(
+    z.object({
+      check: reviewChecks,
+      result: z.enum(["pass", "finding", "needs_context"]),
+      explanation: z.string().min(1).max(2e3)
+    })
+  ).length(6),
+  findings: z.array(reviewFinding).max(20)
+}).strict();
+const reviewDecisionInput = z.object({
+  requestId: z.string().uuid(),
+  resultId: z.string().uuid(),
+  expectedRevision: z.number().int().nonnegative(),
+  inputHash: z.string().length(64),
+  findingIds: z.array(z.string().min(1)).min(1).max(20),
+  action: z.enum(["apply", "dismiss", "clarify", "defer"]),
+  reason: z.string().trim().min(1).max(4e3),
+  evidence: z.array(z.string().min(1).max(2e3)).max(12).default([]),
+  value: z.string().max(32e3).optional(),
+  answer: z.string().trim().min(1).max(4e3).optional()
+}).strict().superRefine((decision, ctx) => {
+  if (decision.action === "apply" && decision.value === void 0)
+    ctx.addIssue({
+      code: "custom",
+      message: "Applying a correction requires the final value."
+    });
+  if (decision.action === "clarify" && !decision.answer)
+    ctx.addIssue({
+      code: "custom",
+      message: "Clarification requires an answer."
+    });
+  if (decision.action !== "apply" && decision.value !== void 0)
+    ctx.addIssue({
+      code: "custom",
+      message: "Only apply accepts replacement wording."
+    });
+  if (decision.action !== "clarify" && decision.answer !== void 0)
+    ctx.addIssue({
+      code: "custom",
+      message: "Only clarify accepts an answer."
+    });
+  if (new Set(decision.findingIds).size !== decision.findingIds.length)
+    ctx.addIssue({ code: "custom", message: "Duplicate finding IDs." });
+});
+
+var __defProp$2 = Object.defineProperty;
+var __defNormalProp$2 = (obj, key, value) => key in obj ? __defProp$2(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField$2 = (obj, key, value) => __defNormalProp$2(obj, typeof key !== "symbol" ? key + "" : key, value);
+class CliRequestError extends Error {
+  constructor(input) {
+    super(input.message, { cause: input.cause });
+    __publicField$2(this, "code");
+    __publicField$2(this, "httpStatus");
+    __publicField$2(this, "details");
+    this.name = "CliRequestError";
+    this.code = input.code;
+    this.httpStatus = input.httpStatus;
+    this.details = input.details;
+  }
+}
+
+function getRetryAfterMs(value, now = Date.now()) {
+  if (!value) return void 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1e3;
+  const date = Date.parse(value);
+  if (!Number.isFinite(date) || date <= now) return void 0;
+  return date - now;
+}
+
+const errorBodySchema = z.object({
+  error: z.union([
+    z.string(),
+    z.object({
+      code: z.string().optional(),
+      message: z.string(),
+      details: z.unknown().optional()
+    })
+  ])
+});
+async function readCliResponseError(response) {
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    body = void 0;
+  }
+  const parsed = errorBodySchema.safeParse(body);
+  if (parsed.success) {
+    const error = parsed.data.error;
+    return new CliRequestError({
+      message: typeof error === "string" ? error : error.message,
+      code: typeof error === "string" ? void 0 : error.code,
+      httpStatus: response.status,
+      details: typeof error === "string" ? void 0 : error.details
+    });
+  }
+  return new CliRequestError({
+    message: `Request failed. Status: ${response.statusText || response.status}`,
+    code: "request_failed",
+    httpStatus: response.status
+  });
+}
+
+const retryDelays = [250, 750];
+const retryableStatuses = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504]);
+async function requestCliJson(url, init = {}) {
+  const method = (init.method ?? "GET").toUpperCase();
+  const canRetry = method === "GET" || method === "HEAD";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let response;
+    try {
+      response = await fetch(url, init);
+    } catch (cause) {
+      if (!canRetry || attempt === 2) {
+        throw new CliRequestError({
+          message: "Request failed due to a network error",
+          code: "network_error",
+          cause
+        });
+      }
+      await sleep$1(retryDelays[attempt] ?? 750);
+      continue;
+    }
+    if (canRetry && attempt < 2 && retryableStatuses.has(response.status)) {
+      await response.body?.cancel().catch(() => void 0);
+      const baseDelay = retryDelays[attempt] ?? 750;
+      const retryAfter = response.status === 429 || response.status === 503 ? getRetryAfterMs(response.headers.get("Retry-After")) : void 0;
+      const delay = Math.max(baseDelay, Math.min(retryAfter ?? 0, 5e3));
+      await sleep$1(delay);
+      continue;
+    }
+    if (!response.ok) throw await readCliResponseError(response);
+    try {
+      return await response.json();
+    } catch (cause) {
+      throw new CliRequestError({
+        message: "Server returned invalid JSON",
+        code: "invalid_response",
+        httpStatus: response.status,
+        cause
+      });
+    }
+  }
+  throw new CliRequestError({
+    message: "Request failed due to a network error",
+    code: "network_error"
+  });
+}
+function sleep$1(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function inspectQualityRun(context, runId, wait, timeout) {
+  const id = z.string().uuid().parse(runId);
+  const deadline = Date.now() + z.number().int().min(1).max(3600).parse(timeout) * 1e3;
+  while (true) {
+    const raw = await requestCliJson(
+      `${context.host}/api/cli/${context.projectId}/quality/runs/${id}`,
+      { headers: { Authorization: `Bearer ${context.accessToken}` } }
+    );
+    const result = z.object({ status: z.enum(["running", "complete", "failed"]) }).passthrough().parse(raw);
+    if (!wait || result.status !== "running") return result;
+    if (Date.now() >= deadline) return { ...result, status: "timeout" };
+    await setTimeout$1(1e3);
+  }
+}
+
+function parseCreditUnits(value) {
+  const match = /^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/.exec(value);
+  if (!match) {
+    throw new Error(
+      `Invalid credit limit: "${value}". Use a non-negative amount with at most two decimals.`
+    );
+  }
+  const whole = Number(match[1]);
+  const fraction = Number((match[2] ?? "").padEnd(2, "0"));
+  const units = whole * 100 + fraction;
+  if (!Number.isSafeInteger(units)) {
+    throw new Error(`Credit limit is too large: "${value}".`);
+  }
+  return units;
+}
+
+async function qualityCommand(context, input) {
+  const timeout = input.action === "decide" ? 300 : z.coerce.number().int().min(1).max(3600).parse(input.options.timeout);
+  const url = `${context.host}/api/cli/${context.projectId}/quality`;
+  const post = (path, body) => requestCliJson(`${url}/${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${context.accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  let result;
+  if (input.action === "decide") {
+    const body = z.object({ decisions: z.array(reviewDecisionInput).min(1).max(100) }).strict().parse(JSON.parse(await readFile(input.file, "utf8")));
+    result = z.object({
+      results: z.array(
+        z.object({ status: z.enum(["saved", "error"]) }).passthrough()
+      )
+    }).passthrough().parse(await post("decisions", body));
+  } else if (input.action === "show" || input.action === "retry") {
+    if (input.action === "retry")
+      await post(`runs/${z.string().uuid().parse(input.runId)}/retry`, {});
+    result = await inspectQualityRun(
+      context,
+      input.runId,
+      input.options.wait ?? false,
+      timeout
+    );
+  } else {
+    const options = input.options;
+    const selection = reviewSelection.parse({
+      jobId: options.job,
+      keys: options.key,
+      namespaces: options.namespace,
+      keyIds: options.keyId.length ? options.keyId : void 0,
+      translationIds: options.translationId.length ? options.translationId : void 0,
+      languages: options.languages?.split(",").map((code) => code.trim()),
+      source: options.source,
+      model: options.model,
+      recheck: options.recheck
+    });
+    if (options.estimate)
+      result = z.record(z.unknown()).parse(await post("estimate", selection));
+    else {
+      if (options.maxCredits === void 0)
+        throw new Error(
+          "Review submission requires --max-credits. Use --estimate first; review does not apply corrections or approve text."
+        );
+      const requestId = z.string().uuid().parse(options.requestId ?? randomUUID());
+      process.stderr.write(
+        `Review request ID: ${requestId}. Reuse --request-id with identical arguments if submission is interrupted.
+`
+      );
+      const receipt = z.object({
+        runId: z.string().uuid(),
+        requestId: z.string().uuid(),
+        creditUnits: z.number()
+      }).parse(
+        await post("runs", {
+          ...selection,
+          requestId,
+          maxCreditUnits: parseCreditUnits(options.maxCredits)
+        })
+      );
+      result = options.wait ? await inspectQualityRun(context, receipt.runId, true, timeout) : {
+        version: 1,
+        command: "quality",
+        status: "started",
+        run_id: receipt.runId,
+        request_id: receipt.requestId,
+        credit_units: receipt.creditUnits,
+        next_actions: [
+          {
+            command: [
+              "babli",
+              "quality",
+              "show",
+              receipt.runId,
+              "--wait",
+              "--json"
+            ],
+            paid: false
+          }
+        ]
+      };
+    }
+  }
+  console.info(JSON.stringify(result, null, 2));
+  const decisions = z.array(z.object({ status: z.string() })).safeParse(result.results);
+  return result.status === "failed" || result.status === "timeout" || decisions.success && decisions.data.some((item) => item.status === "error") ? 2 : 0;
+}
+
+function registerQualityCommands(program, run, withGlobalOptions) {
+  const quality = program.command("quality").description(
+    "Review existing translations and record agent decisions; approval remains separate"
+  );
+  const collect = (value, values) => [...values, value];
+  withGlobalOptions(quality.command("check")).description(
+    "Estimate or submit one-model review; never generates missing text"
+  ).option(
+    "--job <id>",
+    "Review the exact key/language pairs from a translation job"
+  ).option("--key <pattern>", "Namespaced key glob (repeatable)", collect, []).option("--namespace <pattern>", "Namespace glob (repeatable)", collect, []).option("--key-id <id>", "Key UUID (repeatable)", collect, []).option(
+    "--translation-id <id>",
+    "Exact translation UUID (repeatable)",
+    collect,
+    []
+  ).option("--languages <codes>", "Target language codes (comma-separated)").option("--source <code>", "Declared source language").option(
+    "--model <model>",
+    "One configured reviewer: gpt-4.1 | gemini-3.1-pro | gemini-3-flash",
+    "gpt-4.1"
+  ).option(
+    "--recheck <result-id>",
+    "Recheck one result with current inputs and saved clarifications"
+  ).option("--estimate", "Inspect scope and price without spending").option(
+    "--request-id <uuid>",
+    "Reuse the original request ID after an uncertain submission"
+  ).option(
+    "--max-credits <amount>",
+    "Maximum authorized charge; required to submit"
+  ).option("--wait", "Wait for review completion").option("--timeout <seconds>", "Maximum wait time", "300").action(
+    async (options) => run({ action: "check", options })
+  );
+  for (const action of ["show", "retry"])
+    withGlobalOptions(quality.command(action)).argument("<run-id>").description(
+      action === "show" ? "Inspect reports, coverage, decisions and freshness" : "Retry failed execution once without another customer charge"
+    ).option("--wait", "Wait for completion").option("--timeout <seconds>", "Maximum wait time", "300").action(
+      async (runId, options) => run({ action, runId, options })
+    );
+  withGlobalOptions(quality.command("decide")).description(
+    "Record apply/dismiss/clarify/defer actions; never starts a paid recheck"
+  ).requiredOption(
+    "--file <path>",
+    "JSON file containing decisions with request IDs and expected revisions"
+  ).action(
+    async (options) => run({ action: "decide", file: options.file })
+  );
+}
 
 const nodeParts = process.versions.node.split(".").map(Number);
 const major = nodeParts[0] ?? 0;
@@ -316,12 +692,13 @@ function computePushPlan(comparison) {
       }
     }
   }
-  const hasChanges = newLanguages.length > 0 || newKeys.length > 0 || Object.keys(missingTranslationsPerLanguage).length > 0 || conflicts.length > 0;
+  const hasChanges = (comparison.keysToRemove?.length ?? 0) > 0 || newLanguages.length > 0 || newKeys.length > 0 || Object.keys(missingTranslationsPerLanguage).length > 0 || conflicts.length > 0;
   return {
     newLanguages,
     newKeys,
     missingTranslationsPerLanguage,
     conflicts,
+    keysToRemove: comparison.keysToRemove ?? [],
     hasChanges
   };
 }
@@ -1066,9 +1443,9 @@ function namespaceFilePathToRegex(namespaceFilePath) {
   return new RegExp(modified);
 }
 
-var __defProp$2 = Object.defineProperty;
-var __defNormalProp$2 = (obj, key, value) => key in obj ? __defProp$2(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
-var __publicField$2 = (obj, key, value) => __defNormalProp$2(obj, typeof key !== "symbol" ? key + "" : key, value);
+var __defProp$1 = Object.defineProperty;
+var __defNormalProp$1 = (obj, key, value) => key in obj ? __defProp$1(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField$1 = (obj, key, value) => __defNormalProp$1(obj, typeof key !== "symbol" ? key + "" : key, value);
 async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
   const allFilesByPattern = {};
   const languagesInConfig = new AllLanguagesGatherer(translationFilesConfig);
@@ -1163,8 +1540,8 @@ async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
 }
 class AllLanguagesGatherer {
   constructor(translationFilesConfig) {
-    __publicField$2(this, "translationFilesConfig", translationFilesConfig);
-    __publicField$2(this, "allLanguagesInConfig", /* @__PURE__ */ new Set());
+    __publicField$1(this, "translationFilesConfig", translationFilesConfig);
+    __publicField$1(this, "allLanguagesInConfig", /* @__PURE__ */ new Set());
     for (const fileConfig of this.translationFilesConfig) {
       if (fileConfig.languages) {
         for (const lang of fileConfig.languages) {
@@ -1856,6 +2233,22 @@ function generateFlutterArb(keys, localeCode) {
   return JSON.stringify(arbStructure, null, 2);
 }
 
+function assertNoNestedKeyCollisions(keys) {
+  const names = new Set(keys);
+  for (const key of keys) {
+    const parts = key.split(".");
+    while (parts.length > 1) {
+      parts.pop();
+      const parent = parts.join(".");
+      if (names.has(parent)) {
+        throw new Error(
+          `Keys "${parent}" and "${key}" cannot share nested translation output. Choose different keys or configure nested: false.`
+        );
+      }
+    }
+  }
+}
+
 function makeFlatObject(keys) {
   const flat = {};
   for (const [key, value] of keys) {
@@ -1864,6 +2257,7 @@ function makeFlatObject(keys) {
   return flat;
 }
 function makeNestedObject(keys) {
+  assertNoNestedKeyCollisions([...keys].map(([key]) => key));
   const nested = {};
   for (const [key, value] of keys) {
     const parts = key.split(".");
@@ -1979,11 +2373,52 @@ function generateTranslationFile(keys, format, localeCode, fileOptions) {
   }
 }
 
+function normalizePullPath(path) {
+  return path.normalize("NFC").toLowerCase();
+}
+
+function assertNoPullPathCollisions(files) {
+  const paths = /* @__PURE__ */ new Map();
+  for (const [path, content] of Object.entries(files)) {
+    if (content === null) continue;
+    const normalized = normalizePullPath(path);
+    const previous = paths.get(normalized);
+    if (previous !== void 0 && previous !== path) {
+      throw new Error(
+        `Translation paths "${previous}" and "${path}" differ only by case or Unicode normalization. Use distinct destination paths.`
+      );
+    }
+    paths.set(normalized, path);
+  }
+}
+
 function invertMap(map) {
   if (!map) return {};
   return Object.fromEntries(
     Object.entries(map).map(([local, remote]) => [remote, local])
   );
+}
+
+function resolveTranslationPath(config, state, language) {
+  if (config.namespace !== void 0 ? state.namespace !== config.namespace : !config.path.includes("{{namespace}}") && state.namespace !== "")
+    return null;
+  let path = config.path.replace(/^\.\//, "");
+  for (const [name, value] of [
+    ["lang", language],
+    ["namespace", state.namespace],
+    ["source", state.source]
+  ]) {
+    if (name === void 0 || value === void 0 || !path.includes(`{{${name}}}`))
+      continue;
+    if (!value.trim()) return null;
+    if (/[\\\u0000-\u001f*?\[\]{}]/.test(value) || /^[a-z]:/i.test(value) || value.split("/").some((part) => part === "" || part === "." || part === "..")) {
+      throw new Error(
+        `Invalid ${name} substitution ${JSON.stringify(value)} for ${config.path}`
+      );
+    }
+    path = path.replaceAll(`{{${name}}}`, () => value);
+  }
+  return path;
 }
 
 const KEY = 0;
@@ -2008,114 +2443,163 @@ function sortKeys({
   return keys;
 }
 
-async function prepareFilesToPull(mergedKeysInLocalOrder, mergedKeysByKeyByNamespace, translationFilesConfig, allLanguages, onlyApproved, emptyValueString, selectedKeys) {
-  const keysToPullByFile = {};
-  translationFilesConfig.forEach((fileConfig) => {
-    if (fileConfig.transform) {
-      return;
+async function prepareFilesToPull({
+  mergedKeysInLocalOrder,
+  mergedKeysByKeyByNamespace,
+  translationFilesConfig,
+  allLanguages,
+  onlyApproved,
+  emptyValueString,
+  selectedKeys,
+  allFilesByPattern,
+  keepLocalOnly
+}) {
+  const files = /* @__PURE__ */ new Map();
+  const serverKeys = Object.values(mergedKeysByKeyByNamespace).flatMap(
+    Object.values
+  );
+  const useServer = (key) => !selectedKeys || key.server !== void 0 && selectedKeys.has(getComparisonKey(key));
+  const countedPaths = /* @__PURE__ */ new Set();
+  const localLanguageFor = (config, remoteLanguage) => {
+    const remoteToLocal = invertMap(config.mapLocalToRemote);
+    const languages = config.languages ?? allLanguages.map(
+      (language) => remoteToLocal[language.code] ?? language.code
+    );
+    for (const localLanguage of languages) {
+      if ((config.mapLocalToRemote?.[localLanguage] ?? localLanguage) === remoteLanguage)
+        return localLanguage;
     }
-    const localToRemote = fileConfig.mapLocalToRemote ?? {};
-    const remoteToLocal = invertMap(fileConfig.mapLocalToRemote);
-    const languages = fileConfig.languages ? fileConfig.languages.map((local) => localToRemote[local] ?? local) : allLanguages.map((l) => l.code);
-    languages.forEach((remoteLang) => {
-      const localLang = remoteToLocal[remoteLang] ?? remoteLang;
-      const pathWithLang = fileConfig.path.replace("{{lang}}", localLang);
-      const fileFormat = fileConfig.format;
-      function insertKeys(path, keys, namespace) {
-        const keysInLocalOrder = mergedKeysInLocalOrder[path]?.keys.filter(
-          (k) => (k.server?.namespace ?? k.local?.namespace ?? "") === namespace
-        );
-        const allKeys = keysInLocalOrder ? uniq([...keysInLocalOrder, ...Object.values(keys)]) : Object.values(keys);
-        for (const key of allKeys) {
-          const translation = key.translations[remoteLang];
-          const isSelectedForPull = !selectedKeys || selectedKeys.has(getComparisonKey(key));
-          const serverValue = onlyApproved ? translation?.server?.approved ? translation?.server?.currentValue : null : translation?.server?.currentValue;
-          const hasServerKey = key.server != null;
-          const value = isSelectedForPull && (!selectedKeys || hasServerKey) ? serverValue : translation?.local?.value;
-          if (value != void 0 || fileConfig.pullWithEmptyValues) {
-            if (!fileFormat) {
-              throw new Error("Could not determine file format");
-            }
-            keysToPullByFile[path] ?? (keysToPullByFile[path] = {
-              keys: [],
-              lang: remoteLang,
-              fileFormat,
-              usedConfig: fileConfig
-            });
-            keysToPullByFile[path].keys.push({
-              key: key.key,
+    return null;
+  };
+  const destinationsFor = (key, remoteLanguage, current) => {
+    if (!key.server || !useServer(key)) return [];
+    const state = {
+      key: key.key,
+      namespace: key.server.namespace,
+      source: key.server.source
+    };
+    const paths = [];
+    for (const candidate of translationFilesConfig) {
+      if (candidate.transform) continue;
+      const language = candidate === current.config ? current.localLanguage : localLanguageFor(candidate, remoteLanguage);
+      if (language === null) continue;
+      const path = resolveTranslationPath(candidate, state, language);
+      if (path !== null) paths.push(path);
+    }
+    return paths;
+  };
+  for (const config of translationFilesConfig) {
+    if (config.transform) continue;
+    const localFiles = allFilesByPattern[config.path.replace(/^\.\//, "")] ?? [];
+    const remoteToLocal = invertMap(config.mapLocalToRemote);
+    const languages = config.languages ?? allLanguages.map(
+      (language) => remoteToLocal[language.code] ?? language.code
+    );
+    for (const localLanguage of languages) {
+      const remoteLanguage = config.mapLocalToRemote?.[localLanguage] ?? localLanguage;
+      const ensureFile = (path) => {
+        let file = files.get(path);
+        if (!file) {
+          file = {
+            config,
+            language: remoteLanguage,
+            keys: /* @__PURE__ */ new Map(),
+            localOnly: [],
+            relocated: false,
+            serverWrote: false
+          };
+          files.set(path, file);
+        }
+        return file;
+      };
+      for (const localFile of localFiles.filter(
+        (file) => file.lang === remoteLanguage
+      )) {
+        if (countedPaths.has(localFile.path)) continue;
+        countedPaths.add(localFile.path);
+        const originalKeys = mergedKeysInLocalOrder[localFile.path]?.keys ?? [];
+        const output = ensureFile(localFile.path);
+        for (const key of originalKeys) {
+          const destinations = destinationsFor(key, remoteLanguage, {
+            config,
+            localLanguage
+          });
+          if (destinations.includes(localFile.path)) continue;
+          if (destinations.length > 0) {
+            output.relocated = true;
+            continue;
+          }
+          if (!key.server && !selectedKeys && !keepLocalOnly) {
+            output.localOnly.push(key);
+            continue;
+          }
+          const value = key.translations[remoteLanguage]?.local?.value;
+          if (value != null || config.pullWithEmptyValues) {
+            output.keys.set(key.key, {
               value: value ?? emptyValueString,
-              description: key.server?.description,
+              description: key.local?.description,
               meta: key.local?.meta ?? {}
             });
           }
         }
       }
-      const namespacesToProcess = fileConfig.namespace ? [
-        [
-          fileConfig.namespace,
-          mergedKeysByKeyByNamespace[fileConfig.namespace] ?? {}
-        ]
-      ] : fileConfig.path.includes("{{namespace}}") ? Object.entries(mergedKeysByKeyByNamespace) : [["", mergedKeysByKeyByNamespace[""] ?? {}]];
-      for (const [namespace, mergedKeysByKey] of namespacesToProcess) {
-        const pathWithNamespace = pathWithLang.replace(
-          "{{namespace}}",
-          namespace
+      for (const key of serverKeys) {
+        if (!key.server || !useServer(key)) continue;
+        const path = resolveTranslationPath(
+          config,
+          { key: key.key, ...key.server },
+          localLanguage
         );
-        if (pathWithLang.includes("{{source}}")) {
-          const groupedBySource = {};
-          for (const key of Object.values(mergedKeysByKey)) {
-            const source = key.server?.source ?? "";
-            if (!groupedBySource[source]) {
-              groupedBySource[source] = {};
-            }
-            groupedBySource[source][key.key] = key;
-          }
-          for (const [source, sourceKeys] of Object.entries(groupedBySource)) {
-            insertKeys(
-              pathWithNamespace.replace("{{source}}", source),
-              Object.values(sourceKeys),
-              namespace
-            );
-          }
-        } else {
-          insertKeys(
-            pathWithNamespace,
-            Object.values(mergedKeysByKey),
-            namespace
-          );
-        }
+        if (path === null) continue;
+        const translation = key.translations[remoteLanguage]?.server;
+        const value = !translation ? void 0 : onlyApproved && !translation.approved ? null : translation.currentValue;
+        if (value === void 0 && !config.pullWithEmptyValues) continue;
+        const output = ensureFile(path);
+        output.serverWrote = true;
+        output.keys.set(key.key, {
+          value: value ?? emptyValueString,
+          description: key.server.description,
+          meta: key.local?.meta ?? {}
+        });
       }
-    });
-  });
-  const filesToPull = {};
-  for (const [file, { keys, lang, fileFormat, usedConfig }] of Object.entries(
-    keysToPullByFile
-  )) {
-    const keysToUse = keys.map(
-      ({ key, value, description, meta }) => {
-        return [
-          key,
-          {
-            value,
-            description,
-            meta
-          }
-        ];
-      }
-    );
-    const res = generateTranslationFile(
-      sortKeys({ sortBy: usedConfig.sortBy, keys: keysToUse }),
-      fileFormat,
-      lang,
-      usedConfig
-    );
-    filesToPull[file] = res;
+    }
   }
-  return filesToPull;
-}
-function uniq(arr) {
-  return [...new Set(arr)];
+  const result = {};
+  const removed = /* @__PURE__ */ new Map();
+  for (const [path, file] of files) {
+    if (!file.serverWrote && !file.relocated && file.localOnly.length === 0)
+      continue;
+    for (const key of file.localOnly) {
+      const entry = removed.get(getComparisonKey(key)) ?? {
+        key: key.key,
+        namespace: key.local?.namespace ?? "",
+        paths: []
+      };
+      entry.paths.push(path);
+      removed.set(getComparisonKey(key), entry);
+    }
+    const placementPattern = file.config.path.includes("{{source}}") || file.config.path.includes("{{namespace}}");
+    if (file.keys.size === 0 && placementPattern) {
+      result[path] = null;
+      continue;
+    }
+    const format = file.config.format;
+    if (!format) throw new Error(`Could not determine file format for ${path}`);
+    const ordered = /* @__PURE__ */ new Map();
+    for (const key of mergedKeysInLocalOrder[path]?.keys ?? []) {
+      const value = file.keys.get(key.key);
+      if (value) ordered.set(key.key, value);
+    }
+    for (const [key, value] of file.keys) ordered.set(key, value);
+    result[path] = generateTranslationFile(
+      sortKeys({ sortBy: file.config.sortBy, keys: [...ordered] }),
+      format,
+      file.language,
+      file.config
+    );
+  }
+  assertNoPullPathCollisions(result);
+  return { files: result, removedKeys: [...removed.values()] };
 }
 
 function boldInfo(text) {
@@ -2280,6 +2764,17 @@ async function push(comparison, pushToServer, projectInfo, appHost, prompt, exit
     differentTranslationsLanguage
   } = comparison;
   const termWidth = process.stdout.columns ?? 80;
+  const keysToRemove = comparison.keysToRemove ?? [];
+  if (keysToRemove.length > 0 && !options?.quiet) {
+    console.info(`
+${keysToRemove.length} server-only keys will be archived:`);
+    for (const key of keysToRemove.slice(0, 10)) {
+      console.info(`    ${formatNamespacedKey(key)}`);
+    }
+    if (keysToRemove.length > 10) {
+      console.info(`    ... and ${keysToRemove.length - 10} more`);
+    }
+  }
   if (options?.filterSummary && !options.quiet) {
     const { pushed, withheld, patterns } = options.filterSummary;
     console.info(
@@ -2302,7 +2797,9 @@ async function push(comparison, pushToServer, projectInfo, appHost, prompt, exit
 ${Bold}${newKeys.length} new keys:${Reset}`);
     const { text, hiddenCount } = renderKeyCards(newKeys, termWidth);
     console.info(text);
-    const allResult = renderKeyCards(newKeys, termWidth, { limit: newKeys.length });
+    const allResult = renderKeyCards(newKeys, termWidth, {
+      limit: newKeys.length
+    });
     await showAllPrompt(hiddenCount, allResult.text, prompt);
     const answer2 = await prompt.confirm({ message: "Continue?" });
     if (!answer2) {
@@ -2316,17 +2813,27 @@ ${Bold}${newKeys.length} new keys:${Reset}`);
   const seen = /* @__PURE__ */ new Set();
   const translationKeys = Object.values(missingTranslationsOnServerPerLanguage).flat().filter((k) => {
     const comparisonKey = getComparisonKey(k);
-    if (newKeyNames.has(comparisonKey) || seen.has(comparisonKey)) return false;
+    if (newKeyNames.has(comparisonKey) || seen.has(comparisonKey))
+      return false;
     seen.add(comparisonKey);
     return true;
   });
   if (translationKeys.length > 0) {
-    const langCount = Object.keys(missingTranslationsOnServerPerLanguage).length;
-    greenInfo(`
-${Bold}${translationKeys.length} missing translations across ${langCount} languages:${Reset}`);
-    const { text, hiddenCount } = renderKeyCards(translationKeys, termWidth, { onlyChanges: true });
+    const langCount = Object.keys(
+      missingTranslationsOnServerPerLanguage
+    ).length;
+    greenInfo(
+      `
+${Bold}${translationKeys.length} missing translations across ${langCount} languages:${Reset}`
+    );
+    const { text, hiddenCount } = renderKeyCards(translationKeys, termWidth, {
+      onlyChanges: true
+    });
     console.info(text);
-    const allResult = renderKeyCards(translationKeys, termWidth, { limit: translationKeys.length, onlyChanges: true });
+    const allResult = renderKeyCards(translationKeys, termWidth, {
+      limit: translationKeys.length,
+      onlyChanges: true
+    });
     await showAllPrompt(hiddenCount, allResult.text, prompt);
     const answer3 = await prompt.confirm({ message: "Continue?" });
     if (!answer3) {
@@ -2363,7 +2870,9 @@ ${Bold}${translationKeys.length} missing translations across ${langCount} langua
       const local = key.translations[lang]?.local;
       const server = key.translations[lang]?.server;
       if (!local || !server) {
-        throw new Error(`Expected both local and server translation for key "${key.key}" lang "${lang}"`);
+        throw new Error(
+          `Expected both local and server translation for key "${key.key}" lang "${lang}"`
+        );
       }
       let answer = sticky;
       if (!answer) {
@@ -2429,11 +2938,31 @@ Different translations were found on server and local:`);
   if (!options?.quiet) {
     console.info(`  ${FgGreen}\u2713 Push complete${Reset}
 `);
-    console.info(`  ${Dim}Project:${Reset}   ${FgBlue}${appHost}/app/project/${projectInfo.id}${Reset}`);
-    console.info(`  ${Dim}Translate:${Reset} ${FgBlue}${appHost}/app/project/${projectInfo.id}/translate${Reset}
-`);
+    console.info(
+      `  ${Dim}Project:${Reset}   ${FgBlue}${appHost}/app/project/${projectInfo.id}${Reset}`
+    );
+    console.info(
+      `  ${Dim}Translate:${Reset} ${FgBlue}${appHost}/app/project/${projectInfo.id}/translate${Reset}
+`
+    );
   }
   return result;
+}
+
+async function applyPullPlan(files, writeFile, removeFile) {
+  assertNoPullPathCollisions(files);
+  const written = /* @__PURE__ */ new Set();
+  for (const [file, content] of Object.entries(files)) {
+    if (content !== null) {
+      await writeFile(file, content);
+      written.add(normalizePullPath(file));
+    }
+  }
+  for (const [file, content] of Object.entries(files)) {
+    if (content === null && !written.has(normalizePullPath(file))) {
+      await removeFile(file);
+    }
+  }
 }
 
 function filterRecord(record, selectedKeys) {
@@ -2490,7 +3019,10 @@ function filterComparisonBySelectedKeys(comparison, selectedKeys) {
       (lang) => languagesInSelection.has(lang)
     )
   );
-  const needPush = Object.keys(missingKeysOnServer).length > 0 || Object.keys(missingTranslationsOnServerPerLanguage).length > 0 || Object.keys(differentTranslationsLanguage).length > 0 || missingLanguagesOnServer.size > 0;
+  const keysToRemove = comparison.keysToRemove?.filter(
+    (key) => selectedKeys.has(getComparisonKey(key))
+  );
+  const needPush = (keysToRemove?.length ?? 0) > 0 || Object.keys(missingKeysOnServer).length > 0 || Object.keys(missingTranslationsOnServerPerLanguage).length > 0 || Object.keys(differentTranslationsLanguage).length > 0 || missingLanguagesOnServer.size > 0;
   const needPull = Object.keys(missingKeysOnLocal).length > 0 || Object.keys(missingTranslationsOnLocalPerLanguage).length > 0;
   return {
     needPull,
@@ -2502,8 +3034,82 @@ function filterComparisonBySelectedKeys(comparison, selectedKeys) {
     missingKeysOnLocal,
     missingTranslationsOnLocalPerLanguage,
     missingOrDifferentKeysOnServer,
-    keysToRemove: comparison.keysToRemove
+    keysToRemove
   };
+}
+
+async function confirmLocalOnlyRemoval(removedKeys, prompt) {
+  const preview = removedKeys.slice(0, 5);
+  const remaining = removedKeys.length - preview.length;
+  const keyList = preview.map((key) => formatNamespacedKey(key)).join(", ") + (remaining > 0 ? `, ... +${remaining} more` : "");
+  console.info(
+    `
+  ${FgYellow}${removedKeys.length} local key${removedKeys.length !== 1 ? "s" : ""} not on the server will be removed from local files:${Reset}`
+  );
+  console.info(`  ${Dim}${keyList}${Reset}
+`);
+  return prompt.confirm({
+    message: "Remove them from local files? (No keeps them in place)"
+  });
+}
+
+async function pullTransformFiles({
+  transformConfigs,
+  transforms,
+  mergedKeysByKeyByNamespace,
+  allLanguages,
+  onlyApproved,
+  selectedKeys,
+  fileAPI,
+  cwd
+}) {
+  const filesToPull = {};
+  for (const config of transformConfigs) {
+    const namespace = exists(config.namespace, "Transform must have namespace");
+    const transform = exists(
+      transforms.get(config.path),
+      `Transform not loaded for "${config.path}"`
+    );
+    const mergedKeysByKey = mergedKeysByKeyByNamespace[namespace] ?? {};
+    const localToRemote = config.mapLocalToRemote ?? {};
+    const remoteToLocal = invertMap(config.mapLocalToRemote);
+    const languagePairs = config.languages ? config.languages.map((local) => ({
+      local,
+      remote: localToRemote[local] ?? local
+    })) : allLanguages.map((l) => ({
+      local: remoteToLocal[l.code] ?? l.code,
+      remote: l.code
+    }));
+    const translations = {};
+    for (const { local, remote } of languagePairs) {
+      translations[local] = {};
+      for (const [key, universalKey] of Object.entries(mergedKeysByKey)) {
+        const translation = universalKey.translations[remote];
+        const isSelectedForPull = !selectedKeys || selectedKeys.has(getComparisonKey({ key, namespace }));
+        const hasServerKey = universalKey.server != null;
+        const serverValue = onlyApproved ? translation?.server?.approved ? translation?.server?.currentValue : null : translation?.server?.currentValue;
+        const value = isSelectedForPull && (!selectedKeys || hasServerKey) ? serverValue ?? translation?.local?.value : translation?.local?.value;
+        if (value != null) {
+          translations[local][key] = value;
+        }
+      }
+    }
+    const pathPattern = config.path.replace(/^\.\//, "");
+    const fullPath = cwd ? join(cwd, pathPattern) : pathPattern;
+    let currentContent = null;
+    try {
+      currentContent = await fileAPI.readFile(fullPath);
+    } catch {
+    }
+    try {
+      filesToPull[pathPattern] = transform.pull(translations, currentContent);
+    } catch (err) {
+      throw new Error(
+        `Transform pull failed for "${config.path}": ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+  return filesToPull;
 }
 
 const MATCH_OPTS = { nocomment: true, dot: true };
@@ -2579,65 +3185,6 @@ function resolveSelectedKeys(requestedKeys, mergedKeysByKeyByNamespace, requeste
   return selected;
 }
 
-async function pullTransformFiles({
-  transformConfigs,
-  transforms,
-  mergedKeysByKeyByNamespace,
-  allLanguages,
-  onlyApproved,
-  selectedKeys,
-  fileAPI,
-  cwd
-}) {
-  const filesToPull = {};
-  for (const config of transformConfigs) {
-    const namespace = exists(config.namespace, "Transform must have namespace");
-    const transform = exists(
-      transforms.get(config.path),
-      `Transform not loaded for "${config.path}"`
-    );
-    const mergedKeysByKey = mergedKeysByKeyByNamespace[namespace] ?? {};
-    const localToRemote = config.mapLocalToRemote ?? {};
-    const remoteToLocal = invertMap(config.mapLocalToRemote);
-    const languagePairs = config.languages ? config.languages.map((local) => ({
-      local,
-      remote: localToRemote[local] ?? local
-    })) : allLanguages.map((l) => ({
-      local: remoteToLocal[l.code] ?? l.code,
-      remote: l.code
-    }));
-    const translations = {};
-    for (const { local, remote } of languagePairs) {
-      translations[local] = {};
-      for (const [key, universalKey] of Object.entries(mergedKeysByKey)) {
-        const translation = universalKey.translations[remote];
-        const isSelectedForPull = !selectedKeys || selectedKeys.has(getComparisonKey({ key, namespace }));
-        const hasServerKey = universalKey.server != null;
-        const serverValue = onlyApproved ? translation?.server?.approved ? translation?.server?.currentValue : null : translation?.server?.currentValue;
-        const value = isSelectedForPull && (!selectedKeys || hasServerKey) ? serverValue ?? translation?.local?.value : translation?.local?.value;
-        if (value != null) {
-          translations[local][key] = value;
-        }
-      }
-    }
-    const pathPattern = config.path.replace(/^\.\//, "");
-    const fullPath = cwd ? join(cwd, pathPattern) : pathPattern;
-    let currentContent = null;
-    try {
-      currentContent = await fileAPI.readFile(fullPath);
-    } catch {
-    }
-    try {
-      filesToPull[pathPattern] = transform.pull(translations, currentContent);
-    } catch (err) {
-      throw new Error(
-        `Transform pull failed for "${config.path}": ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-  }
-  return filesToPull;
-}
-
 async function runCli({
   cliInput,
   allFilesByPattern,
@@ -2645,6 +3192,7 @@ async function runCli({
   allServerKeys,
   getFilePatternOrPath,
   writeFile,
+  removeFile,
   pushToServer,
   appHost,
   translationFilesConfig,
@@ -2685,6 +3233,7 @@ async function runCli({
       languagesOnLocal.add(lang);
     }
   }
+  let pullResult;
   async function pull(pullOptions) {
     let selectedKeys2 = pullOptions?.selectedKeys;
     if (!selectedKeys2 && (pullOptions?.keys && pullOptions.keys.length > 0 || pullOptions?.namespaces && pullOptions.namespaces.length > 0)) {
@@ -2703,18 +3252,28 @@ async function runCli({
       }
       selectedKeys2 = selectedKeys2 ? new Set([...selectedKeys2].filter((k) => localKeys.has(k))) : localKeys;
     }
-    const filesToPull = await prepareFilesToPull(
+    const preparePull = (keepLocalOnly) => prepareFilesToPull({
       mergedKeysInLocalOrder,
       mergedKeysByKeyByNamespace,
       translationFilesConfig,
-      projectInfo.languages,
-      pullOptions?.onlyApproved ?? false,
+      allLanguages: projectInfo.languages,
+      onlyApproved: pullOptions?.onlyApproved ?? false,
       emptyValueString,
-      selectedKeys2
-    );
-    for (const [file, content] of Object.entries(filesToPull)) {
-      await writeFile(file, content);
+      selectedKeys: selectedKeys2,
+      allFilesByPattern,
+      keepLocalOnly
+    });
+    let plan = await preparePull(pullOptions?.keepLocalOnly ?? false);
+    if (plan.removedKeys.length > 0 && !await confirmLocalOnlyRemoval(plan.removedKeys, prompt)) {
+      plan = await preparePull(true);
     }
+    await applyPullPlan(plan.files, writeFile, removeFile);
+    if (plan.removedKeys.length > 0) {
+      greenInfo(
+        `\u2713 Removed ${plan.removedKeys.length} local key${plan.removedKeys.length !== 1 ? "s" : ""} not on the server`
+      );
+    }
+    pullResult = { removedKeys: plan.removedKeys };
     if (hasTransforms) {
       const transformFiles = await pullTransformFiles({
         transformConfigs,
@@ -2744,29 +3303,35 @@ async function runCli({
     mergedKeysByKeyByNamespace,
     emptyValueString
   );
-  if (cliInput.action === "push" && cliInput.keysToRemove && cliInput.keysToRemove.length > 0) {
-    comparison.keysToRemove = cliInput.keysToRemove;
+  if (cliInput.action === "push") {
+    if (cliInput.keysToRemove && cliInput.keysToRemove.length > 0) {
+      comparison.keysToRemove = cliInput.keysToRemove;
+    } else if (cliInput.prune) {
+      comparison.keysToRemove = Object.values(
+        comparison.missingKeysOnLocal
+      ).map((key) => ({
+        key: key.key,
+        namespace: key.server?.namespace ?? ""
+      }));
+    }
+    if (comparison.keysToRemove?.length) comparison.needPush = true;
   }
   const filterKeys = cliInput.action === "push" ? cliInput.keys : cliInput.action === "pull" ? cliInput.options.keys : cliInput.action === "status" ? cliInput.keys : void 0;
   const filterNamespaces = cliInput.action === "push" ? cliInput.namespaces : cliInput.action === "pull" ? cliInput.options.namespaces : cliInput.action === "status" ? cliInput.namespaces : void 0;
   const hasSelectionFilter = (filterKeys?.length ?? 0) > 0 || (filterNamespaces?.length ?? 0) > 0;
-  let selectedKeys;
+  let selectedKeys = cliInput.action === "status" ? cliInput.selectedKeys : cliInput.action === "pull" ? cliInput.options.selectedKeys : void 0;
   let pushFilterSummary;
   let scopedComparison = comparison;
-  if (hasSelectionFilter) {
-    selectedKeys = resolveSelectedKeys(
+  if (hasSelectionFilter || selectedKeys) {
+    selectedKeys ?? (selectedKeys = resolveSelectedKeys(
       filterKeys ?? [],
       mergedKeysByKeyByNamespace,
       filterNamespaces ?? []
-    );
-    const keysBefore = Object.keys(
-      comparison.missingOrDifferentKeysOnServer
-    ).length;
+    ));
+    const keysBefore = Object.keys(comparison.missingOrDifferentKeysOnServer).length + (comparison.keysToRemove?.length ?? 0);
     scopedComparison = filterComparisonBySelectedKeys(comparison, selectedKeys);
     if (cliInput.action === "push") {
-      const pushed = Object.keys(
-        scopedComparison.missingOrDifferentKeysOnServer
-      ).length;
+      const pushed = Object.keys(scopedComparison.missingOrDifferentKeysOnServer).length + (scopedComparison.keysToRemove?.length ?? 0);
       pushFilterSummary = {
         pushed,
         withheld: keysBefore - pushed,
@@ -2776,13 +3341,18 @@ async function runCli({
       };
     }
   }
+  if (cliInput.action === "push" && scopedComparison.keysToRemove?.length && !cliInput.allowEmptyPrune && !Object.values(allFilesByPattern).some((files) => files.length > 0) && !hasTransforms) {
+    throw new Error(
+      "No configured local translation files were found. Refusing to archive server keys. Check your file paths or use --allow-empty-prune to intentionally prune without local files."
+    );
+  }
   const statusData = computeStatus(
     scopedComparison,
     languagesOnServer,
     languagesOnLocal
   );
   let pushResult;
-  if (cliInput.action === "push") {
+  if (cliInput.action === "push" && !cliInput.dryRun) {
     pushResult = await push(
       scopedComparison,
       pushToServer,
@@ -2804,118 +3374,22 @@ async function runCli({
     comparison: scopedComparison,
     status: statusData,
     pushResult,
+    pullResult,
     pushFilter: pushFilterSummary,
     mergedKeysByKeyByNamespace
   };
 }
 
-var __defProp$1 = Object.defineProperty;
-var __defNormalProp$1 = (obj, key, value) => key in obj ? __defProp$1(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
-var __publicField$1 = (obj, key, value) => __defNormalProp$1(obj, typeof key !== "symbol" ? key + "" : key, value);
-class CliRequestError extends Error {
-  constructor(input) {
-    super(input.message, { cause: input.cause });
-    __publicField$1(this, "code");
-    __publicField$1(this, "httpStatus");
-    __publicField$1(this, "details");
-    this.name = "CliRequestError";
-    this.code = input.code;
-    this.httpStatus = input.httpStatus;
-    this.details = input.details;
-  }
-}
-
-function getRetryAfterMs(value, now = Date.now()) {
-  if (!value) return void 0;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1e3;
-  const date = Date.parse(value);
-  if (!Number.isFinite(date) || date <= now) return void 0;
-  return date - now;
-}
-
-const errorBodySchema = z.object({
-  error: z.union([
-    z.string(),
-    z.object({
-      code: z.string().optional(),
-      message: z.string(),
-      details: z.unknown().optional()
-    })
-  ])
-});
-async function readCliResponseError(response) {
-  let body;
-  try {
-    body = await response.json();
-  } catch {
-    body = void 0;
-  }
-  const parsed = errorBodySchema.safeParse(body);
-  if (parsed.success) {
-    const error = parsed.data.error;
-    return new CliRequestError({
-      message: typeof error === "string" ? error : error.message,
-      code: typeof error === "string" ? void 0 : error.code,
-      httpStatus: response.status,
-      details: typeof error === "string" ? void 0 : error.details
-    });
-  }
-  return new CliRequestError({
-    message: `Request failed. Status: ${response.statusText || response.status}`,
-    code: "request_failed",
-    httpStatus: response.status
-  });
-}
-
-const retryDelays = [250, 750];
-const retryableStatuses = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504]);
-async function requestCliJson(url, init = {}) {
-  const method = (init.method ?? "GET").toUpperCase();
-  const canRetry = method === "GET" || method === "HEAD";
-  for (let attempt = 0; attempt < 3; attempt++) {
-    let response;
-    try {
-      response = await fetch(url, init);
-    } catch (cause) {
-      if (!canRetry || attempt === 2) {
-        throw new CliRequestError({
-          message: "Request failed due to a network error",
-          code: "network_error",
-          cause
-        });
-      }
-      await sleep$1(retryDelays[attempt] ?? 750);
-      continue;
-    }
-    if (canRetry && attempt < 2 && retryableStatuses.has(response.status)) {
-      await response.body?.cancel().catch(() => void 0);
-      const baseDelay = retryDelays[attempt] ?? 750;
-      const retryAfter = response.status === 429 || response.status === 503 ? getRetryAfterMs(response.headers.get("Retry-After")) : void 0;
-      const delay = Math.max(baseDelay, Math.min(retryAfter ?? 0, 5e3));
-      await sleep$1(delay);
-      continue;
-    }
-    if (!response.ok) throw await readCliResponseError(response);
-    try {
-      return await response.json();
-    } catch (cause) {
-      throw new CliRequestError({
-        message: "Server returned invalid JSON",
-        code: "invalid_response",
-        httpStatus: response.status,
-        cause
-      });
-    }
-  }
-  throw new CliRequestError({
-    message: "Request failed due to a network error",
-    code: "network_error"
-  });
-}
-function sleep$1(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const agentTranslationGuidance = `Agents must prepare descriptions before translation.
+1. Push new keys and source changes first: babli push --json --no-interaction.
+2. Export current context: babli key export --language <source-code> --output keys.json.
+3. Inspect code usages for the keys you will translate. Keep useful descriptions;
+   draft missing or outdated descriptions with meaning and placeholder context.
+4. Check and save drafts: babli key update --file descriptions.json --dry-run,
+   then babli key update --file descriptions.json. Resolve conflicts first.
+5. Estimate, translate, and pull only keys with prepared descriptions.
+Record unclear keys as unresolved; leave them out of translation until clarified.
+Use sync-and-translate only after descriptions cover its selected keys and source changes.`;
 
 async function fetchKeyInLoop(host, requestCode) {
   const res = await requestCliJson(
@@ -3065,11 +3539,13 @@ function computeDashboard(status, questionsCount, projectName, options) {
   const isInSync = badges.length === 0;
   const menuItems = [];
   if (!isInSync) {
-    if (status.needPush) {
+    if (status.needPush || status.issues.serverOnlyKeys.length > 0) {
       menuItems.push({
         value: "sync-and-translate",
-        label: `Sync & Translate  (push ${pushCount} new, translate, pull results)`
+        label: status.issues.serverOnlyKeys.length > 0 ? `Sync & Translate  (review ${plural(status.issues.serverOnlyKeys.length, "server-only key")}, push, translate, pull)` : `Sync & Translate  (push ${pushCount} new, translate, pull results)`
       });
+    }
+    if (status.needPush) {
       menuItems.push({ value: "push", label: "Push" });
     }
     if (status.needPull) {
@@ -3100,11 +3576,11 @@ function computeTranslationWork(params) {
     namespaces
   } = params;
   const languageFilter = languages ? new Set(languages) : void 0;
-  const selectedKeys = keys && keys.length > 0 || namespaces && namespaces.length > 0 ? resolveSelectedKeys(
+  const selectedKeys = params.selectedKeys ?? (keys && keys.length > 0 || namespaces && namespaces.length > 0 ? resolveSelectedKeys(
     keys ?? [],
     mergedKeysByKeyByNamespace,
     namespaces ?? []
-  ) : void 0;
+  ) : void 0);
   const result = [];
   for (const keysInNamespace of Object.values(mergedKeysByKeyByNamespace)) {
     for (const key of Object.values(keysInNamespace)) {
@@ -3201,6 +3677,7 @@ function computeTranslationCoverage(input) {
 }
 
 async function writeFile(file, content) {
+  await fs__default.mkdir(path$1.dirname(file), { recursive: true });
   await fs__default.writeFile(file, content, "utf-8");
 }
 
@@ -3260,27 +3737,29 @@ async function fetchJobStatus(host, projectId, accessToken, jobId) {
   });
   return { ...result, failures: result.failures ?? [] };
 }
-async function fetchQuestions(host, projectId, accessToken) {
+async function fetchQuestions(host, projectId, accessToken, scope) {
   const json = await requestCliJson(
-    `${host}/api/cli/${projectId}/questions`,
+    `${host}/api/cli/${projectId}/questions${scope ? `?scope=${encodeURIComponent(JSON.stringify(scope))}` : ""}`,
     {
       headers: { Authorization: `Bearer ${accessToken}` }
     }
   );
+  if (scope && json.scopeVersion !== 1)
+    throw new CliRequestError({
+      code: "unsupported_question_scope",
+      message: "This server does not support scoped question inspection. Update the server before trusting job-scoped follow-up."
+    });
   return json.questions;
 }
 async function submitAnswers(host, projectId, accessToken, answers) {
-  return requestCliJson(
-    `${host}/api/cli/${projectId}/answers`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ answers })
-    }
-  );
+  return requestCliJson(`${host}/api/cli/${projectId}/answers`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ answers })
+  });
 }
 async function fetchPendingReviews(host, projectId, accessToken) {
   const json = await requestCliJson(
@@ -3334,6 +3813,7 @@ async function pingServer(host, cliVersion) {
       `Your CLI version is different from the server version, please update. Your version is ${cliVersion}, but the server is ${json.cliVersion}.`
     );
   }
+  return json;
 }
 async function listCliKeys(host, projectId, accessToken, options) {
   const searchParams = new URLSearchParams();
@@ -3544,16 +4024,20 @@ async function initProject(host, accessToken) {
     console.info(`
 Next steps:`);
     console.info(`1. Run 'babli push' to upload your existing translations`);
-    console.info(`2. Translate at ${host}/app/project/${project.id}/translate`);
-    console.info(`3. Run 'babli pull' to download completed translations`);
+    console.info(`2. Prepare and save key descriptions from code usages`);
+    console.info(`3. Translate at ${host}/app/project/${project.id}/translate`);
+    console.info(`4. Run 'babli pull' to download completed translations`);
   } else {
     console.info(`
 Next steps:`);
     console.info(`1. Add translation files to the locales/ directory`);
     console.info(`2. Run 'babli push' to upload your translations`);
-    console.info(`3. Translate at ${host}/app/project/${project.id}/translate`);
-    console.info(`4. Run 'babli pull' to download completed translations`);
+    console.info(`3. Prepare and save key descriptions from code usages`);
+    console.info(`4. Translate at ${host}/app/project/${project.id}/translate`);
+    console.info(`5. Run 'babli pull' to download completed translations`);
   }
+  console.info(`
+${agentTranslationGuidance}`);
 }
 
 async function pollTranslationJob(host, projectId, accessToken, jobId, timeoutSeconds, flags) {
@@ -3597,6 +4081,109 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function printTranslationFollowUp(followUp) {
+  console.info(
+    `Question follow-up: ${followUp.questions_status}; ${followUp.questions.length} unanswered. Linguistic review: not requested.`
+  );
+  for (const question of followUp.questions) {
+    console.info(
+      `[${question.languageCode}] ${question.namespace ? `${question.namespace}:` : ""}${question.keyName}: ${question.question}${question.relevance === "earlier" ? " (earlier run; check relevance)" : ""}`
+    );
+  }
+  for (const action of followUp.next_actions) console.info(action.reason);
+}
+
+function buildTranslationFollowUp(questions, scope = {}) {
+  const selections = scope.jobId ? [["--job", scope.jobId]] : scope.pairs ? scope.pairs.map((pair) => [
+    "--key-id",
+    pair.keyId,
+    "--languages",
+    pair.languages.join(",")
+  ]) : scope.keyIds?.length === 0 ? [] : [
+    [
+      ...(scope.keyIds ?? []).flatMap((id) => ["--key-id", id]),
+      ...(scope.keys ?? []).flatMap((key) => ["--key", key]),
+      ...(scope.namespaces ?? []).flatMap((namespace) => [
+        "--namespace",
+        namespace
+      ]),
+      ...scope.languages?.length ? ["--languages", scope.languages.join(",")] : []
+    ]
+  ];
+  return {
+    questions_status: "checked",
+    questions,
+    review_status: "not_requested",
+    next_actions: [
+      ...questions.length ? [
+        {
+          command: [
+            "babli",
+            "questions",
+            "--answers-file",
+            "answers.json",
+            "--json",
+            "--no-interaction"
+          ],
+          reason: "Inspect each question against repository evidence. Save supported answers using the listed identifiers; ask the user about unknown product facts. Earlier questions may no longer apply. Saving answers does not verify wording or authorize paid work.",
+          paid: false
+        }
+      ] : [],
+      ...selections.map((args) => ({
+        command: ["babli", "quality", "check", ...args, "--estimate", "--json"],
+        reason: "The complete agent workflow includes linguistic review. Estimate the selected scope, then submit only within the remaining authorized --max-credits budget. Evaluate each finding against evidence; report unresolved judgments instead of applying every suggestion.",
+        paid: false
+      }))
+    ]
+  };
+}
+
+async function readTranslationFollowUp(context, scope, pending = false) {
+  if (pending)
+    return {
+      questions_status: "pending",
+      questions: [],
+      review_status: "not_requested",
+      next_actions: scope.jobId ? [
+        {
+          command: ["babli", "job", scope.jobId, "--wait", "--json"],
+          reason: "Wait for the existing job before evaluating its final questions. Do not resubmit translation.",
+          paid: false
+        }
+      ] : []
+    };
+  try {
+    return buildTranslationFollowUp(
+      await fetchQuestions(
+        context.host,
+        context.projectId,
+        context.accessToken,
+        scope
+      ),
+      scope
+    );
+  } catch (error) {
+    return {
+      questions_status: "unavailable",
+      questions: [],
+      review_status: "not_requested",
+      error: error instanceof Error ? error.message : "Could not fetch questions",
+      next_actions: [
+        {
+          command: [
+            "babli",
+            "questions",
+            ...scope.jobId ? ["--job", scope.jobId] : [],
+            "--json"
+          ],
+          reason: "Question discovery failed. Retry inspection before declaring the workflow finished.",
+          paid: false
+        }
+      ]
+    };
+  }
+}
+
 function reportFormatWarnings(count) {
   if (count) {
     console.info(
@@ -3619,12 +4206,18 @@ async function jobCommand(ctx, options) {
     ctx.accessToken,
     options.jobId
   );
+  const followUp = await readTranslationFollowUp(
+    ctx,
+    { jobId: options.jobId },
+    status.status !== "complete" && status.status !== "failed"
+  );
   if (ctx.flags.json) {
     console.info(
       JSON.stringify(
         {
           version: 1,
           command: "job",
+          follow_up: followUp,
           status: status.status,
           job_id: options.jobId,
           counts: {
@@ -3654,6 +4247,7 @@ async function jobCommand(ctx, options) {
     );
     return status.status === "failed" || status.status === "timeout" ? 2 : 0;
   }
+  printTranslationFollowUp(followUp);
   if (status.status === "complete") {
     console.info(
       `${FgGreen}Job complete: ${status.finished}/${status.total} processes finished.${Reset}`
@@ -3897,6 +4491,7 @@ const keyContextSchema = z.object({
   keyId: z.string().uuid(),
   key: z.string(),
   namespace: z.string(),
+  source: z.string(),
   description: z.string().nullable(),
   sourceText: z.string().nullable(),
   sourceVersionId: z.string().uuid().nullable()
@@ -3983,6 +4578,288 @@ function invalidResponse(message) {
   return new CliRequestError({ message, code: "invalid_response" });
 }
 
+function count(amount, noun) {
+  return amount > 0 ? `${amount} ${noun}${amount === 1 ? "" : "s"}` : null;
+}
+function assertNoUnpushedChanges(status) {
+  if (!status.needPush) return;
+  const missingTranslations = Object.values(
+    status.toPush.missingTranslations
+  ).reduce((sum, keys) => sum + keys.length, 0);
+  const parts = [
+    count(status.toPush.newKeys.length, "new key"),
+    count(status.toPush.changedValues.length, "changed translation"),
+    count(missingTranslations, "missing translation"),
+    count(status.languages.localOnly.length, "local-only language")
+  ].filter((part) => part !== null);
+  const summary = parts.length > 0 ? ` (${parts.join(", ")})` : "";
+  throw new CliRequestError({
+    code: "unpushed_changes",
+    message: `Local files have changes that are not pushed${summary}. Run "babli push" first so the pull after renaming does not discard them, or pass --allow-unpushed.`
+  });
+}
+
+function exitAfterFlush(code) {
+  return new Promise(() => {
+    process.stdout.write("", () => process.exit(code));
+  });
+}
+
+const stateSchema = z.object({
+  key: z.string(),
+  namespace: z.string(),
+  source: z.string()
+}).strict();
+const itemSchema = z.object({
+  keyId: z.string().uuid(),
+  expectedKey: z.string(),
+  expectedNamespace: z.string(),
+  expectedSource: z.string(),
+  to: z.string().refine((value) => value.trim().length > 0, "Key must not be blank"),
+  toNamespace: z.string().optional(),
+  toSource: z.string().optional()
+}).strict();
+const manifestSchema = z.object({
+  version: z.literal(1),
+  projectId: z.string().uuid(),
+  items: z.array(itemSchema).min(1).max(1e3)
+}).strict();
+function validateIds(input, context) {
+  const seen = /* @__PURE__ */ new Set();
+  for (const [index, item] of input.items.entries()) {
+    const id = item.keyId.toLowerCase();
+    if (seen.has(id)) context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["items", index, "keyId"],
+      message: "Duplicate key ID"
+    });
+    seen.add(id);
+  }
+}
+const keyRenameFileSchema = manifestSchema.superRefine(validateIds);
+manifestSchema.extend({
+  dryRun: z.boolean()
+}).strict().superRefine(validateIds);
+const keyRenameResultSchema = z.object({
+  items: z.array(z.object({
+    index: z.number().int().nonnegative(),
+    key_id: z.string().uuid(),
+    status: z.enum(["renamed", "would_rename", "unchanged"]),
+    from: stateSchema,
+    to: stateSchema
+  }).strict()).max(1e3)
+}).strict();
+
+function keyRenameStates(item) {
+  return {
+    from: { key: item.expectedKey, namespace: item.expectedNamespace, source: item.expectedSource },
+    to: { key: item.to, namespace: item.toNamespace ?? item.expectedNamespace, source: item.toSource ?? item.expectedSource }
+  };
+}
+
+function keyRenamePaths(file, configs, languages) {
+  return file.items.map((item, index) => {
+    const states = keyRenameStates(item);
+    const result = { index, key_id: item.keyId.toLowerCase(), from: [], to: [] };
+    for (const side of ["from", "to"]) {
+      for (const config of configs) {
+        if (config.transform) continue;
+        const localLanguages = config.languages ?? languages.map((language) => Object.entries(config.mapLocalToRemote ?? {}).find(([, remote]) => remote === language)?.[0] ?? language);
+        for (const language of localLanguages) {
+          try {
+            const path = resolveTranslationPath(config, states[side], language);
+            if (path !== null && !result[side].includes(path)) result[side].push(path);
+          } catch (cause) {
+            if (side === "from") continue;
+            throw new CliRequestError({ code: "invalid_destination_path", message: cause instanceof Error ? cause.message : String(cause), details: { index, key_id: item.keyId, side }, cause });
+          }
+        }
+      }
+    }
+    return result;
+  });
+}
+
+async function validateKeyRenamePull(file, configs, project, serverKeys) {
+  const targets = new Map(
+    file.items.map((item) => [
+      item.keyId.toLowerCase(),
+      keyRenameStates(item).to
+    ])
+  );
+  const mergedKeysByKeyByNamespace = {};
+  gatherServerKeys({
+    allServerKeys: serverKeys.map((key) => ({
+      ...key,
+      ...targets.get(key.id.toLowerCase())
+    })),
+    mergedKeysByKeyByNamespace,
+    getLangCode: makeGetLangCode(project.languages),
+    getFilePatternOrPath: () => void 0,
+    mergedKeysInLocalOrder: {}
+  });
+  try {
+    await prepareFilesToPull({
+      mergedKeysByKeyByNamespace,
+      mergedKeysInLocalOrder: {},
+      translationFilesConfig: configs,
+      allLanguages: project.languages,
+      onlyApproved: false,
+      emptyValueString: null,
+      selectedKeys: void 0,
+      allFilesByPattern: {},
+      keepLocalOnly: false
+    });
+  } catch (cause) {
+    throw new CliRequestError({
+      code: "invalid_rename_output",
+      message: `The rename cannot be pulled with this configuration: ${cause instanceof Error ? cause.message : String(cause)}`,
+      cause
+    });
+  }
+}
+
+async function keyRenameFileCommand(ctx, options, configs) {
+  let content;
+  if (options.file === "-") {
+    if (stdin.isTTY)
+      throw new CliRequestError({
+        code: "invalid_rename_file",
+        message: "Pipe a JSON manifest to --file -."
+      });
+    stdin.setEncoding("utf8");
+    content = "";
+    for await (const chunk of stdin) content += String(chunk);
+  } else {
+    content = await fs$1.readFile(options.file, "utf8");
+  }
+  let json;
+  try {
+    json = JSON.parse(content);
+  } catch (cause) {
+    throw new CliRequestError({
+      code: "invalid_rename_file",
+      message: "The rename manifest is not valid JSON.",
+      cause
+    });
+  }
+  const parsed = keyRenameFileSchema.safeParse(json);
+  if (!parsed.success)
+    throw new CliRequestError({
+      code: "invalid_rename_file",
+      message: "Invalid rename manifest.",
+      details: parsed.error.issues
+    });
+  const file = parsed.data;
+  if (file.projectId.toLowerCase() !== ctx.projectId.toLowerCase())
+    throw new CliRequestError({
+      code: "project_mismatch",
+      message: "The rename manifest does not match the configured project."
+    });
+  const project = await fetchProjectInfo(
+    ctx.host,
+    ctx.projectId,
+    ctx.accessToken
+  );
+  const fileChanges = keyRenamePaths(
+    file,
+    configs,
+    project.languages.map((language) => language.code)
+  );
+  const serverKeys = await fetchServerKeys(
+    ctx.host,
+    ctx.projectId,
+    ctx.accessToken
+  );
+  await validateKeyRenamePull(file, configs, project, serverKeys);
+  let response;
+  try {
+    response = await requestCliJson(
+      `${ctx.host}/api/cli/${ctx.projectId}/keys/renames`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${ctx.accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ ...file, dryRun: options.dryRun })
+      }
+    );
+  } catch (cause) {
+    if (!options.dryRun && (!(cause instanceof CliRequestError) || cause.httpStatus === void 0 || cause.httpStatus >= 500 || cause.httpStatus === 408)) {
+      throw new CliRequestError({
+        code: "outcome_unknown",
+        message: "The rename outcome is unconfirmed. Rerun the same manifest safely to confirm it.",
+        cause
+      });
+    }
+    throw cause;
+  }
+  const result = keyRenameResultSchema.safeParse(response);
+  const invalidResult = () => new CliRequestError({
+    code: options.dryRun ? "invalid_response" : "outcome_unknown",
+    message: "Invalid rename response; rerun the same manifest to confirm the outcome."
+  });
+  if (!result.success || result.data.items.length !== file.items.length)
+    throw invalidResult();
+  const counts = {
+    total: file.items.length,
+    renamed: 0,
+    would_rename: 0,
+    unchanged: 0
+  };
+  for (const [index, item] of result.data.items.entries()) {
+    const expected = file.items[index];
+    if (!expected) throw invalidResult();
+    const { to } = keyRenameStates(expected);
+    if (item.index !== index || item.key_id.toLowerCase() !== expected.keyId.toLowerCase() || item.to.key !== to.key || item.to.namespace !== to.namespace || item.to.source !== to.source || (options.dryRun ? item.status === "renamed" : item.status === "would_rename"))
+      throw invalidResult();
+    counts[item.status]++;
+  }
+  const nextActions = options.dryRun ? [] : [
+    {
+      command: ["babli", "pull", "--json", "--no-interaction"],
+      reason: "Pull writes the renamed keys and placements to local files and removes the old names. Do not push before pulling.",
+      paid: false
+    }
+  ];
+  if (ctx.flags.json)
+    printJson({
+      version: 1,
+      command: "key_rename",
+      status: options.dryRun ? "dry_run" : "renamed",
+      project_id: ctx.projectId,
+      dry_run: options.dryRun,
+      counts,
+      items: result.data.items,
+      file_changes: fileChanges,
+      next_actions: nextActions
+    });
+  else {
+    console.info(
+      `${counts.renamed} renamed, ${counts.would_rename} would rename, ${counts.unchanged} unchanged.`
+    );
+    if (!options.dryRun)
+      console.info(
+        'Run "babli pull" to update local files. Do not push before pulling.'
+      );
+  }
+}
+
+function validateKeyRenameOptions(options) {
+  if (options.file !== void 0) {
+    if (!options.file.trim()) throw new Error("Provide a nonblank --file path.");
+    if ([options.key, options.keyId, options.namespace, options.to].some((value) => value !== void 0)) {
+      throw new Error("Use --file separately from single-key lookup and destination flags.");
+    }
+    return;
+  }
+  if (options.dryRun) throw new Error("--dry-run requires --file.");
+  if (options.allowUnpushed) throw new Error("--allow-unpushed requires --file.");
+  if (!options.to) throw new Error("Provide --to or --file.");
+  if (options.keyId !== void 0 === (options.key !== void 0)) throw new Error("Provide exactly one of --key-id or --key.");
+}
+
 async function loadTransform(transformPath, cwd) {
   const absolutePath = resolve(cwd, transformPath);
   let loaded;
@@ -4029,22 +4906,6 @@ function makePushToServer(host, accessToken) {
       }
     );
   };
-}
-
-function parseCreditUnits(value) {
-  const match = /^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/.exec(value);
-  if (!match) {
-    throw new Error(
-      `Invalid credit limit: "${value}". Use a non-negative amount with at most two decimals.`
-    );
-  }
-  const whole = Number(match[1]);
-  const fraction = Number((match[2] ?? "").padEnd(2, "0"));
-  const units = whole * 100 + fraction;
-  if (!Number.isSafeInteger(units)) {
-    throw new Error(`Credit limit is too large: "${value}".`);
-  }
-  return units;
 }
 
 async function projectListCommand(ctx, options) {
@@ -4203,6 +5064,40 @@ ${Dim}Suggestions saved on server. Apply them in the Babli dashboard.${Reset}`
   }
 }
 
+function buildAnswerNextActions(pairs) {
+  return pairs.map((pair) => ({
+    command: pair.approved ? ["babli", "key", "get", "--key-id", pair.keyId, "--json"] : [
+      "babli",
+      "translate",
+      "--key-id",
+      pair.keyId,
+      "--languages",
+      pair.languageCode,
+      "--strategy",
+      "not-approved",
+      "--estimate",
+      "--json"
+    ],
+    reason: pair.approved ? `Inspect the approved ${pair.languageCode} wording against the saved answer. Do not silently unapprove it or claim the answer verified it.` : "Assess whether existing wording needs changing. This estimate spends nothing; explicit paid regeneration must retain this exact pair and use the remaining authorized --max-credits budget. Missing-only sync will skip existing text.",
+    paid: false
+  }));
+}
+
+function answeredPairsScope(pairs) {
+  const languagesByKey = /* @__PURE__ */ new Map();
+  for (const pair of pairs) {
+    const languages = languagesByKey.get(pair.keyId) ?? [];
+    if (!languages.includes(pair.languageCode)) languages.push(pair.languageCode);
+    languagesByKey.set(pair.keyId, languages);
+  }
+  return {
+    pairs: [...languagesByKey].map(([keyId, languages]) => ({
+      keyId,
+      languages
+    }))
+  };
+}
+
 const MAX_TRANSLATION_ANSWERS = 500;
 const translationAnswerInput = z.object({
   keyId: z.string().uuid(),
@@ -4235,8 +5130,18 @@ async function questionsCommand(ctx) {
   const fileAnswers = ctx.answersFile === void 0 ? void 0 : translationAnswersInput.parse(
     JSON.parse(await readFile(ctx.answersFile, "utf8"))
   ).answers;
-  const questions = ctx.questions ?? await fetchQuestions(ctx.host, ctx.projectId, ctx.accessToken);
+  const questions = ctx.questions ?? await fetchQuestions(ctx.host, ctx.projectId, ctx.accessToken, ctx.scope);
   const answers = fileAnswers ?? [];
+  if (ctx.scope && fileAnswers?.some(
+    (answer) => !questions.some(
+      (question) => question.keyId === answer.keyId && question.languageId === answer.languageId && question.question === answer.questionText
+    )
+  )) {
+    throw new Error(
+      "Answer file includes questions outside the selected scope. Fetch the scoped questions again."
+    );
+  }
+  const affectedPairs = [];
   let answered = 0;
   async function saveAnswers() {
     const result = await submitAnswers(
@@ -4249,11 +5154,12 @@ async function questionsCommand(ctx) {
       throw new Error(
         `Server saved ${result.answered} of ${answers.length} answers. Fetch questions again before retrying.`
       );
+    affectedPairs.push(...result.affectedPairs ?? []);
     answered += result.answered;
     answers.length = 0;
     if (!ctx.flags.json) {
       console.info(
-        `${FgGreen}Saved ${answered} answer(s). Retranslate the affected keys to apply them.${Reset}`
+        `${FgGreen}Saved ${answered} answer(s). Inspect affected wording before authorizing regeneration.${Reset}`
       );
     }
   }
@@ -4281,7 +5187,11 @@ ${Bold}${questions.length} unanswered question(s):${Reset}
     }
   }
   if (answers.length) await saveAnswers();
-  const remaining = answered ? await fetchQuestions(ctx.host, ctx.projectId, ctx.accessToken) : questions;
+  const followUp = answered ? await readTranslationFollowUp(
+    ctx,
+    ctx.scope ?? answeredPairsScope(affectedPairs)
+  ) : void 0;
+  const remaining = followUp?.questions ?? questions;
   if (ctx.flags.json) {
     console.info(
       JSON.stringify(
@@ -4291,7 +5201,10 @@ ${Bold}${questions.length} unanswered question(s):${Reset}
           status: answered ? "answered" : questions.length ? "skipped" : "none",
           summary: { total: questions.length, answered },
           questions: remaining,
-          retranslationRequired: answered > 0
+          retranslationRequired: answered > 0,
+          affected_pairs: affectedPairs,
+          follow_up: followUp,
+          next_actions: buildAnswerNextActions(affectedPairs)
         },
         null,
         2
@@ -4381,6 +5294,28 @@ function renderDashboardJson(model, status, questionsCount) {
     null,
     2
   );
+}
+
+function renderPushPreview(plan) {
+  const translationCount = Object.values(
+    plan.missingTranslationsPerLanguage
+  ).reduce((sum, keys) => sum + keys.length, 0);
+  console.info("Dry run \u2014 no server changes made.");
+  console.info(
+    `${plan.newLanguages.length} new languages, ${plan.newKeys.length} new keys, ${translationCount} translations, ${plan.conflicts.length} conflicting values, ${plan.keysToRemove.length} keys to archive.`
+  );
+  for (const key of plan.newKeys) console.info(`  Add: ${key}`);
+  for (const [language, keys] of Object.entries(
+    plan.missingTranslationsPerLanguage
+  )) {
+    for (const key of keys)
+      console.info(`  Add translation: ${key} (${language})`);
+  }
+  for (const conflict of plan.conflicts) {
+    console.info(`  Conflict: ${conflict.key} (${conflict.language})`);
+  }
+  for (const key of plan.keysToRemove)
+    console.info(`  Archive: ${formatNamespacedKey(key)}`);
 }
 
 function deduplicateByKey(grouped) {
@@ -4630,7 +5565,7 @@ function renderCoverage(lines, coverage, full) {
     );
   }
 }
-function renderPushJson(pushPlan, filter) {
+function renderPushJson(pushPlan, filter, dryRun = false) {
   const totalTranslations = Object.values(
     pushPlan.missingTranslationsPerLanguage
   ).reduce((sum, keys) => sum + keys.length, 0);
@@ -4638,7 +5573,7 @@ function renderPushJson(pushPlan, filter) {
     {
       version: 1,
       command: "push",
-      status: pushPlan.hasChanges ? "pushed" : "nothing_to_push",
+      status: dryRun ? "dry_run" : pushPlan.hasChanges ? "pushed" : "nothing_to_push",
       filter: filter ? {
         applied: true,
         patterns: filter.patterns,
@@ -4649,20 +5584,23 @@ function renderPushJson(pushPlan, filter) {
         new_languages: pushPlan.newLanguages.map((l) => l.code),
         new_keys: pushPlan.newKeys,
         translations_per_language: pushPlan.missingTranslationsPerLanguage,
-        conflicts: pushPlan.conflicts
+        conflicts: pushPlan.conflicts,
+        archived_keys: pushPlan.keysToRemove
       },
       counts: {
         new_languages: pushPlan.newLanguages.length,
         new_keys: pushPlan.newKeys.length,
         translations: totalTranslations,
-        conflicts: pushPlan.conflicts.length
+        conflicts: pushPlan.conflicts.length,
+        archived_keys: pushPlan.keysToRemove.length
       }
     },
     null,
     2
   );
 }
-function renderPullJson(status) {
+function renderPullJson(status, pullResult) {
+  const removedKeys = pullResult?.removedKeys ?? [];
   const totalPulled = Object.values(status.toPull.missingTranslations).reduce(
     (sum, keys) => sum + keys.length,
     0
@@ -4679,9 +5617,15 @@ function renderPullJson(status) {
         })),
         missing_translations: status.toPull.missingTranslations
       },
+      removed_keys: removedKeys.map((key) => ({
+        key: key.key,
+        namespace: key.namespace,
+        files: key.paths
+      })),
       counts: {
         missing_keys: status.toPull.missingKeys.length,
-        translations: totalPulled
+        translations: totalPulled,
+        removed_keys: removedKeys.length
       }
     },
     null,
@@ -5102,7 +6046,7 @@ async function readMutuallyExclusiveValue(input) {
     return void 0;
   }
   if (input.file === "-") {
-    if (stdin.isTTY && input.flags.noInteraction) {
+    if (stdin$1.isTTY && input.flags.noInteraction) {
       throw new Error(`${input.fileName} - would read from an interactive terminal.`);
     }
     return readStdin();
@@ -5111,7 +6055,7 @@ async function readMutuallyExclusiveValue(input) {
 }
 async function readStdin() {
   const chunks = [];
-  for await (const chunk of stdin) {
+  for await (const chunk of stdin$1) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
   }
   return Buffer.concat(chunks).toString("utf8");
@@ -5122,10 +6066,83 @@ function formatKeyLine(key) {
   return `${namespace}${key.key} ${key.id}${archived}`;
 }
 
+async function collectKeysToRemove(input) {
+  const { serverOnlyKeys } = input;
+  if (serverOnlyKeys.length === 0) return [];
+  if (input.prune) return serverOnlyKeys;
+  if (input.noInteraction) return [];
+  const preview = serverOnlyKeys.slice(0, 5);
+  const remaining = serverOnlyKeys.length - preview.length;
+  const keyList = preview.map((key) => formatNamespacedKey(key)).join(", ") + (remaining > 0 ? `, ... +${remaining} more` : "");
+  console.info(
+    `
+  ${FgYellow}${serverOnlyKeys.length} key${serverOnlyKeys.length !== 1 ? "s" : ""} on server not in your local files:${Reset}`
+  );
+  console.info(`  ${Dim}${keyList}${Reset}
+`);
+  const action = await select({
+    message: "What to do with server-only keys?",
+    choices: [
+      { value: "keep", name: "Keep on server (do nothing)" },
+      { value: "select", name: "View and select which to remove" },
+      { value: "remove-all", name: "Remove all from server" }
+    ]
+  });
+  if (action === "keep") return [];
+  if (action === "remove-all") {
+    return serverOnlyKeys.map((key) => ({
+      key: key.key,
+      namespace: key.namespace
+    }));
+  }
+  if (action === "select") {
+    const removableKeys = new Map(
+      serverOnlyKeys.map((key) => [getComparisonKey(key), key])
+    );
+    const selected = await checkbox({
+      message: "Select keys to remove from server:",
+      choices: serverOnlyKeys.map((key) => ({
+        value: getComparisonKey(key),
+        name: formatNamespacedKey(key),
+        checked: false
+      }))
+    });
+    if (selected.length > 0) {
+      console.info(
+        `
+  ${Dim}${selected.length} key${selected.length !== 1 ? "s" : ""} selected for removal.${Reset}`
+      );
+      return selected.flatMap((comparisonKey) => {
+        const key = removableKeys.get(comparisonKey);
+        if (!key) return [];
+        return [{ key: key.key, namespace: key.namespace }];
+      });
+    }
+  }
+  return [];
+}
+
+function getSyncQuestionScope(input) {
+  const selected = input.selectedKeys ?? resolveSelectedKeys(
+    input.keys ?? [],
+    input.syncResult.mergedKeysByKeyByNamespace,
+    input.namespaces ?? []
+  );
+  const keyIds = Object.values(input.syncResult.mergedKeysByKeyByNamespace).flatMap((keys) => Object.values(keys)).filter(
+    (key) => key.server && selected.has(getComparisonKey(key)) && (!input.onlyExisting || key.local) && (!input.keyIds?.length || input.keyIds.includes(key.server.id))
+  ).flatMap((key) => key.server ? [key.server.id] : []);
+  return { keyIds, languages: input.languages ?? input.targetLanguages };
+}
+
 async function syncAndTranslate(input) {
   const { host, projectId, accessToken, flags } = input;
   const json = flags.json;
   let { syncResult } = input;
+  const selectedKeys = input.keys.length > 0 || input.namespaces.length > 0 ? resolveSelectedKeys(
+    input.keys,
+    syncResult.mergedKeysByKeyByNamespace,
+    input.namespaces
+  ) : void 0;
   const invalidLanguages = (input.languages ?? []).filter(
     (language) => !input.targetLanguages.includes(language)
   );
@@ -5139,8 +6156,18 @@ ${Bold}  Sync & Translate${Reset}
 `);
   let pushResult;
   let pushStatus = "nothing_to_push";
-  if (syncResult.status.needPush) {
-    const keysToRemove = await collectKeysToRemove(input);
+  const keysToRemove = await collectKeysToRemove({
+    serverOnlyKeys: syncResult.status.issues.serverOnlyKeys,
+    noInteraction: flags.noInteraction,
+    prune: input.prune
+  });
+  const removedKeyIds = new Set(
+    keysToRemove.map((key) => getComparisonKey(key))
+  );
+  const keptServerOnlyKeys = syncResult.status.issues.serverOnlyKeys.filter(
+    (key) => !removedKeyIds.has(getComparisonKey(key))
+  );
+  if (syncResult.status.needPush || keysToRemove.length > 0) {
     if (!json) console.info(`  Pushing...`);
     syncResult = await input.doPush(keysToRemove);
     pushResult = syncResult.pushResult;
@@ -5153,6 +6180,9 @@ ${Bold}  Sync & Translate${Reset}
         parts.push(`${created} new key${created !== 1 ? "s" : ""}`);
       if (updated > 0)
         parts.push(`${updated} updated value${updated !== 1 ? "s" : ""}`);
+      const archived = pushResult?.archivedKeyIds?.length ?? 0;
+      if (archived > 0)
+        parts.push(`${archived} archived key${archived !== 1 ? "s" : ""}`);
       if (parts.length > 0) {
         console.info(`  ${FgGreen}\u2713 ${parts.join(", ")} pushed${Reset}`);
       } else {
@@ -5175,7 +6205,8 @@ ${Bold}  Sync & Translate${Reset}
     emptyValueString: input.emptyValueString,
     languages: input.languages,
     keys: input.keys,
-    namespaces: input.namespaces
+    namespaces: input.namespaces,
+    selectedKeys
   });
   const workKeyIds = new Set(workSet.map((w) => w.keyId));
   const workLanguages = [
@@ -5228,8 +6259,8 @@ ${Bold}  Sync & Translate${Reset}
   ).reduce((sum, keys) => sum + keys.length, 0);
   let pullStatus = "nothing_to_pull";
   if (syncResult.status.needPull) {
-    pullStatus = "pulled";
-    if (!flags.noInteraction && pushedKeyIds.length > 0) {
+    if (!flags.noInteraction) {
+      pullStatus = "pulled";
       await pullWithTierPicker({
         flags,
         syncResult,
@@ -5239,17 +6270,29 @@ ${Bold}  Sync & Translate${Reset}
         scores
       });
     } else {
-      if (!json) console.info(`
-  Pulling...`);
-      await input.doPull(
-        input.onlyExisting ? { onlyExisting: true } : void 0
+      const pullOptions = automaticPullOptions(
+        syncResult,
+        keptServerOnlyKeys,
+        input.onlyExisting
       );
-      if (!json) console.info(`  ${FgGreen}\u2713 Translations pulled${Reset}`);
+      if (pullOptions !== "skip") {
+        pullStatus = "pulled";
+        if (!json) console.info(`
+  Pulling...`);
+        await input.doPull(pullOptions);
+        if (!json) console.info(`  ${FgGreen}\u2713 Translations pulled${Reset}`);
+      }
     }
   } else if (!json) {
     console.info(`
   ${FgGreen}\u2713 Nothing new to pull.${Reset}`);
   }
+  const followUp = await readTranslationFollowUp(
+    input,
+    translateSummary?.jobId ? { jobId: translateSummary.jobId } : getSyncQuestionScope({ ...input, syncResult, selectedKeys }),
+    translateSummary?.status === "timeout"
+  );
+  if (!json) printTranslationFollowUp(followUp);
   if (json) {
     const overallStatus = translateSummary?.status === "failed" ? "failed" : translateSummary?.status === "timeout" ? "timeout" : "complete";
     console.info(
@@ -5257,6 +6300,7 @@ ${Bold}  Sync & Translate${Reset}
         {
           version: 1,
           command: "sync-and-translate",
+          follow_up: followUp,
           status: overallStatus,
           job_id: translateSummary?.jobId,
           phases: {
@@ -5264,7 +6308,8 @@ ${Bold}  Sync & Translate${Reset}
               status: pushStatus,
               counts: {
                 new_keys: pushResult?.createdKeyIds.length ?? 0,
-                updated_keys: pushResult?.updatedKeyIds.length ?? 0
+                updated_keys: pushResult?.updatedKeyIds.length ?? 0,
+                archived_keys: pushResult?.archivedKeyIds?.length ?? 0
               }
             },
             translate: {
@@ -5329,60 +6374,6 @@ function buildScoreMap(reviews) {
     map.set(`${r.keyId}:${r.languageCode}`, r.score);
   }
   return map;
-}
-async function collectKeysToRemove(input) {
-  const serverOnlyKeys = input.syncResult.status.issues.serverOnlyKeys;
-  if (serverOnlyKeys.length === 0) return [];
-  if (input.flags.noInteraction) return [];
-  const preview = serverOnlyKeys.slice(0, 5);
-  const remaining = serverOnlyKeys.length - preview.length;
-  const keyList = preview.map((key) => formatNamespacedKey(key)).join(", ") + (remaining > 0 ? `, ... +${remaining} more` : "");
-  console.info(
-    `
-  ${FgYellow}${serverOnlyKeys.length} key${serverOnlyKeys.length !== 1 ? "s" : ""} on server not in your local files:${Reset}`
-  );
-  console.info(`  ${Dim}${keyList}${Reset}
-`);
-  const action = await select({
-    message: "What to do with server-only keys?",
-    choices: [
-      { value: "keep", name: "Keep on server (do nothing)" },
-      { value: "select", name: "View and select which to remove" },
-      { value: "remove-all", name: "Remove all from server" }
-    ]
-  });
-  if (action === "keep") return [];
-  if (action === "remove-all") {
-    return serverOnlyKeys.map((key) => ({
-      key: key.key,
-      namespace: key.namespace
-    }));
-  }
-  if (action === "select") {
-    const removableKeys = new Map(
-      serverOnlyKeys.map((key) => [getComparisonKey(key), key])
-    );
-    const selected = await checkbox({
-      message: "Select keys to remove from server:",
-      choices: serverOnlyKeys.map((key) => ({
-        value: getComparisonKey(key),
-        name: formatNamespacedKey(key),
-        checked: false
-      }))
-    });
-    if (selected.length > 0) {
-      console.info(
-        `
-  ${Dim}${selected.length} key${selected.length !== 1 ? "s" : ""} selected for removal.${Reset}`
-      );
-      return selected.flatMap((comparisonKey) => {
-        const key = removableKeys.get(comparisonKey);
-        if (!key) return [];
-        return [{ key: key.key, namespace: key.namespace }];
-      });
-    }
-  }
-  return [];
 }
 async function questionTranslateLoop(input) {
   const { host, projectId, accessToken, flags, workSet, questionKeyIds } = input;
@@ -5541,6 +6532,34 @@ function filterQuestionsForKeys(questions, keyIds, languages) {
     (question) => keyIds.has(question.keyId) && (!languageSet || languageSet.has(question.languageCode))
   );
 }
+function automaticPullOptions(syncResult, keptServerOnlyKeys, onlyExisting) {
+  const fullPull = onlyExisting ? { onlyExisting: true } : void 0;
+  if (keptServerOnlyKeys.length === 0 || onlyExisting || syncResult.status.languages.serverOnly.length > 0) {
+    return fullPull;
+  }
+  const kept = new Set(keptServerOnlyKeys.map((key) => getComparisonKey(key)));
+  const other = /* @__PURE__ */ new Set();
+  const consider = (key) => {
+    const id = getComparisonKey(key);
+    if (!kept.has(id)) other.add(id);
+  };
+  for (const key of syncResult.status.toPull.missingKeys) consider(key);
+  for (const key of Object.values(syncResult.comparison.missingKeysOnLocal)) {
+    consider(key);
+  }
+  for (const keys of Object.values(
+    syncResult.comparison.missingTranslationsOnLocalPerLanguage
+  )) {
+    for (const key of keys) consider(key);
+  }
+  const statusTranslationCount = Object.values(
+    syncResult.status.toPull.missingTranslations
+  ).reduce((sum, names) => sum + names.length, 0);
+  const listedTranslations = Object.keys(syncResult.comparison.missingTranslationsOnLocalPerLanguage).length > 0;
+  if (statusTranslationCount > 0 && !listedTranslations) return fullPull;
+  if (other.size === 0) return "skip";
+  return { selectedKeys: other };
+}
 async function pullWithTierPicker(input) {
   const { flags, pushedKeyIds, doPull, hasS2tContext, scores } = input;
   const comparison = input.syncResult.comparison;
@@ -5660,11 +6679,14 @@ async function translateCommand(input) {
   }
   const summary = summarize(work, input.strategy);
   if (work.length === 0) {
+    const followUp2 = input.dryRun || input.estimate ? void 0 : await readTranslationFollowUp(input, getSyncQuestionScope(input));
+    if (followUp2 && !input.flags.json) printTranslationFollowUp(followUp2);
     if (input.flags.json) {
       emitJson({
         version: 1,
         command: "translate",
         status: "skipped",
+        follow_up: followUp2,
         summary
       });
     } else {
@@ -5722,6 +6744,11 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
         version: 1,
         command: "translate",
         status: "started",
+        follow_up: await readTranslationFollowUp(
+          input,
+          { jobId: response.jobId },
+          true
+        ),
         job_id: response.jobId,
         summary,
         billing: response.numberOfBillableProcesses === void 0 ? void 0 : { billable_processes: response.numberOfBillableProcesses },
@@ -5755,10 +6782,17 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
   } catch (err) {
     return reportFailure(input, response.jobId, err);
   }
+  const followUp = await readTranslationFollowUp(
+    input,
+    { jobId: response.jobId },
+    finalStatus.status === "timeout"
+  );
+  if (!input.flags.json) printTranslationFollowUp(followUp);
   if (input.flags.json) {
     emitJson({
       version: 1,
       command: "translate",
+      follow_up: followUp,
       status: finalStatus.status,
       job_id: response.jobId,
       counts: {
@@ -6016,6 +7050,7 @@ Commands:
   translate --key-id <id>      Request AI translations for one remote key
   job <jobId>                  Check the status of a translation job
 
+  quality check|show|decide|retry  Review translations through your coding agent
   questions                    Show and answer translation questions
   review                       Review and approve translations
   proofread                    Run AI proofreading
@@ -6025,7 +7060,7 @@ Commands:
   key export                   Export compact key context
   key add                      Add a remote key
   key update                   Update key metadata/source text
-  key rename                   Rename a remote key
+  key rename                   Rename keys, namespaces, and sources
   key archive                  Archive a remote key
   key unarchive                Unarchive a remote key
 
@@ -6035,6 +7070,8 @@ Commands:
 
   project get                  Show remote project metadata
   project update               Update remote project metadata
+
+${agentTranslationGuidance}
 
 Examples:
   babli status
@@ -6075,6 +7112,14 @@ program.command("logout").description("Logout from Babli.ai").action(async () =>
   await run({ action: "logout" });
 });
 program.command("push").description("Push local keys and translations to server").option(
+  "--prune",
+  "Archive server keys absent from local translation files in the selected scope"
+).option("--dry-run", "Preview changes without writing to the server").option(
+  "--allow-empty-prune",
+  "Allow archiving when no configured local translation files are found"
+).addHelpText("after", `
+${agentTranslationGuidance}
+`).option(
   "--resolve <strategy>",
   "Resolve push conflicts non-interactively: local | server"
 ).option(
@@ -6089,17 +7134,25 @@ program.command("push").description("Push local keys and translations to server"
   []
 ).addHelpText(
   "after",
-  '\nExamples:\n  babli push                          # interactive, confirm each step\n  babli push --resolve local           # overwrite server for all conflicts\n  babli push --no-interaction          # push all, no prompts\n  babli push --json --no-interaction   # for CI/agents\n  babli push --key "auth:*"            # only push keys in the auth namespace\n  babli push --namespace checkout      # only push the checkout namespace\n  babli push --key "auth:*" --json --no-interaction  # preview the scoped plan\n\n--key and --namespace combine with AND (a key must match both).'
-).action(async (options) => {
-  await run({
-    action: "push",
-    keys: options.key,
-    namespaces: options.namespace
-  });
-});
+  '\nExamples:\n  babli push                          # interactive, confirm each step\n  babli push --resolve local           # overwrite server for all conflicts\n  babli push --prune --dry-run --json   # preview uploads and archives\n  babli push --prune --no-interaction  # upload and archive server-only keys\n  babli push --no-interaction          # push all, no prompts\n  babli push --json --no-interaction   # for CI/agents\n  babli push --key "auth:*"            # only push keys in the auth namespace\n  babli push --namespace checkout      # only push the checkout namespace\n  babli push --key "auth:*" --dry-run --json  # preview the scoped plan\n\n--key and --namespace combine with AND (a key must match both).'
+).action(
+  async (options) => {
+    await run({
+      action: "push",
+      prune: options.prune === true,
+      allowEmptyPrune: options.allowEmptyPrune === true,
+      dryRun: options.dryRun === true,
+      keys: options.key,
+      namespaces: options.namespace
+    });
+  }
+);
 program.command("pull").description("Pull translations from server to local files").option("--only-approved", "Only pull translations that are approved").option(
   "--only-existing",
   "Only pull updates to keys that already exist locally"
+).option(
+  "--keep-local-only",
+  "Keep local keys that are not on the server instead of removing them"
 ).option(
   "--key <pattern>",
   'Only pull keys matching this glob (repeatable; quote it; "namespace:key" or a glob like "auth:*")',
@@ -6117,6 +7170,7 @@ Examples:
   babli pull                       # pull all translations
   babli pull --only-approved       # only approved translations
   babli pull --only-existing       # skip new keys, update existing only
+  babli pull --keep-local-only     # keep keys that exist only locally
   babli pull --key hello --key bye # only pull these keys
   babli pull --key auth:login      # pull a key in the 'auth' namespace
   babli pull --key "user.profile.*" # pull keys under a prefix
@@ -6130,6 +7184,7 @@ Examples:
       options: {
         onlyApproved: options.onlyApproved,
         onlyExisting: options.onlyExisting,
+        keepLocalOnly: options.keepLocalOnly === true,
         keys: options.key,
         namespaces: options.namespace
       }
@@ -6156,7 +7211,9 @@ program.command("status").description("Show sync status between local files and 
     namespaces: options.namespace
   });
 });
-program.command("translate").description("Trigger AI translation for missing translations").option(
+program.command("translate").description("Trigger AI translation for missing translations").addHelpText("after", `
+${agentTranslationGuidance}
+`).option(
   "--strategy <strategy>",
   "Which translations to (re)generate: missing | not-approved",
   "missing"
@@ -6199,7 +7256,7 @@ program.command("translate").description("Trigger AI translation for missing tra
   "Block and poll until the job finishes (non-interactive mode returns the job id immediately by default)"
 ).option("--timeout <seconds>", "Max wait time when polling", "300").addHelpText(
   "after",
-  '\nExamples:\n  babli translate                    # translate all missing, interactive\n  babli translate --languages cs,de  # only Czech and German\n  babli translate --strategy not-approved  # also re-translate unapproved drafts\n  babli translate --only-existing    # skip keys not in local files\n  babli translate --key "auth:*"     # only translate the auth namespace\n  babli translate --namespace checkout  # only translate the checkout namespace\n  babli translate --key-ids key_1,key_2 --no-interaction\n  babli translate --dry-run --json   # complete work-set, no spend\n  babli translate --namespace speech --estimate --json\n  babli translate --namespace speech --max-credits 7.00 --wait --json\n  babli translate --json --no-interaction  # dispatch and return a job id\n\nOn timeout, run `babli job <job_id> --wait`; do not dispatch translate again.\n--key and --namespace combine with AND (a key must match both).'
+  '\nExamples:\n  babli translate                    # translate all missing, interactive\n  babli translate --languages cs,de  # only Czech and German\n  babli translate --strategy not-approved  # also re-translate unapproved drafts\n  babli translate --only-existing    # skip keys not in local files\n  babli translate --key "auth:*"     # only translate the auth namespace\n  babli translate --namespace checkout  # only translate the checkout namespace\n  babli translate --key-ids key_1,key_2 --no-interaction\n  babli translate --dry-run --json   # complete work-set, no spend\n  babli translate --namespace speech --estimate --json\n  babli translate --namespace speech --max-credits 7.00 --wait --json\n  babli translate --json --no-interaction  # dispatch and return a job id\n\nInspect follow_up after completion: answer questions from evidence, ask the user about unknown product facts, and report anything unresolved.\nOn timeout, run `babli job <job_id> --wait`; do not dispatch translate again.\n--key and --namespace combine with AND (a key must match both).'
 ).action(
   async (options) => {
     const timeout = parseInt(options.timeout, 10);
@@ -6304,7 +7361,13 @@ withGlobalOptions(keyCommand.command("update")).description("Update key metadata
   validateKeyUpdateOptions(options);
   await run({ action: "key-update", options });
 });
-withGlobalOptions(keyCommand.command("rename")).description("Rename one key").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").requiredOption("--to <new-key>", "New key name").action(async (options) => {
+withGlobalOptions(keyCommand.command("rename")).description("Rename keys, namespaces, and source placement").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").option("--to <new-key>", "New key name").option("--file <path>", "Atomic rename manifest; - reads JSON from stdin").option("--dry-run", "Validate the entire manifest without writing").option(
+  "--allow-unpushed",
+  "Rename even when local files have changes that are not pushed"
+).action(async (options) => {
+  options.dryRun = options.dryRun === true;
+  options.allowUnpushed = options.allowUnpushed === true;
+  validateKeyRenameOptions(options);
   await run({ action: "key-rename", options });
 });
 withGlobalOptions(keyCommand.command("archive")).description("Archive one key").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").action(async (options) => {
@@ -6355,6 +7418,14 @@ withGlobalOptions(projectCommand.command("update")).description("Update remote p
   }
 );
 program.command("sync-and-translate").description("Push local changes, translate, and pull results").option(
+  "--allow-empty-prune",
+  "Allow archiving when no configured local translation files are found"
+).option(
+  "--prune",
+  "Archive server keys absent from local translation files in the selected scope"
+).addHelpText("after", `
+${agentTranslationGuidance}
+`).option(
   "--resolve <strategy>",
   "Resolve push conflicts non-interactively: local | server"
 ).option(
@@ -6379,7 +7450,7 @@ program.command("sync-and-translate").description("Push local changes, translate
   "production"
 ).option("--max-credits <amount>", "Maximum cumulative credit charge").option("--timeout <seconds>", "Max wait time when polling", "300").addHelpText(
   "after",
-  'Examples:\n  babli sync-and-translate --json --no-interaction # complete agent workflow; waits automatically\n  babli sync-and-translate                         # interactive\n  babli sync-and-translate --only-existing         # skip keys not in local files\n  babli sync-and-translate --namespace speech --key "mosquito.*" --max-credits 7.00'
+  'Examples:\n  babli sync-and-translate --json --no-interaction # descriptions prepared; waits automatically; inspect follow_up afterward\n  babli sync-and-translate                         # interactive\n  babli sync-and-translate --only-existing         # skip keys not in local files\n  babli sync-and-translate --prune --json          # also archive server-only keys\n  babli sync-and-translate --namespace speech --key "mosquito.*" --max-credits 7.00'
 ).action(
   async (options) => {
     if (options.model !== "production" && options.model !== "preview") {
@@ -6393,6 +7464,8 @@ program.command("sync-and-translate").description("Push local changes, translate
       action: "sync-and-translate",
       options: {
         onlyExisting: options.onlyExisting === true,
+        prune: options.prune === true,
+        allowEmptyPrune: options.allowEmptyPrune === true,
         keys: options.key,
         namespaces: options.namespace,
         languages: options.languages?.split(",").map((language) => language.trim()).filter(Boolean),
@@ -6403,15 +7476,44 @@ program.command("sync-and-translate").description("Push local changes, translate
     });
   }
 );
-program.command("questions").description("Show and answer unanswered translation questions").option(
+registerQualityCommands(
+  program,
+  async (input) => {
+    await run({ action: "quality", input });
+  },
+  withGlobalOptions
+);
+program.command("questions").option("--job <id>", "Inspect questions for the exact translation job scope").option(
+  "--key <pattern>",
+  "Only matching namespaced keys (repeatable)",
+  collectOption,
+  []
+).option(
+  "--namespace <pattern>",
+  "Only matching namespaces (repeatable)",
+  collectOption,
+  []
+).option("--key-id <id>", "Only this key UUID (repeatable)", collectOption, []).option("--languages <codes>", "Only these languages (comma-separated)").description("Show and answer unanswered translation questions").option(
   "--answers-file <path>",
   "Submit a JSON answers file without prompting (requires a user token)"
 ).addHelpText(
   "after",
   "\nExamples:\n  babli questions                    # interactive\n  babli questions --json             # JSON output for agents"
-).action(async (options) => {
-  await run({ action: "questions", answersFile: options.answersFile });
-});
+).action(
+  async (options) => {
+    await run({
+      action: "questions",
+      answersFile: options.answersFile,
+      scope: {
+        jobId: options.job,
+        keys: options.key,
+        namespaces: options.namespace,
+        ...options.keyId.length ? { keyIds: options.keyId } : {},
+        languages: options.languages?.split(",").map((code) => code.trim())
+      }
+    });
+  }
+);
 program.command("review").description("Review and approve translations").option(
   "--score-threshold <score>",
   "Min score for auto-approval in non-interactive mode",
@@ -6525,20 +7627,20 @@ async function run(cliInput) {
   try {
     const result = await runAction(cliInput, getGlobalFlags());
     if (cliInput.action === "status" && (result.needPush || result.needPull)) {
-      process.exit(1);
+      await exitAfterFlush(1);
     }
     if (result.exitCode !== void 0 && result.exitCode !== 0) {
-      process.exit(result.exitCode);
+      await exitAfterFlush(result.exitCode);
     }
   } catch (err) {
     if (err instanceof Error && err.message.includes("User force closed the prompt")) {
       console.info("Exiting...");
-      process.exit(0);
+      await exitAfterFlush(0);
     }
     if (getGlobalFlags().json) {
       if (err instanceof KeyDescriptionBatchError) {
         console.info(JSON.stringify(err.report, null, 2));
-        process.exit(2);
+        await exitAfterFlush(2);
       }
       const error = serializeCliError(err);
       console.info(
@@ -6552,7 +7654,7 @@ async function run(cliInput) {
           2
         )
       );
-      process.exit(2);
+      await exitAfterFlush(2);
     }
     console.error(`${Bold}Oops, something went wrong:${Reset}`);
     if (env.NODE_ENV === "development") {
@@ -6563,7 +7665,7 @@ async function run(cliInput) {
     } else {
       console.error(FgRed + String(err) + Reset);
     }
-    process.exit(2);
+    await exitAfterFlush(2);
   }
 }
 function readBuildInfo() {
@@ -6619,6 +7721,7 @@ async function performSync(ctx, cliInput, translationFilesConfig, transforms) {
     allServerKeys,
     getFilePatternOrPath,
     writeFile,
+    removeFile: (file) => fs__default.rm(file, { force: true }),
     pushToServer: makePushToServer(ctx.host, ctx.accessToken),
     appHost: ctx.host,
     translationFilesConfig,
@@ -6661,7 +7764,7 @@ async function runAction(cliInput, flags) {
     process.exit(2);
   });
   const host = parsed?.host ?? defaultHost;
-  await pingServer(host, buildInfo.versionLabel);
+  const server = await pingServer(host, buildInfo.versionLabel);
   const orgCtx = { host, accessToken, flags };
   if (cliInput.action === "project-list") {
     await projectListCommand(orgCtx, cliInput.options);
@@ -6688,6 +7791,14 @@ async function runAction(cliInput, flags) {
     accessToken,
     flags
   };
+  if (cliInput.action === "quality") {
+    if (!server.capabilities?.includes("quality-review-v1"))
+      throw new Error(
+        "This server does not support CLI linguistic review. Update the server before submitting review work."
+      );
+    const exitCode = await qualityCommand(surgicalCtx, cliInput.input);
+    return { needPush: false, needPull: false, exitCode };
+  }
   if (cliInput.action === "job") {
     const exitCode = await jobCommand(surgicalCtx, cliInput.options);
     return { needPush: false, needPull: false, exitCode };
@@ -6717,10 +7828,6 @@ async function runAction(cliInput, flags) {
     } else {
       await keyUpdateCommand(surgicalCtx, cliInput.options);
     }
-    return { needPush: false, needPull: false };
-  }
-  if (cliInput.action === "key-rename") {
-    await keyRenameCommand(surgicalCtx, cliInput.options);
     return { needPush: false, needPull: false };
   }
   if (cliInput.action === "key-archive") {
@@ -6769,6 +7876,22 @@ async function runAction(cliInput, flags) {
     defaultFilePattern: parsed.defaultFilePattern
   };
   const doSync = (action) => performSync(syncCtx, action, translationFilesConfig, transforms);
+  if (cliInput.action === "key-rename") {
+    if (cliInput.options.file !== void 0) {
+      if (!cliInput.options.allowUnpushed) {
+        const status = await doSync({ action: "status" });
+        assertNoUnpushedChanges(status.status);
+      }
+      await keyRenameFileCommand(
+        surgicalCtx,
+        { file: cliInput.options.file, dryRun: cliInput.options.dryRun },
+        translationFilesConfig
+      );
+    } else {
+      await keyRenameCommand(surgicalCtx, cliInput.options);
+    }
+    return { needPush: false, needPull: false };
+  }
   if (cliInput.action === "workflow" || cliInput.action === "sync-and-translate") {
     const projectInfo = await fetchProjectInfo(host, projectId, accessToken);
     const projectName = projectInfo.name;
@@ -6788,6 +7911,11 @@ async function runAction(cliInput, flags) {
         return [];
       })
     ]);
+    const workflowSelectedKeys = workflowKeys.length > 0 || workflowNamespaces.length > 0 ? resolveSelectedKeys(
+      workflowKeys,
+      result2.mergedKeysByKeyByNamespace,
+      workflowNamespaces
+    ) : void 0;
     const s2tInput = {
       host,
       projectId,
@@ -6795,6 +7923,7 @@ async function runAction(cliInput, flags) {
       flags,
       syncResult: result2,
       targetLanguages,
+      prune: cliInput.action === "sync-and-translate" && cliInput.options.prune,
       emptyValueString: parsed.emptyValueString,
       onlyExisting: cliInput.action === "sync-and-translate" ? cliInput.options.onlyExisting : false,
       keys: workflowKeys,
@@ -6806,11 +7935,12 @@ async function runAction(cliInput, flags) {
       doPush: (keysToRemove) => doSync({
         action: "push",
         keysToRemove,
+        allowEmptyPrune: cliInput.action === "sync-and-translate" && cliInput.options.allowEmptyPrune,
         quiet: true,
         keys: workflowKeys,
         namespaces: workflowNamespaces
       }),
-      reFetchAndSync: () => doSync(statusInput),
+      reFetchAndSync: () => doSync({ ...statusInput, selectedKeys: workflowSelectedKeys }),
       doPull: async (options) => {
         await doSync({
           action: "pull",
@@ -6818,6 +7948,7 @@ async function runAction(cliInput, flags) {
             onlyApproved: false,
             keys: workflowKeys,
             namespaces: workflowNamespaces,
+            selectedKeys: workflowSelectedKeys,
             ...options
           }
         });
@@ -6883,7 +8014,8 @@ async function runAction(cliInput, flags) {
       projectId,
       accessToken,
       flags,
-      answersFile: cliInput.answersFile
+      answersFile: cliInput.answersFile,
+      scope: cliInput.scope
     });
     return { needPush: false, needPull: false };
   }
@@ -6946,12 +8078,18 @@ async function runAction(cliInput, flags) {
       );
     }
   }
-  if (cliInput.action === "push" && flags.json) {
+  if (cliInput.action === "push") {
     const pushPlan = computePushPlan(result.comparison);
-    console.info(renderPushJson(pushPlan, result.pushFilter));
+    if (flags.json) {
+      console.info(
+        renderPushJson(pushPlan, result.pushFilter, cliInput.dryRun === true)
+      );
+    } else if (cliInput.dryRun) {
+      renderPushPreview(pushPlan);
+    }
   }
   if (cliInput.action === "pull" && flags.json) {
-    console.info(renderPullJson(result.status));
+    console.info(renderPullJson(result.status, result.pullResult));
   }
   if (cliInput.action === "translate") {
     const projectInfo = await fetchProjectInfo(host, projectId, accessToken);
