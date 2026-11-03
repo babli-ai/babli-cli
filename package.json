@@ -1,6 +1,6 @@
 {
   "name": "babli",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -30,7 +30,7 @@
   "dependencies": {
     "@inquirer/prompts": "^7.10.1",
     "commander": "^14.0.3",
-    "glob": "^11.1.0",
+    "glob": "^14.0.2",
     "ignore": "^7.0.5",
     "js-yaml": "^4.1.1",
     "minimatch": "^10.2.5",
@@ -50,12 +50,13 @@
     "rollup-plugin-esbuild": "^6.2.1",
     "rollup-plugin-tsconfig-paths": "^1.5.2",
     "postgres": "^3.4.8",
+    "safe-unwrap": "workspace:*",
     "shared": "workspace:*",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "vite": "^6.4.2",
+    "vite": "^6.4.4",
     "vite-tsconfig-paths": "^5.1.4",
-    "vitest": "^4.1.11",
+    "vitest": "^4.1.12",
     "zod": "^3.25.76",
     "zod-to-json-schema": "^3.25.2"
   },

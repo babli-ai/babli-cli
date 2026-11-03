@@ -1,124 +1,133 @@
 #!/usr/bin/env node
+import { z } from 'zod';
+import * as fs from 'fs/promises';
+import fs__default from 'fs/promises';
+import { stdin, env } from 'process';
 import { randomUUID } from 'node:crypto';
 import fs$1, { readFile } from 'node:fs/promises';
-import { z } from 'zod';
+import path from 'node:path';
+import open from 'open';
+import path$1, { join, resolve } from 'path';
+import { glob } from 'glob';
+import { parse, stringify } from 'yaml';
+import { fromError } from 'zod-validation-error';
 import { setTimeout as setTimeout$1 } from 'node:timers/promises';
+import { Option, Command, Help } from 'commander';
 import { select, input, checkbox, confirm } from '@inquirer/prompts';
 import * as minimatch from 'minimatch';
 import { minimatch as minimatch$1 } from 'minimatch';
-import { Command, Help } from 'commander';
 import fsSync from 'fs';
-import * as fs from 'fs/promises';
-import fs__default from 'fs/promises';
-import { stdin as stdin$1, env } from 'process';
-import open from 'open';
-import path, { join, resolve } from 'path';
-import { glob } from 'glob';
-import path$1 from 'node:path';
 import ignore from 'ignore';
-import { stdin } from 'node:process';
+import { stdin as stdin$1 } from 'node:process';
 import PO from 'pofile';
-import { parse, stringify } from 'yaml';
 import { pathToFileURL } from 'url';
-import { fromError } from 'zod-validation-error';
 import yaml from 'js-yaml';
 import { Parser, Language, Query } from 'web-tree-sitter';
 
-const reviewModel = z.enum([
-  "gpt-4.1",
-  "gemini-3.1-pro",
-  "gemini-3-flash"
-]);
-const reviewSelection = z.object({
-  jobId: z.string().uuid().optional(),
-  keys: z.array(z.string().min(1)).max(500).default([]),
-  namespaces: z.array(z.string()).max(500).default([]),
-  keyIds: z.array(z.string().uuid()).max(500).optional(),
-  translationIds: z.array(z.string().uuid()).max(500).optional(),
-  languages: z.array(z.string().min(1)).max(200).optional(),
-  source: z.string().min(1).optional(),
-  type: z.literal("").default(""),
-  model: reviewModel.default("gpt-4.1"),
-  recheck: z.string().uuid().optional()
-}).strict();
-reviewSelection.extend({
-  requestId: z.string().uuid(),
-  maxCreditUnits: z.number().int().nonnegative()
+function assertNever$1(x) {
+  throw new Error(`Unexpected value: ${x}`);
+}
+
+function unwrap(value, message) {
+  if (value === null || value === void 0) {
+    throw new Error("Unwrap failed: value is null or undefined");
+  }
+  return value;
+}
+
+const languageCode = z.string().min(1);
+const fields = {
+  term: z.string().min(1),
+  sourceLanguageCode: languageCode,
+  description: z.string().nullable().optional(),
+  translations: z.record(languageCode, z.string()).optional()
+};
+const glossaryUpsertSchema = z.object(fields).strict();
+const glossaryUpdateSchema = z.object({
+  ...fields,
+  term: fields.term.optional(),
+  sourceLanguageCode: fields.sourceLanguageCode.optional(),
+  removeTranslations: z.array(languageCode).optional()
+}).strict().refine(
+  (input) => Object.values(input).some((value) => value !== void 0),
+  {
+    message: "Provide at least one field to update."
+  }
+).refine(
+  (input) => !input.removeTranslations?.some(
+    (code) => input.translations?.[code] !== void 0
+  ),
+  { message: "Cannot set and remove the same translation." }
+);
+const glossaryFileSchema = z.object({
+  version: z.literal(1),
+  terms: z.array(glossaryUpsertSchema).max(1e4)
+}).strict().superRefine((file, ctx) => {
+  const seen = /* @__PURE__ */ new Set();
+  file.terms.forEach((term, index) => {
+    const identity = JSON.stringify([term.term, term.sourceLanguageCode]);
+    if (seen.has(identity)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["terms", index],
+        message: "Duplicate term and source language."
+      });
+    }
+    seen.add(identity);
+  });
 });
-const reviewFinding = z.object({
-  id: z.string().min(1).max(100),
-  category: z.enum([
-    "format",
-    "meaning",
-    "omission",
-    "addition",
-    "terminology",
-    "grammar",
-    "locale",
-    "style",
-    "ambiguity",
-    "context_conflict"
-  ]),
-  importance: z.enum(["defect", "question", "suggestion"]),
-  explanation: z.string().min(1).max(4e3),
-  evidence: z.array(z.object({ path: z.string().min(1), quote: z.string().min(1) })).min(1).max(12),
-  replacement: z.string().max(32e3).nullable(),
-  question: z.string().max(2e3).nullable()
-}).strict();
-const reviewChecks = z.enum([
-  "meaning",
-  "completeness",
-  "terminology",
-  "fluency",
-  "locale",
-  "requirements"
-]);
+
+function hasCurrentApproval(summary) {
+  if (!summary) return false;
+  return summary.ai.outcome === "no_issues_found" && summary.ai.freshness === "current" || summary.human.outcome === "approved" && summary.human.freshness === "current";
+}
+
+const humanReviewOutcome = z.enum(["approved", "changes_requested"]);
+z.enum(["either", "ai", "human"]);
+const reviewSubjectKind = z.enum(["translation", "source_wording"]);
+const QUALITY_CONTRACT_CAPABILITY = "quality-contract-v2";
 z.object({
-  resultId: z.string().uuid(),
-  checks: z.array(
-    z.object({
-      check: reviewChecks,
-      result: z.enum(["pass", "finding", "needs_context"]),
-      explanation: z.string().min(1).max(2e3)
-    })
-  ).length(6),
-  findings: z.array(reviewFinding).max(20)
-}).strict();
-const reviewDecisionInput = z.object({
   requestId: z.string().uuid(),
-  resultId: z.string().uuid(),
-  expectedRevision: z.number().int().nonnegative(),
-  inputHash: z.string().length(64),
-  findingIds: z.array(z.string().min(1)).min(1).max(20),
-  action: z.enum(["apply", "dismiss", "clarify", "defer"]),
-  reason: z.string().trim().min(1).max(4e3),
-  evidence: z.array(z.string().min(1).max(2e3)).max(12).default([]),
-  value: z.string().max(32e3).optional(),
-  answer: z.string().trim().min(1).max(4e3).optional()
-}).strict().superRefine((decision, ctx) => {
-  if (decision.action === "apply" && decision.value === void 0)
-    ctx.addIssue({
-      code: "custom",
-      message: "Applying a correction requires the final value."
-    });
-  if (decision.action === "clarify" && !decision.answer)
-    ctx.addIssue({
-      code: "custom",
-      message: "Clarification requires an answer."
-    });
-  if (decision.action !== "apply" && decision.value !== void 0)
-    ctx.addIssue({
-      code: "custom",
-      message: "Only apply accepts replacement wording."
-    });
-  if (decision.action !== "clarify" && decision.answer !== void 0)
-    ctx.addIssue({
-      code: "custom",
-      message: "Only clarify accepts an answer."
-    });
-  if (new Set(decision.findingIds).size !== decision.findingIds.length)
-    ctx.addIssue({ code: "custom", message: "Duplicate finding IDs." });
-});
+  translationId: z.string().uuid(),
+  expectedTargetVersionId: z.string().uuid(),
+  expectedSourceVersionId: z.string().uuid().nullable(),
+  expectedHeadId: z.string().uuid().nullable(),
+  expectedContextGeneration: z.number().int().nonnegative(),
+  expectedContextHash: z.string().length(64),
+  create: z.object({ keyId: z.string().uuid(), languageId: z.string().uuid() }).optional(),
+  expectedConcernIds: z.array(z.string().uuid()).max(50),
+  outcome: humanReviewOutcome,
+  note: z.string().trim().max(4e3).default(""),
+  translation: z.string().max(32e3).optional(),
+  acknowledgedConcernIds: z.array(z.string().uuid()).max(50).default([]),
+  sourceLanguageCode: z.string().max(32).default(""),
+  subjectKind: reviewSubjectKind.default("translation")
+}).strict();
+z.object({
+  requestId: z.string().uuid(),
+  questionId: z.string().uuid(),
+  text: z.string().trim().min(1).max(4e3),
+  scope: z.enum(["key_language", "project", "recheck"]),
+  recheckResultId: z.string().uuid().optional(),
+  keyId: z.string().uuid().nullable(),
+  languageCode: z.string().max(32).nullable()
+}).strict();
+z.object({
+  requestId: z.string().uuid(),
+  reason: z.string().trim().max(2e3).default(""),
+  translationIds: z.array(z.string().uuid()).min(1).max(500),
+  sourceLanguageCode: z.string().min(1).max(32).optional()
+}).strict();
+z.object({
+  requestId: z.string().uuid(),
+  sourceLanguageCode: z.string().min(1).max(32).optional(),
+  action: z.enum(["save_only", "request_review", "mark_stale"]),
+  scope: z.enum(["listed", "project"]).default("listed"),
+  translationIds: z.array(z.string().uuid()).max(500).default([]),
+  keyIds: z.array(z.string().uuid()).max(200).default([]),
+  reviewKinds: z.array(z.enum(["ai", "human"])).min(1),
+  reason: z.string().trim().max(2e3).default("")
+}).strict();
 
 var __defProp$2 = Object.defineProperty;
 var __defNormalProp$2 = (obj, key, value) => key in obj ? __defProp$2(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
@@ -187,7 +196,7 @@ async function requestCliJson(url, init = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
     let response;
     try {
-      response = await fetch(url, init);
+      response = await fetch(url, withReviewCapability(init));
     } catch (cause) {
       if (!canRetry || attempt === 2) {
         throw new CliRequestError({
@@ -224,189 +233,241 @@ async function requestCliJson(url, init = {}) {
     code: "network_error"
   });
 }
+function withReviewCapability(init) {
+  const headers = new Headers(init.headers);
+  const existing = headers.get("x-babli-client-capabilities");
+  const values = new Set(
+    (existing ?? "").split(",").map((item) => item.trim()).filter(Boolean)
+  );
+  values.add(QUALITY_CONTRACT_CAPABILITY);
+  headers.set("x-babli-client-capabilities", [...values].join(", "));
+  return { ...init, headers };
+}
 function sleep$1(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function inspectQualityRun(context, runId, wait, timeout) {
-  const id = z.string().uuid().parse(runId);
-  const deadline = Date.now() + z.number().int().min(1).max(3600).parse(timeout) * 1e3;
-  while (true) {
-    const raw = await requestCliJson(
-      `${context.host}/api/cli/${context.projectId}/quality/runs/${id}`,
-      { headers: { Authorization: `Bearer ${context.accessToken}` } }
-    );
-    const result = z.object({ status: z.enum(["running", "complete", "failed"]) }).passthrough().parse(raw);
-    if (!wait || result.status !== "running") return result;
-    if (Date.now() >= deadline) return { ...result, status: "timeout" };
-    await setTimeout$1(1e3);
-  }
-}
-
-function parseCreditUnits(value) {
-  const match = /^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/.exec(value);
-  if (!match) {
-    throw new Error(
-      `Invalid credit limit: "${value}". Use a non-negative amount with at most two decimals.`
-    );
-  }
-  const whole = Number(match[1]);
-  const fraction = Number((match[2] ?? "").padEnd(2, "0"));
-  const units = whole * 100 + fraction;
-  if (!Number.isSafeInteger(units)) {
-    throw new Error(`Credit limit is too large: "${value}".`);
-  }
-  return units;
-}
-
-async function qualityCommand(context, input) {
-  const timeout = input.action === "decide" ? 300 : z.coerce.number().int().min(1).max(3600).parse(input.options.timeout);
-  const url = `${context.host}/api/cli/${context.projectId}/quality`;
-  const post = (path, body) => requestCliJson(`${url}/${path}`, {
-    method: "POST",
+function administrationRequest(ctx, path, method = "GET", body) {
+  return requestCliJson(`${ctx.host}/api/cli/${path}`, {
+    method,
     headers: {
-      Authorization: `Bearer ${context.accessToken}`,
+      Authorization: `Bearer ${ctx.accessToken}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify(body)
+    ...body === void 0 ? {} : { body: JSON.stringify(body) }
   });
-  let result;
-  if (input.action === "decide") {
-    const body = z.object({ decisions: z.array(reviewDecisionInput).min(1).max(100) }).strict().parse(JSON.parse(await readFile(input.file, "utf8")));
-    result = z.object({
-      results: z.array(
-        z.object({ status: z.enum(["saved", "error"]) }).passthrough()
-      )
-    }).passthrough().parse(await post("decisions", body));
-  } else if (input.action === "show" || input.action === "retry") {
-    if (input.action === "retry")
-      await post(`runs/${z.string().uuid().parse(input.runId)}/retry`, {});
-    result = await inspectQualityRun(
-      context,
-      input.runId,
-      input.options.wait ?? false,
-      timeout
-    );
-  } else {
-    const options = input.options;
-    const selection = reviewSelection.parse({
-      jobId: options.job,
-      keys: options.key,
-      namespaces: options.namespace,
-      keyIds: options.keyId.length ? options.keyId : void 0,
-      translationIds: options.translationId.length ? options.translationId : void 0,
-      languages: options.languages?.split(",").map((code) => code.trim()),
-      source: options.source,
-      model: options.model,
-      recheck: options.recheck
+}
+
+function parseGlossaryTranslations(items) {
+  const translations = {};
+  for (const item of items) {
+    const separator = item.indexOf("=");
+    if (separator < 1 || !item.slice(0, separator).trim())
+      throw new Error("Use --translation language=value.");
+    const code = item.slice(0, separator).trim();
+    if (Object.hasOwn(translations, code))
+      throw new Error(`Duplicate --translation for ${code}.`);
+    Object.defineProperty(translations, code, {
+      value: item.slice(separator + 1),
+      enumerable: true,
+      configurable: true,
+      writable: true
     });
-    if (options.estimate)
-      result = z.record(z.unknown()).parse(await post("estimate", selection));
-    else {
-      if (options.maxCredits === void 0)
-        throw new Error(
-          "Review submission requires --max-credits. Use --estimate first; review does not apply corrections or approve text."
-        );
-      const requestId = z.string().uuid().parse(options.requestId ?? randomUUID());
-      process.stderr.write(
-        `Review request ID: ${requestId}. Reuse --request-id with identical arguments if submission is interrupted.
-`
-      );
-      const receipt = z.object({
-        runId: z.string().uuid(),
-        requestId: z.string().uuid(),
-        creditUnits: z.number()
-      }).parse(
-        await post("runs", {
-          ...selection,
-          requestId,
-          maxCreditUnits: parseCreditUnits(options.maxCredits)
-        })
-      );
-      result = options.wait ? await inspectQualityRun(context, receipt.runId, true, timeout) : {
-        version: 1,
-        command: "quality",
-        status: "started",
-        run_id: receipt.runId,
-        request_id: receipt.requestId,
-        credit_units: receipt.creditUnits,
-        next_actions: [
-          {
-            command: [
-              "babli",
-              "quality",
-              "show",
-              receipt.runId,
-              "--wait",
-              "--json"
-            ],
-            paid: false
-          }
-        ]
-      };
-    }
   }
-  console.info(JSON.stringify(result, null, 2));
-  const decisions = z.array(z.object({ status: z.string() })).safeParse(result.results);
-  return result.status === "failed" || result.status === "timeout" || decisions.success && decisions.data.some((item) => item.status === "error") ? 2 : 0;
+  return translations;
 }
 
-function registerQualityCommands(program, run, withGlobalOptions) {
-  const quality = program.command("quality").description(
-    "Review existing translations and record agent decisions; approval remains separate"
-  );
-  const collect = (value, values) => [...values, value];
-  withGlobalOptions(quality.command("check")).description(
-    "Estimate or submit one-model review; never generates missing text"
-  ).option(
-    "--job <id>",
-    "Review the exact key/language pairs from a translation job"
-  ).option("--key <pattern>", "Namespaced key glob (repeatable)", collect, []).option("--namespace <pattern>", "Namespace glob (repeatable)", collect, []).option("--key-id <id>", "Key UUID (repeatable)", collect, []).option(
-    "--translation-id <id>",
-    "Exact translation UUID (repeatable)",
-    collect,
-    []
-  ).option("--languages <codes>", "Target language codes (comma-separated)").option("--source <code>", "Declared source language").option(
-    "--model <model>",
-    "One configured reviewer: gpt-4.1 | gemini-3.1-pro | gemini-3-flash",
-    "gpt-4.1"
-  ).option(
-    "--recheck <result-id>",
-    "Recheck one result with current inputs and saved clarifications"
-  ).option("--estimate", "Inspect scope and price without spending").option(
-    "--request-id <uuid>",
-    "Reuse the original request ID after an uncertain submission"
-  ).option(
-    "--max-credits <amount>",
-    "Maximum authorized charge; required to submit"
-  ).option("--wait", "Wait for review completion").option("--timeout <seconds>", "Maximum wait time", "300").action(
-    async (options) => run({ action: "check", options })
-  );
-  for (const action of ["show", "retry"])
-    withGlobalOptions(quality.command(action)).argument("<run-id>").description(
-      action === "show" ? "Inspect reports, coverage, decisions and freshness" : "Retry failed execution once without another customer charge"
-    ).option("--wait", "Wait for completion").option("--timeout <seconds>", "Maximum wait time", "300").action(
-      async (runId, options) => run({ action, runId, options })
+function printJson(value) {
+  console.info(JSON.stringify(value, null, 2));
+}
+
+async function readMutuallyExclusiveValue(input) {
+  if (input.direct !== void 0 && input.file !== void 0) {
+    throw new Error(
+      `Use either ${input.directName} or ${input.fileName}, not both.`
     );
-  withGlobalOptions(quality.command("decide")).description(
-    "Record apply/dismiss/clarify/defer actions; never starts a paid recheck"
-  ).requiredOption(
-    "--file <path>",
-    "JSON file containing decisions with request IDs and expected revisions"
-  ).action(
-    async (options) => run({ action: "decide", file: options.file })
-  );
+  }
+  if (input.direct !== void 0) {
+    return input.direct;
+  }
+  if (input.file === void 0) {
+    if (input.required) {
+      throw new Error(`Provide ${input.directName} or ${input.fileName}.`);
+    }
+    return void 0;
+  }
+  if (input.file === "-") {
+    if (stdin.isTTY && input.flags.noInteraction) {
+      throw new Error(
+        `${input.fileName} - would read from an interactive terminal.`
+      );
+    }
+    return readStdin();
+  }
+  return fs__default.readFile(input.file, "utf8");
+}
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
-const nodeParts = process.versions.node.split(".").map(Number);
-const major = nodeParts[0] ?? 0;
-const minor = nodeParts[1] ?? 0;
-if (major < 20 || major === 20 && minor < 11) {
-  console.error(
-    "\x1B[31mError: Babli CLI requires Node.js version 20.11 or higher\x1B[0m"
-  );
-  console.error(`Current version: ${process.versions.node}`);
-  process.exit(1);
+function resolveGlossaryScope(ctx, options) {
+  if (options.project !== void 0 && options.organization !== void 0)
+    throw new Error("Use either --project or --organization, not both.");
+  if (options.organization !== void 0) {
+    if (!options.organization.trim())
+      throw new Error("Organization id cannot be blank.");
+    return new URLSearchParams({ organizationId: options.organization });
+  }
+  const projectId = options.project ?? ctx.projectId;
+  if (!projectId?.trim())
+    throw new Error(
+      "Provide --project, --organization, or a babli.json project."
+    );
+  return new URLSearchParams({ projectId });
+}
+
+async function writeJsonFile(filename, value) {
+  const output = path.resolve(filename);
+  const temporary = `${output}.${randomUUID()}.tmp`;
+  try {
+    await fs$1.writeFile(temporary, `${JSON.stringify(value, null, 2)}
+`, {
+      flag: "wx"
+    });
+    await fs$1.rename(temporary, output);
+  } finally {
+    await fs$1.rm(temporary, { force: true });
+  }
+  return output;
+}
+
+async function glossaryCommand(ctx, input) {
+  const { action, options } = input;
+  const query = resolveGlossaryScope(ctx, options);
+  const base = `glossary?${query}`;
+  let result;
+  let status = "ok";
+  switch (action) {
+    case "list": {
+      if (options.includeInherited) query.set("includeInherited", "true");
+      result = await administrationRequest(
+        ctx,
+        `glossary?${query}`
+      );
+      break;
+    }
+    case "get": {
+      result = await administrationRequest(
+        ctx,
+        `glossary/${encodeURIComponent(unwrap(input.id))}?${query}`
+      );
+      break;
+    }
+    case "upsert":
+    case "update": {
+      const fields = {
+        term: options.term,
+        sourceLanguageCode: options.sourceLanguage,
+        description: options.description,
+        translations: options.translation === void 0 ? void 0 : parseGlossaryTranslations(options.translation),
+        ...action === "update" ? { removeTranslations: options.removeTranslation } : {}
+      };
+      const body = action === "upsert" ? glossaryUpsertSchema.parse(fields) : glossaryUpdateSchema.parse(fields);
+      const path = action === "upsert" ? base : `glossary/${encodeURIComponent(unwrap(input.id))}?${query}`;
+      result = await administrationRequest(
+        ctx,
+        path,
+        action === "upsert" ? "PUT" : "PATCH",
+        body
+      );
+      status = "updated";
+      break;
+    }
+    case "remove": {
+      result = await administrationRequest(
+        ctx,
+        `glossary/${encodeURIComponent(unwrap(input.id))}?${query}`,
+        "DELETE"
+      );
+      status = "removed";
+      break;
+    }
+    case "move-to-organization": {
+      if (!query.has("projectId"))
+        throw new Error(
+          "Moving a term requires --project or a babli.json project."
+        );
+      result = await administrationRequest(
+        ctx,
+        `glossary/${encodeURIComponent(unwrap(input.id))}/move-to-organization?${query}`,
+        "POST"
+      );
+      status = "moved";
+      break;
+    }
+    case "export": {
+      const { terms } = await administrationRequest(
+        ctx,
+        base
+      );
+      const file = glossaryFileSchema.parse({
+        version: 1,
+        terms: terms.map(
+          ({ term, sourceLanguageCode, description, translations }) => ({
+            term,
+            sourceLanguageCode,
+            description,
+            translations
+          })
+        )
+      });
+      const output = await writeJsonFile(unwrap(options.output), file);
+      result = { output, count: terms.length };
+      status = "exported";
+      break;
+    }
+    case "import": {
+      const text = await readMutuallyExclusiveValue({
+        file: unwrap(options.file),
+        directName: "--file",
+        fileName: "--file",
+        flags: ctx.flags,
+        required: true
+      });
+      const file = glossaryFileSchema.parse(
+        JSON.parse(unwrap(text))
+      );
+      result = await administrationRequest(
+        ctx,
+        `glossary/import?${query}`,
+        "POST",
+        { file, dryRun: options.dryRun === true }
+      );
+      status = options.dryRun ? "dry_run" : "imported";
+      break;
+    }
+    default:
+      assertNever$1(action);
+  }
+  if (ctx.flags.json) {
+    printJson({
+      version: 1,
+      command: `glossary_${action.replaceAll("-", "_")}`,
+      status,
+      ...result
+    });
+  } else if ("terms" in result) {
+    const terms = result.terms;
+    if (!terms.length) console.info("No glossary terms found.");
+    for (const term of terms)
+      console.info(
+        `${term.id} [${term.projectId ? `project:${term.projectId}` : `organization:${term.organizationId}`}] ${term.term} (${term.sourceLanguageCode}) ${JSON.stringify(term.translations)}${term.description ? ` \u2014 ${term.description}` : ""}`
+      );
+  } else console.info(JSON.stringify(result, null, 2));
 }
 
 const Reset = "\x1B[0m";
@@ -1940,14 +2001,14 @@ function gatherServerKeys({
       if (mergedKeysByKey[serverKey.key].translations[lang]) {
         mergedKeysByKey[serverKey.key].translations[lang].server = {
           id: translation.id,
-          approved: translation.approved,
+          quality: translation.quality,
           currentValue: translation.currentVersion.value
         };
       } else {
         mergedKeysByKey[serverKey.key].translations[lang] = {
           server: {
             id: translation.id,
-            approved: translation.approved,
+            quality: translation.quality,
             currentValue: translation.currentVersion.value
           }
         };
@@ -2448,7 +2509,6 @@ async function prepareFilesToPull({
   mergedKeysByKeyByNamespace,
   translationFilesConfig,
   allLanguages,
-  onlyApproved,
   emptyValueString,
   selectedKeys,
   allFilesByPattern,
@@ -2552,7 +2612,7 @@ async function prepareFilesToPull({
         );
         if (path === null) continue;
         const translation = key.translations[remoteLanguage]?.server;
-        const value = !translation ? void 0 : onlyApproved && !translation.approved ? null : translation.currentValue;
+        const value = translation?.currentValue;
         if (value === void 0 && !config.pullWithEmptyValues) continue;
         const output = ensureFile(path);
         output.serverWrote = true;
@@ -2949,22 +3009,6 @@ Different translations were found on server and local:`);
   return result;
 }
 
-async function applyPullPlan(files, writeFile, removeFile) {
-  assertNoPullPathCollisions(files);
-  const written = /* @__PURE__ */ new Set();
-  for (const [file, content] of Object.entries(files)) {
-    if (content !== null) {
-      await writeFile(file, content);
-      written.add(normalizePullPath(file));
-    }
-  }
-  for (const [file, content] of Object.entries(files)) {
-    if (content === null && !written.has(normalizePullPath(file))) {
-      await removeFile(file);
-    }
-  }
-}
-
 function filterRecord(record, selectedKeys) {
   const result = {};
   for (const [comparisonKey, key] of Object.entries(record)) {
@@ -3038,6 +3082,93 @@ function filterComparisonBySelectedKeys(comparison, selectedKeys) {
   };
 }
 
+async function applyPullPlan(files, writeFile, removeFile) {
+  assertNoPullPathCollisions(files);
+  const written = /* @__PURE__ */ new Set();
+  for (const [file, content] of Object.entries(files)) {
+    if (content !== null) {
+      await writeFile(file, content);
+      written.add(normalizePullPath(file));
+    }
+  }
+  for (const [file, content] of Object.entries(files)) {
+    if (content === null && !written.has(normalizePullPath(file))) {
+      await removeFile(file);
+    }
+  }
+}
+
+function computePullResult(input) {
+  const result = {
+    addedTranslations: [],
+    updatedTranslations: [],
+    removedTranslations: [],
+    remainingMissingTranslations: [],
+    removedKeys: input.removedKeys,
+    changedFiles: input.changedFiles
+  };
+  const namespaces = /* @__PURE__ */ new Set([
+    ...Object.keys(input.before),
+    ...Object.keys(input.after)
+  ]);
+  for (const namespace of namespaces) {
+    const before = input.before[namespace] ?? {};
+    const after = input.after[namespace] ?? {};
+    for (const key of /* @__PURE__ */ new Set([
+      ...Object.keys(before),
+      ...Object.keys(after)
+    ])) {
+      const original = before[key];
+      const pulled = after[key];
+      const languages = /* @__PURE__ */ new Set([
+        ...Object.keys(original?.translations ?? {}),
+        ...Object.keys(pulled?.translations ?? {})
+      ]);
+      for (const language of languages) {
+        const previous = original?.translations[language]?.local?.value;
+        const current = pulled?.translations[language]?.local?.value;
+        const translation = { key, namespace, language };
+        if (previous == null && current != null)
+          result.addedTranslations.push(translation);
+        else if (previous != null && current == null)
+          result.removedTranslations.push(translation);
+        else if (previous !== current && current != null)
+          result.updatedTranslations.push(translation);
+      }
+      if (!original?.server || input.selectedKeys && !input.selectedKeys.has(getComparisonKey({ key, namespace })))
+        continue;
+      const expectedLanguages = /* @__PURE__ */ new Set();
+      for (const config of input.translationFilesConfig) {
+        const remoteToLocal = invertMap(config.mapLocalToRemote);
+        const localLanguages = config.languages ?? input.languages.map(
+          (language) => remoteToLocal[language] ?? language
+        );
+        for (const localLanguage of localLanguages) {
+          const matches = config.transform ? config.namespace === namespace : resolveTranslationPath(
+            config,
+            { ...original.server },
+            localLanguage
+          ) !== null;
+          if (matches)
+            expectedLanguages.add(
+              config.mapLocalToRemote?.[localLanguage] ?? localLanguage
+            );
+        }
+      }
+      for (const language of expectedLanguages) {
+        if (pulled?.translations[language]?.local?.value == null) {
+          result.remainingMissingTranslations.push({
+            key,
+            namespace,
+            language
+          });
+        }
+      }
+    }
+  }
+  return result;
+}
+
 async function confirmLocalOnlyRemoval(removedKeys, prompt) {
   const preview = removedKeys.slice(0, 5);
   const remaining = removedKeys.length - preview.length;
@@ -3058,12 +3189,12 @@ async function pullTransformFiles({
   transforms,
   mergedKeysByKeyByNamespace,
   allLanguages,
-  onlyApproved,
   selectedKeys,
   fileAPI,
   cwd
 }) {
   const filesToPull = {};
+  const previousContents = {};
   for (const config of transformConfigs) {
     const namespace = exists(config.namespace, "Transform must have namespace");
     const transform = exists(
@@ -3087,7 +3218,7 @@ async function pullTransformFiles({
         const translation = universalKey.translations[remote];
         const isSelectedForPull = !selectedKeys || selectedKeys.has(getComparisonKey({ key, namespace }));
         const hasServerKey = universalKey.server != null;
-        const serverValue = onlyApproved ? translation?.server?.approved ? translation?.server?.currentValue : null : translation?.server?.currentValue;
+        const serverValue = translation?.server?.currentValue;
         const value = isSelectedForPull && (!selectedKeys || hasServerKey) ? serverValue ?? translation?.local?.value : translation?.local?.value;
         if (value != null) {
           translations[local][key] = value;
@@ -3101,6 +3232,7 @@ async function pullTransformFiles({
       currentContent = await fileAPI.readFile(fullPath);
     } catch {
     }
+    previousContents[pathPattern] = currentContent;
     try {
       filesToPull[pathPattern] = transform.pull(translations, currentContent);
     } catch (err) {
@@ -3109,7 +3241,67 @@ async function pullTransformFiles({
       );
     }
   }
-  return filesToPull;
+  return { files: filesToPull, previousContents };
+}
+
+async function readPullOutput(input) {
+  const contents = new Map(
+    Object.values(input.allFilesByPattern).flatMap(
+      (files) => files.map((file) => [file.path, file.content])
+    )
+  );
+  for (const [path, content] of Object.entries(input.previousContents)) {
+    if (content !== null) contents.set(path, content);
+  }
+  const changedFiles = [];
+  for (const [path, content] of Object.entries(input.files)) {
+    if (content === null) {
+      if (contents.delete(path)) changedFiles.push(path);
+    } else {
+      if (contents.get(path) !== content) changedFiles.push(path);
+      contents.set(path, content);
+    }
+  }
+  const fileAPI = {
+    async readFile(path) {
+      const content = contents.get(path);
+      if (content === void 0)
+        throw new Error(`Pull output not found: ${path}`);
+      return content;
+    },
+    async fileExists(path) {
+      return contents.has(path);
+    },
+    async glob(pattern) {
+      return [...contents.keys()].filter((path) => minimatch$1(path, pattern));
+    }
+  };
+  const { mergedKeysByKeyByNamespace } = await gatherLocalKeys({
+    allFilesByPattern: await gatherLocalFiles(
+      input.translationFilesConfig,
+      fileAPI
+    ),
+    keySeparator: input.keySeparator,
+    emptyValueString: input.emptyValueString
+  });
+  const transformConfigs = input.translationFilesConfig.filter(
+    (config) => config.transform
+  );
+  if (transformConfigs.length > 0) {
+    const transformed = await gatherTransformKeys({
+      transformConfigs,
+      transforms: input.transforms,
+      fileAPI,
+      emptyValueString: input.emptyValueString
+    });
+    for (const [namespace, keys] of Object.entries(
+      transformed.mergedKeysByKeyByNamespace
+    )) {
+      mergedKeysByKeyByNamespace[namespace] ?? (mergedKeysByKeyByNamespace[namespace] = {});
+      Object.assign(mergedKeysByKeyByNamespace[namespace], keys);
+    }
+  }
+  return { keys: mergedKeysByKeyByNamespace, changedFiles };
 }
 
 const MATCH_OPTS = { nocomment: true, dot: true };
@@ -3185,6 +3377,87 @@ function resolveSelectedKeys(requestedKeys, mergedKeysByKeyByNamespace, requeste
   return selected;
 }
 
+async function pullTranslations(input) {
+  const { options, mergedKeysByKeyByNamespace } = input;
+  let selectedKeys = options.selectedKeys;
+  if (!selectedKeys && ((options.keys?.length ?? 0) > 0 || (options.namespaces?.length ?? 0) > 0)) {
+    selectedKeys = resolveSelectedKeys(
+      options.keys ?? [],
+      mergedKeysByKeyByNamespace,
+      options.namespaces ?? []
+    );
+  }
+  if (options.onlyExisting) {
+    const localKeys = /* @__PURE__ */ new Set();
+    for (const keys of Object.values(mergedKeysByKeyByNamespace)) {
+      for (const key of Object.values(keys)) {
+        if (key.local) localKeys.add(getComparisonKey(key));
+      }
+    }
+    selectedKeys = selectedKeys ? new Set([...selectedKeys].filter((key) => localKeys.has(key))) : localKeys;
+  }
+  const preparePull = (keepLocalOnly) => prepareFilesToPull({
+    mergedKeysInLocalOrder: input.mergedKeysInLocalOrder,
+    mergedKeysByKeyByNamespace,
+    translationFilesConfig: input.translationFilesConfig,
+    allLanguages: input.projectInfo.languages,
+    emptyValueString: input.emptyValueString,
+    selectedKeys,
+    allFilesByPattern: input.allFilesByPattern,
+    keepLocalOnly
+  });
+  let plan = await preparePull(options.keepLocalOnly ?? false);
+  if (plan.removedKeys.length > 0 && !await confirmLocalOnlyRemoval(plan.removedKeys, input.prompt)) {
+    plan = await preparePull(true);
+  }
+  const transformed = input.transformConfigs.length > 0 && input.fileAPI ? await pullTransformFiles({
+    transformConfigs: input.transformConfigs,
+    transforms: input.transforms,
+    mergedKeysByKeyByNamespace,
+    allLanguages: input.projectInfo.languages,
+    selectedKeys,
+    fileAPI: input.fileAPI,
+    cwd: input.cwd
+  }) : { files: {}, previousContents: {} };
+  const files = { ...plan.files, ...transformed.files };
+  const reportConfigs = [
+    ...input.translationFilesConfig.filter(
+      (config) => !config.transform && !input.transformConfigs.some(
+        (transform) => transform.path === config.path
+      )
+    ),
+    ...input.transformConfigs.map((config) => ({
+      ...config,
+      transform: config.transform ?? config.path
+    }))
+  ];
+  const output = await readPullOutput({
+    files,
+    previousContents: transformed.previousContents,
+    allFilesByPattern: input.allFilesByPattern,
+    translationFilesConfig: reportConfigs,
+    transforms: input.transforms,
+    keySeparator: input.projectInfo.keySeparator,
+    emptyValueString: input.emptyValueString
+  });
+  const result = computePullResult({
+    before: mergedKeysByKeyByNamespace,
+    after: output.keys,
+    translationFilesConfig: reportConfigs,
+    languages: input.projectInfo.languages.map((language) => language.code),
+    selectedKeys,
+    removedKeys: plan.removedKeys,
+    changedFiles: output.changedFiles
+  });
+  await applyPullPlan(files, input.writeFile, input.removeFile);
+  if (plan.removedKeys.length > 0) {
+    greenInfo(
+      `\u2713 Removed ${plan.removedKeys.length} local key${plan.removedKeys.length !== 1 ? "s" : ""} not on the server`
+    );
+  }
+  return result;
+}
+
 async function runCli({
   cliInput,
   allFilesByPattern,
@@ -3234,62 +3507,6 @@ async function runCli({
     }
   }
   let pullResult;
-  async function pull(pullOptions) {
-    let selectedKeys2 = pullOptions?.selectedKeys;
-    if (!selectedKeys2 && (pullOptions?.keys && pullOptions.keys.length > 0 || pullOptions?.namespaces && pullOptions.namespaces.length > 0)) {
-      selectedKeys2 = resolveSelectedKeys(
-        pullOptions.keys ?? [],
-        mergedKeysByKeyByNamespace,
-        pullOptions.namespaces ?? []
-      );
-    }
-    if (pullOptions?.onlyExisting) {
-      const localKeys = /* @__PURE__ */ new Set();
-      for (const keys of Object.values(mergedKeysByKeyByNamespace)) {
-        for (const key of Object.values(keys)) {
-          if (key.local) localKeys.add(getComparisonKey(key));
-        }
-      }
-      selectedKeys2 = selectedKeys2 ? new Set([...selectedKeys2].filter((k) => localKeys.has(k))) : localKeys;
-    }
-    const preparePull = (keepLocalOnly) => prepareFilesToPull({
-      mergedKeysInLocalOrder,
-      mergedKeysByKeyByNamespace,
-      translationFilesConfig,
-      allLanguages: projectInfo.languages,
-      onlyApproved: pullOptions?.onlyApproved ?? false,
-      emptyValueString,
-      selectedKeys: selectedKeys2,
-      allFilesByPattern,
-      keepLocalOnly
-    });
-    let plan = await preparePull(pullOptions?.keepLocalOnly ?? false);
-    if (plan.removedKeys.length > 0 && !await confirmLocalOnlyRemoval(plan.removedKeys, prompt)) {
-      plan = await preparePull(true);
-    }
-    await applyPullPlan(plan.files, writeFile, removeFile);
-    if (plan.removedKeys.length > 0) {
-      greenInfo(
-        `\u2713 Removed ${plan.removedKeys.length} local key${plan.removedKeys.length !== 1 ? "s" : ""} not on the server`
-      );
-    }
-    pullResult = { removedKeys: plan.removedKeys };
-    if (hasTransforms) {
-      const transformFiles = await pullTransformFiles({
-        transformConfigs,
-        transforms,
-        mergedKeysByKeyByNamespace,
-        allLanguages: projectInfo.languages,
-        onlyApproved: pullOptions?.onlyApproved ?? false,
-        selectedKeys: selectedKeys2,
-        fileAPI,
-        cwd
-      });
-      for (const [file, content] of Object.entries(transformFiles)) {
-        await writeFile(file, content);
-      }
-    }
-  }
   gatherServerKeys({
     allServerKeys,
     mergedKeysByKeyByNamespace,
@@ -3368,7 +3585,22 @@ async function runCli({
     );
   }
   if (cliInput.action === "pull") {
-    await pull({ ...cliInput.options, selectedKeys });
+    pullResult = await pullTranslations({
+      options: { ...cliInput.options, selectedKeys },
+      mergedKeysInLocalOrder,
+      mergedKeysByKeyByNamespace,
+      translationFilesConfig,
+      projectInfo,
+      emptyValueString,
+      allFilesByPattern,
+      prompt,
+      writeFile,
+      removeFile,
+      transformConfigs,
+      transforms,
+      fileAPI,
+      cwd
+    });
   }
   return {
     comparison: scopedComparison,
@@ -3379,17 +3611,6 @@ async function runCli({
     mergedKeysByKeyByNamespace
   };
 }
-
-const agentTranslationGuidance = `Agents must prepare descriptions before translation.
-1. Push new keys and source changes first: babli push --json --no-interaction.
-2. Export current context: babli key export --language <source-code> --output keys.json.
-3. Inspect code usages for the keys you will translate. Keep useful descriptions;
-   draft missing or outdated descriptions with meaning and placeholder context.
-4. Check and save drafts: babli key update --file descriptions.json --dry-run,
-   then babli key update --file descriptions.json. Resolve conflicts first.
-5. Estimate, translate, and pull only keys with prepared descriptions.
-Record unclear keys as unresolved; leave them out of translation until clarified.
-Use sync-and-translate only after descriptions cover its selected keys and source changes.`;
 
 async function fetchKeyInLoop(host, requestCode) {
   const res = await requestCliJson(
@@ -3404,7 +3625,7 @@ async function fetchKeyInLoop(host, requestCode) {
   throw new Error("Unexpected status");
 }
 
-const keyFilePath = path.join(import.meta.dirname, "babli_k");
+const keyFilePath = path$1.join(import.meta.dirname, "babli_k");
 async function loadKeyOrTokenFile() {
   const apiKey = process.env.BABLI_API_KEY;
   if (apiKey) {
@@ -3451,6 +3672,827 @@ const CliFileApi = {
     return glob(pattern, { cwd: options?.cwd, posix: true });
   }
 };
+
+async function fetchServerKeys(host, projectId, accessToken) {
+  return requestCliJson(`${host}/api/cli/${projectId}/allKeys`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+}
+async function fetchProjectInfo(host, projectId, accessToken) {
+  const result = await requestCliJson(
+    `${host}/api/cli/${projectId}/project`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      }
+    }
+  );
+  return result.project;
+}
+async function getCliProject(host, projectId, accessToken) {
+  return fetchCliJson(`${host}/api/cli/${projectId}/project`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+}
+async function requestTranslation(host, projectId, accessToken, keys, model = "production", maxCreditUnits, quality) {
+  return requestCliJson(
+    `${host}/api/cli/${projectId}/translate`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        keys,
+        model,
+        maxCreditUnits,
+        ...qualityFields(quality)
+      })
+    }
+  );
+}
+async function estimateTranslation(host, projectId, accessToken, keys, model = "production", quality) {
+  return requestCliJson(
+    `${host}/api/cli/${projectId}/estimate`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ keys, model, ...qualityFields(quality) })
+    }
+  );
+}
+function qualityFields(quality) {
+  return {
+    ...quality?.primaryLanguage ? { primaryLanguage: quality.primaryLanguage } : {},
+    ...quality?.referenceMode ? { referenceMode: quality.referenceMode } : {},
+    ...quality?.replaceExisting ? { replaceExisting: true } : {}
+  };
+}
+async function fetchJobStatus(host, projectId, accessToken, jobId) {
+  const result = await requestCliJson(`${host}/api/cli/${projectId}/job/${jobId}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+  return { ...result, failures: result.failures ?? [] };
+}
+async function fetchQuestions(host, projectId, accessToken, scope) {
+  const json = await requestCliJson(
+    `${host}/api/cli/${projectId}/questions${scope ? `?scope=${encodeURIComponent(JSON.stringify(scope))}` : ""}`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }
+  );
+  if (scope && json.scopeVersion !== 1)
+    throw new CliRequestError({
+      code: "unsupported_question_scope",
+      message: "This server does not support scoped question inspection. Update the server before trusting job-scoped follow-up."
+    });
+  return json.questions;
+}
+async function submitAnswers(host, projectId, accessToken, answers) {
+  return requestCliJson(`${host}/api/cli/${projectId}/answers`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ answers })
+  });
+}
+async function fetchPendingReviews(host, projectId, accessToken) {
+  const json = await requestCliJson(
+    `${host}/api/cli/${projectId}/pendingReviews`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }
+  );
+  return json.pending;
+}
+async function pingServer(host, cliVersion) {
+  let json;
+  try {
+    json = await requestCliJson(`${host}/api/cli/ping`);
+  } catch (error) {
+    if (error instanceof CliRequestError && error.httpStatus !== void 0) {
+      console.error(`Could not connect to server at ${host}`);
+      process.exit(1);
+    }
+    throw error;
+  }
+  const baseVersion = (v) => v.replace(/[-+].*$/, "");
+  if (baseVersion(json.cliVersion) !== baseVersion(cliVersion)) {
+    console.warn(
+      `Your CLI version is different from the server version, please update. Your version is ${cliVersion}, but the server is ${json.cliVersion}.`
+    );
+  }
+  return json;
+}
+async function listCliKeys(host, projectId, accessToken, options) {
+  const searchParams = new URLSearchParams();
+  if (options.includeArchived) {
+    searchParams.set("includeArchived", "true");
+  }
+  if (options.query) {
+    searchParams.set("query", options.query);
+  }
+  const suffix = searchParams.size ? `?${searchParams.toString()}` : "";
+  return fetchCliJson(`${host}/api/cli/${projectId}/keys${suffix}`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+}
+async function getCliKey(host, projectId, accessToken, input) {
+  return postCliJson(
+    `${host}/api/cli/${projectId}/keys/get`,
+    accessToken,
+    input
+  );
+}
+async function addCliKey(host, projectId, accessToken, input) {
+  return postCliJson(`${host}/api/cli/${projectId}/keys`, accessToken, input);
+}
+async function updateCliKey(host, projectId, accessToken, input) {
+  return patchCliJson(
+    `${host}/api/cli/${projectId}/keys/update`,
+    accessToken,
+    input
+  );
+}
+async function renameCliKey(host, projectId, accessToken, input) {
+  return patchCliJson(
+    `${host}/api/cli/${projectId}/keys/rename`,
+    accessToken,
+    input
+  );
+}
+async function archiveCliKey(host, projectId, accessToken, input) {
+  return postCliJson(
+    `${host}/api/cli/${projectId}/keys/archive`,
+    accessToken,
+    input
+  );
+}
+async function unarchiveCliKey(host, projectId, accessToken, input) {
+  return postCliJson(
+    `${host}/api/cli/${projectId}/keys/unarchive`,
+    accessToken,
+    input
+  );
+}
+async function upsertCliTranslation(host, projectId, accessToken, input) {
+  return postCliJson(
+    `${host}/api/cli/${projectId}/translations/upsert`,
+    accessToken,
+    input
+  );
+}
+async function listCliOrganizations(host, accessToken) {
+  return fetchCliJson(`${host}/api/cli/organizations`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+}
+async function createCliProject(host, accessToken, input) {
+  return postCliJson(`${host}/api/cli/projects`, accessToken, input);
+}
+async function postCliJson(url, accessToken, body) {
+  return fetchCliJson(url, {
+    body: JSON.stringify(body),
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    method: "POST"
+  });
+}
+async function patchCliJson(url, accessToken, body) {
+  return fetchCliJson(url, {
+    body: JSON.stringify(body),
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    method: "PATCH"
+  });
+}
+async function fetchCliJson(url, init) {
+  return requestCliJson(url, init);
+}
+
+async function humanReviewCommand(input) {
+  const parsed = await loadConfigFile(CliFileApi);
+  if (!parsed) throw new Error("No babli.json in this directory.");
+  const accessToken = await loadKeyOrTokenFile();
+  const host = parsed.host ?? defaultHost;
+  const projectId = parsed.projectId;
+  if (input.action === "status") {
+    const result2 = await requestCliJson(
+      `${host}/api/cli/${projectId}/human-review/status?invitationId=${encodeURIComponent(input.invitationId)}`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    console.info(JSON.stringify(result2, null, 2));
+    return 0;
+  }
+  const translationIds = await resolveTranslationIds(
+    host,
+    projectId,
+    accessToken,
+    input.options
+  );
+  const requestId = input.options.requestId ?? randomUUID();
+  const result = await requestCliJson(
+    `${host}/api/cli/${projectId}/human-review/request`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        requestId,
+        reason: input.options.reason,
+        translationIds,
+        sourceLanguageCode: input.options.source
+      })
+    }
+  );
+  if (input.options.json) console.info(JSON.stringify(result, null, 2));
+  else {
+    const receipt = result;
+    console.info(`Review link: ${receipt.url ?? ""}`);
+    console.info(
+      `Subscribers: ${receipt.subscriber_count ?? 0}. Emails queued: ${receipt.notified_count ?? 0}. Languages: ${(receipt.languages ?? []).join(", ")}`
+    );
+    console.info(`Request ID: ${requestId}`);
+  }
+  return 0;
+}
+async function resolveTranslationIds(host, projectId, accessToken, options) {
+  if (options.translationId.length) return options.translationId;
+  if (!options.key.length) {
+    throw new Error(
+      "Pass --translation-id or --key for the wording to review."
+    );
+  }
+  const { keys } = await listCliKeys(host, projectId, accessToken, {
+    includeArchived: false
+  });
+  const wanted = new Set(options.key);
+  const languages = new Set(options.language);
+  const ids = keys.flatMap((key) => {
+    const names = [
+      key.key,
+      key.namespace ? `${key.namespace}:${key.key}` : key.key
+    ];
+    if (!names.some((name) => wanted.has(name))) return [];
+    return key.translations.flatMap((translation) => {
+      const code = translation.language?.code;
+      if (languages.size && (!code || !languages.has(code))) return [];
+      return [translation.id];
+    });
+  });
+  if (!ids.length) {
+    throw new Error(
+      "No matching translations. Check the key name and language code."
+    );
+  }
+  return ids;
+}
+
+async function readMetadataUpdate(options, flags) {
+  if (options.descriptionFile === "-" && options.instructionsFile === "-") {
+    throw new Error("Only one field can read from stdin.");
+  }
+  const fields = {
+    name: options.name,
+    description: options.description,
+    instructions: options.instructions
+  };
+  for (const field of ["description", "instructions"]) {
+    fields[field] = await readMutuallyExclusiveValue({
+      direct: options[field],
+      directName: `--${field}`,
+      file: options[`${field}File`],
+      fileName: `--${field}-file`,
+      flags
+    });
+  }
+  if (fields.name !== void 0 && !fields.name.trim())
+    throw new Error("Name cannot be blank.");
+  if (Object.values(fields).every((value) => value === void 0))
+    throw new Error("Provide at least one field to update.");
+  return fields;
+}
+
+async function organizationCommand(ctx, input) {
+  if (input.action === "list") {
+    const organizations = await listCliOrganizations(ctx.host, ctx.accessToken);
+    if (ctx.flags.json)
+      printJson({
+        version: 1,
+        command: "organization_list",
+        status: "ok",
+        organizations
+      });
+    else
+      for (const org of organizations)
+        console.info(`${org.id} ${org.name} (${org.role})`);
+    return;
+  }
+  const id = input.options.organization;
+  if (!id) throw new Error("Provide --organization.");
+  const body = input.action === "update" ? await readMetadataUpdate(input.options, ctx.flags) : void 0;
+  const result = await administrationRequest(
+    ctx,
+    `organizations/${encodeURIComponent(id)}`,
+    input.action === "get" ? "GET" : "PATCH",
+    body
+  );
+  if (ctx.flags.json)
+    printJson({
+      version: 1,
+      command: `organization_${input.action}`,
+      status: input.action === "get" ? "ok" : "updated",
+      ...result
+    });
+  else
+    console.info(
+      `${result.organization.name}
+id: ${result.organization.id}
+instructions: ${result.organization.instructions}`
+    );
+}
+
+async function projectMetadataCommand(ctx, action, options) {
+  const projectId = options.project ?? ctx.projectId;
+  if (!projectId)
+    throw new Error(
+      "Provide --project or run from a directory with babli.json."
+    );
+  const path = `${encodeURIComponent(projectId)}/project${options.includeInherited ? "?includeInherited=true" : ""}`;
+  const body = action === "update" ? await readMetadataUpdate(options, ctx.flags) : void 0;
+  const result = await administrationRequest(ctx, path, action === "get" ? "GET" : "PATCH", body);
+  if (ctx.flags.json) {
+    printJson({
+      version: 1,
+      command: `project_${action}`,
+      status: action === "get" ? "ok" : "updated",
+      project: result.project
+    });
+    return;
+  }
+  const project = result.project;
+  console.info(
+    `${project.name}
+id: ${project.id}
+description: ${project.description}
+instructions: ${project.instructions}`
+  );
+  if (project.organization) {
+    console.info(
+      `company: ${project.organization.name} (${project.organization.id})
+company instructions: ${project.organization.instructions}
+Project instructions take precedence where they conflict.`
+    );
+  }
+}
+
+const defaultReviewModel = "gemini-4-argon";
+const reviewModel = z.literal(defaultReviewModel);
+
+const reviewSelection = z.object({
+  jobId: z.string().uuid().optional(),
+  keys: z.array(z.string().min(1)).default([]),
+  namespaces: z.array(z.string()).default([]),
+  keyIds: z.array(z.string().uuid()).optional(),
+  translationIds: z.array(z.string().uuid()).optional(),
+  languages: z.array(z.string().min(1)).max(200).optional(),
+  source: z.string().min(1).optional(),
+  type: z.literal("").default(""),
+  model: reviewModel.default(defaultReviewModel),
+  recheck: z.string().uuid().optional()
+}).strict();
+reviewSelection.extend({
+  requestId: z.string().uuid(),
+  maxCreditUnits: z.number().int().nonnegative()
+});
+const reviewFinding = z.object({
+  id: z.string().min(1).max(100),
+  category: z.enum([
+    "format",
+    "meaning",
+    "omission",
+    "addition",
+    "terminology",
+    "grammar",
+    "locale",
+    "style",
+    "ambiguity",
+    "context_conflict"
+  ]),
+  importance: z.enum(["defect", "question", "suggestion"]),
+  explanation: z.string().min(1).max(4e3),
+  evidence: z.array(z.object({ path: z.string().min(1), quote: z.string().min(1) })).min(1).max(12),
+  replacement: z.string().max(32e3).nullable(),
+  question: z.string().max(2e3).nullable()
+}).strict();
+const reviewChecks = z.enum([
+  "meaning",
+  "completeness",
+  "terminology",
+  "fluency",
+  "locale",
+  "requirements"
+]);
+const concernResolution = z.object({
+  concernId: z.string().uuid(),
+  status: z.enum(["resolved", "remains", "needs_context"]),
+  reason: z.string().trim().min(1).max(2e3)
+}).strict();
+const legacyReviewerReport = z.object({
+  resultId: z.string().uuid(),
+  checks: z.array(
+    z.object({
+      check: reviewChecks,
+      result: z.enum(["pass", "finding", "needs_context"]),
+      explanation: z.string().min(1).max(2e3)
+    })
+  ).length(6),
+  findings: z.array(reviewFinding).max(20),
+  concernResolutions: z.array(concernResolution).max(50).optional()
+}).strict();
+z.union([
+  legacyReviewerReport,
+  z.object({
+    resultId: z.string().uuid(),
+    checksCompleted: z.literal(true),
+    findings: z.array(reviewFinding).max(20),
+    concernResolutions: z.array(concernResolution).max(50).optional()
+  }).strict()
+]);
+const reviewDecisionInput = z.object({
+  requestId: z.string().uuid(),
+  resultId: z.string().uuid(),
+  expectedRevision: z.number().int().nonnegative(),
+  inputHash: z.string().length(64),
+  findingIds: z.array(z.string().min(1)).min(1).max(20),
+  action: z.enum(["apply", "dismiss", "clarify", "defer"]),
+  reason: z.string().trim().min(1).max(4e3),
+  evidence: z.array(z.string().min(1).max(2e3)).max(12).default([]),
+  value: z.string().max(32e3).optional(),
+  answer: z.string().trim().min(1).max(4e3).optional()
+}).strict().superRefine((decision, ctx) => {
+  if (decision.action === "apply" && decision.value === void 0)
+    ctx.addIssue({
+      code: "custom",
+      message: "Applying a correction requires the final value."
+    });
+  if (decision.action === "clarify" && !decision.answer)
+    ctx.addIssue({
+      code: "custom",
+      message: "Clarification requires an answer."
+    });
+  if (decision.action !== "apply" && decision.value !== void 0)
+    ctx.addIssue({
+      code: "custom",
+      message: "Only apply accepts replacement wording."
+    });
+  if (decision.action !== "clarify" && decision.answer !== void 0)
+    ctx.addIssue({
+      code: "custom",
+      message: "Only clarify accepts an answer."
+    });
+  if (new Set(decision.findingIds).size !== decision.findingIds.length)
+    ctx.addIssue({ code: "custom", message: "Duplicate finding IDs." });
+});
+
+async function inspectQualityRun(context, runId, wait, timeout) {
+  const id = z.string().uuid().parse(runId);
+  const deadline = Date.now() + z.number().int().min(1).max(3600).parse(timeout) * 1e3;
+  while (true) {
+    const raw = await requestCliJson(
+      `${context.host}/api/cli/${context.projectId}/quality/runs/${id}`,
+      { headers: { Authorization: `Bearer ${context.accessToken}` } }
+    );
+    const result = z.object({ status: z.enum(["running", "complete", "failed"]) }).passthrough().parse(raw);
+    if (!wait || result.status !== "running") return result;
+    if (Date.now() >= deadline) return { ...result, status: "timeout" };
+    await setTimeout$1(1e3);
+  }
+}
+
+function parseCreditUnits(value) {
+  const match = /^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/.exec(value);
+  if (!match) {
+    throw new Error(
+      `Invalid credit limit: "${value}". Use a non-negative amount with at most two decimals.`
+    );
+  }
+  const whole = Number(match[1]);
+  const fraction = Number((match[2] ?? "").padEnd(2, "0"));
+  const units = whole * 100 + fraction;
+  if (!Number.isSafeInteger(units)) {
+    throw new Error(`Credit limit is too large: "${value}".`);
+  }
+  return units;
+}
+
+async function qualityCommand(context, input) {
+  const timeout = input.action === "decide" ? 300 : z.coerce.number().int().min(1).max(3600).parse(input.options.timeout);
+  const url = `${context.host}/api/cli/${context.projectId}/quality`;
+  const post = (path, body) => requestCliJson(`${url}/${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${context.accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  let result;
+  if (input.action === "decide") {
+    const body = z.object({ decisions: z.array(reviewDecisionInput).min(1).max(100) }).strict().parse(JSON.parse(await readFile(input.file, "utf8")));
+    result = z.object({
+      results: z.array(
+        z.object({ status: z.enum(["saved", "error"]) }).passthrough()
+      )
+    }).passthrough().parse(await post("decisions", body));
+  } else if (input.action === "show" || input.action === "retry") {
+    if (input.action === "retry")
+      await post(`runs/${z.string().uuid().parse(input.runId)}/retry`, {});
+    result = await inspectQualityRun(
+      context,
+      input.runId,
+      input.options.wait ?? false,
+      timeout
+    );
+  } else {
+    const options = input.options;
+    const selection = reviewSelection.parse({
+      jobId: options.job,
+      keys: options.key,
+      namespaces: options.namespace,
+      keyIds: options.keyId.length ? options.keyId : void 0,
+      translationIds: options.translationId.length ? options.translationId : void 0,
+      languages: options.languages?.split(",").map((code) => code.trim()),
+      source: options.source,
+      model: options.model,
+      recheck: options.recheck
+    });
+    if (options.estimate)
+      result = z.record(z.unknown()).parse(await post("estimate", selection));
+    else {
+      if (options.maxCredits === void 0)
+        throw new Error(
+          "Review submission requires --max-credits. Use --estimate first; review does not apply corrections or approve text."
+        );
+      const requestId = z.string().uuid().parse(options.requestId ?? randomUUID());
+      process.stderr.write(
+        `Review request ID: ${requestId}. Reuse --request-id with identical arguments if submission is interrupted.
+`
+      );
+      const receipt = z.object({
+        runId: z.string().uuid(),
+        requestId: z.string().uuid(),
+        creditUnits: z.number()
+      }).parse(
+        await post("runs", {
+          ...selection,
+          requestId,
+          maxCreditUnits: parseCreditUnits(options.maxCredits)
+        })
+      );
+      result = options.wait ? await inspectQualityRun(context, receipt.runId, true, timeout) : {
+        version: 1,
+        command: "quality",
+        status: "started",
+        run_id: receipt.runId,
+        request_id: receipt.requestId,
+        credit_units: receipt.creditUnits,
+        next_actions: [
+          {
+            command: [
+              "babli",
+              "quality",
+              "show",
+              receipt.runId,
+              "--wait",
+              "--json"
+            ],
+            paid: false
+          }
+        ]
+      };
+    }
+  }
+  console.info(JSON.stringify(result, null, 2));
+  const decisions = z.array(z.object({ status: z.string() })).safeParse(result.results);
+  return result.status === "failed" || result.status === "timeout" || decisions.success && decisions.data.some((item) => item.status === "error") ? 2 : 0;
+}
+
+function registerAdministrationCommands(program, run, withGlobalOptions) {
+  const organization = program.command("organization").description(
+    "Manage organization metadata and shared translation instructions"
+  );
+  for (const action of ["list", "get", "update"]) {
+    const command = withGlobalOptions(organization.command(action));
+    if (action !== "list")
+      command.requiredOption("--organization <id>", "Organization id");
+    if (action === "update")
+      command.option("--name <name>", "Organization name").option("--instructions <text>", "Shared translation instructions").option(
+        "--instructions-file <path>",
+        "Read shared instructions from a file or - for stdin"
+      );
+    command.action(
+      async (options) => run({ kind: "organization", action, options })
+    );
+  }
+  const glossary = program.command("glossary").description(
+    "Manage project and organization glossary terms; project scope defaults to babli.json"
+  );
+  const collect = (value, values = []) => [...values, value];
+  const withScope = (command) => withGlobalOptions(command).option("--project <id>", "Project id (defaults to babli.json)").option(
+    "--organization <id>",
+    "Organization scope; cannot be combined with --project"
+  );
+  withScope(glossary.command("list")).description("List glossary terms owned by the selected scope").option(
+    "--include-inherited",
+    "Also show organization terms, labeled by scope"
+  ).action(
+    async (options) => run({ kind: "glossary", action: "list", options })
+  );
+  for (const action of ["get", "remove", "move-to-organization"]) {
+    withScope(glossary.command(action)).argument("<term-id>").description(
+      action === "move-to-organization" ? "Move a project term to its organization; fails on conflicts" : `${action === "get" ? "Read" : "Delete"} a term owned by the selected scope`
+    ).action(
+      async (id, options) => run({ kind: "glossary", action, id, options })
+    );
+  }
+  for (const action of ["upsert", "update"]) {
+    const command = withScope(glossary.command(action)).description(
+      action === "upsert" ? "Create or merge a term by term text and source language" : "Patch a term by id; preserves omitted translations"
+    );
+    if (action === "update")
+      command.argument("<term-id>").option("--term <text>", "New term text").option("--source-language <code>", "New source language");
+    else
+      command.requiredOption("--term <text>", "Term text").requiredOption("--source-language <code>", "Source language code");
+    command.option(
+      "--description <text>",
+      "Note for translator; empty string clears it"
+    ).option(
+      "--translation <code=value>",
+      "Set a target translation (repeatable)",
+      collect
+    );
+    if (action === "update") {
+      command.option(
+        "--remove-translation <code>",
+        "Remove a target translation (repeatable)",
+        collect
+      ).action(
+        async (id, options) => run({ kind: "glossary", action, id, options })
+      );
+    } else
+      command.action(
+        async (options) => run({ kind: "glossary", action, options })
+      );
+  }
+  withScope(glossary.command("export")).description("Export owned terms as portable versioned JSON").requiredOption("--output <path>", "Destination JSON file").action(
+    async (options) => run({ kind: "glossary", action: "export", options })
+  );
+  withScope(glossary.command("import")).description(
+    "Atomically merge JSON terms; preserves unrelated terms and translations"
+  ).requiredOption("--file <path>", "JSON file or - for stdin").option("--dry-run", "Validate permissions and file without writing").action(
+    async (options) => run({ kind: "glossary", action: "import", options })
+  );
+}
+
+function registerQualityCommands(program, run, withGlobalOptions) {
+  const quality = program.command("quality").description(
+    "Review existing translations and record agent decisions; a current AI pass approves wording"
+  );
+  const collect = (value, values) => [...values, value];
+  withGlobalOptions(quality.command("check")).description(
+    "Estimate or submit one-model review; never generates missing text"
+  ).option(
+    "--job <id>",
+    "Review the exact key/language pairs from a translation job"
+  ).option("--key <pattern>", "Namespaced key glob (repeatable)", collect, []).option("--namespace <pattern>", "Namespace glob (repeatable)", collect, []).option("--key-id <id>", "Key UUID (repeatable)", collect, []).option(
+    "--translation-id <id>",
+    "Exact translation UUID (repeatable)",
+    collect,
+    []
+  ).option("--languages <codes>", "Target language codes (comma-separated)").option("--source <code>", "Declared source language").addOption(
+    new Option("--model <model>", "Reviewer; 1 credit per batch").choices([defaultReviewModel]).default(defaultReviewModel)
+  ).option(
+    "--recheck <result-id>",
+    "Recheck one result with current inputs and saved clarifications"
+  ).option("--estimate", "Inspect scope and price without spending").option(
+    "--request-id <uuid>",
+    "Reuse the original request ID after an uncertain submission"
+  ).option(
+    "--max-credits <amount>",
+    "Maximum authorized charge; required to submit"
+  ).option("--wait", "Wait for review completion").option("--timeout <seconds>", "Maximum wait time", "300").action(
+    async (options) => run({ action: "check", options })
+  );
+  for (const action of ["show", "retry"])
+    withGlobalOptions(quality.command(action)).argument("<run-id>").description(
+      action === "show" ? "Inspect reports, coverage, decisions and freshness" : "Retry failed execution once without another customer charge"
+    ).option("--wait", "Wait for completion").option("--timeout <seconds>", "Maximum wait time", "300").action(
+      async (runId, options) => run({ action, runId, options })
+    );
+  withGlobalOptions(quality.command("decide")).description(
+    "Record apply/dismiss/clarify/defer actions; never starts a paid recheck"
+  ).requiredOption(
+    "--file <path>",
+    "JSON file containing decisions with request IDs and expected revisions"
+  ).action(
+    async (options) => run({ action: "decide", file: options.file })
+  );
+}
+
+function renderPullJson(result) {
+  const translations = result.addedTranslations.length + result.updatedTranslations.length;
+  const changed = translations + result.removedTranslations.length + result.removedKeys.length + result.changedFiles.length;
+  return JSON.stringify(
+    {
+      version: 2,
+      command: "pull",
+      status: changed > 0 ? "pulled" : "nothing_to_pull",
+      summary: {
+        added_translations: result.addedTranslations,
+        updated_translations: result.updatedTranslations,
+        removed_translations: result.removedTranslations,
+        remaining_missing_translations: result.remainingMissingTranslations
+      },
+      removed_keys: result.removedKeys.map((key) => ({
+        key: key.key,
+        namespace: key.namespace,
+        files: key.paths
+      })),
+      changed_files: result.changedFiles,
+      counts: {
+        added_translations: result.addedTranslations.length,
+        updated_translations: result.updatedTranslations.length,
+        removed_translations: result.removedTranslations.length,
+        remaining_missing_translations: result.remainingMissingTranslations.length,
+        translations,
+        removed_keys: result.removedKeys.length,
+        changed_files: result.changedFiles.length
+      }
+    },
+    null,
+    2
+  );
+}
+
+const nodeParts = process.versions.node.split(".").map(Number);
+const major = nodeParts[0] ?? 0;
+const minor = nodeParts[1] ?? 0;
+if (major < 20 || major === 20 && minor < 11) {
+  console.error(
+    "\x1B[31mError: Babli CLI requires Node.js version 20.11 or higher\x1B[0m"
+  );
+  console.error(`Current version: ${process.versions.node}`);
+  process.exit(1);
+}
+
+const agentTranslationGuidance = `Agents must prepare descriptions before translation.
+1. Push new keys and source changes first: babli push --json --no-interaction.
+2. Export current context: babli key export --language <source-code> --output keys.json.
+3. Inspect code usages for the keys you will translate. Keep useful descriptions;
+   draft missing or outdated descriptions with meaning and placeholder context.
+4. Check and save drafts: babli key update --file descriptions.json --dry-run,
+   then babli key update --file descriptions.json. Resolve conflicts first.
+5. Estimate, translate, and pull only keys with prepared descriptions.
+Record unclear keys as unresolved; leave them out of translation until clarified.
+Use sync-and-translate only after descriptions cover its selected keys and source changes.`;
+
+function count(amount, noun) {
+  return amount > 0 ? `${amount} ${noun}${amount === 1 ? "" : "s"}` : null;
+}
+function assertNoUnpushedChanges(status) {
+  if (!status.needPush) return;
+  const missingTranslations = Object.values(
+    status.toPush.missingTranslations
+  ).reduce((sum, keys) => sum + keys.length, 0);
+  const parts = [
+    count(status.toPush.newKeys.length, "new key"),
+    count(status.toPush.changedValues.length, "changed translation"),
+    count(missingTranslations, "missing translation"),
+    count(status.languages.localOnly.length, "local-only language")
+  ].filter((part) => part !== null);
+  const summary = parts.length > 0 ? ` (${parts.join(", ")})` : "";
+  throw new CliRequestError({
+    code: "unpushed_changes",
+    message: `Local files have changes that are not pushed${summary}. Run "babli push" first so the pull after renaming does not discard them, or pass --allow-unpushed.`
+  });
+}
 
 function countLanguages(missingTranslations) {
   return Object.keys(missingTranslations).length;
@@ -3588,10 +4630,10 @@ function computeTranslationWork(params) {
       if (!serverId) continue;
       if (onlyExisting && !key.local) continue;
       if (selectedKeys && !selectedKeys.has(getComparisonKey(key))) continue;
-      const hasApprovedReference = Object.values(key.translations).some(
-        (translation) => translation.server?.approved === true && translation.server.currentValue != null && translation.server.currentValue !== ""
+      const hasSourceApproval = Object.entries(key.translations).some(
+        ([code, translation]) => !targetLanguages.includes(code) && hasCurrentApproval(translation.server?.quality) && !translation.server?.quality?.unresolvedConcernIds.length && Boolean(translation.server?.currentValue?.trim())
       );
-      if (!hasApprovedReference) continue;
+      if (!hasSourceApproval) continue;
       const missingLanguages = [];
       for (const lang of targetLanguages) {
         if (languageFilter && !languageFilter.has(lang)) continue;
@@ -3599,7 +4641,7 @@ function computeTranslationWork(params) {
         const missing = serverTranslation?.currentValue == null || emptyValueString === "" && serverTranslation.currentValue === "";
         if (strategy === "missing") {
           if (missing) missingLanguages.push(lang);
-        } else if (missing || serverTranslation?.approved !== true) {
+        } else if (strategy === "replace" || missing || !hasCurrentApproval(serverTranslation?.quality)) {
           missingLanguages.push(lang);
         }
       }
@@ -3676,263 +4718,19 @@ function computeTranslationCoverage(input) {
   };
 }
 
+function exitAfterFlush(code) {
+  return new Promise(() => {
+    process.stdout.write("", () => process.exit(code));
+  });
+}
+
 async function writeFile(file, content) {
-  await fs__default.mkdir(path$1.dirname(file), { recursive: true });
+  await fs__default.mkdir(path.dirname(file), { recursive: true });
   await fs__default.writeFile(file, content, "utf-8");
 }
 
 function getTargetLanguageCodes(languages) {
   return languages.filter((language) => !language.isSource).map((language) => language.code);
-}
-
-async function fetchServerKeys(host, projectId, accessToken) {
-  return requestCliJson(`${host}/api/cli/${projectId}/allKeys`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    }
-  });
-}
-async function fetchProjectInfo(host, projectId, accessToken) {
-  const result = await requestCliJson(
-    `${host}/api/cli/${projectId}/project`,
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`
-      }
-    }
-  );
-  return result.project;
-}
-async function requestTranslation(host, projectId, accessToken, keys, model = "production", maxCreditUnits) {
-  return requestCliJson(
-    `${host}/api/cli/${projectId}/translate`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ keys, model, maxCreditUnits })
-    }
-  );
-}
-async function estimateTranslation(host, projectId, accessToken, keys, model = "production") {
-  return requestCliJson(
-    `${host}/api/cli/${projectId}/estimate`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ keys, model })
-    }
-  );
-}
-async function fetchJobStatus(host, projectId, accessToken, jobId) {
-  const result = await requestCliJson(`${host}/api/cli/${projectId}/job/${jobId}`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    }
-  });
-  return { ...result, failures: result.failures ?? [] };
-}
-async function fetchQuestions(host, projectId, accessToken, scope) {
-  const json = await requestCliJson(
-    `${host}/api/cli/${projectId}/questions${scope ? `?scope=${encodeURIComponent(JSON.stringify(scope))}` : ""}`,
-    {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    }
-  );
-  if (scope && json.scopeVersion !== 1)
-    throw new CliRequestError({
-      code: "unsupported_question_scope",
-      message: "This server does not support scoped question inspection. Update the server before trusting job-scoped follow-up."
-    });
-  return json.questions;
-}
-async function submitAnswers(host, projectId, accessToken, answers) {
-  return requestCliJson(`${host}/api/cli/${projectId}/answers`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ answers })
-  });
-}
-async function fetchPendingReviews(host, projectId, accessToken) {
-  const json = await requestCliJson(
-    `${host}/api/cli/${projectId}/pendingReviews`,
-    {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    }
-  );
-  return json.pending;
-}
-async function approveTranslations(host, projectId, accessToken, translationIds) {
-  return requestCliJson(
-    `${host}/api/cli/${projectId}/approve`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ translationIds })
-    }
-  );
-}
-async function requestProofread(host, projectId, accessToken, keyIds, languageId) {
-  return requestCliJson(
-    `${host}/api/cli/${projectId}/proofread`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ keyIds, languageId })
-    }
-  );
-}
-async function pingServer(host, cliVersion) {
-  let json;
-  try {
-    json = await requestCliJson(`${host}/api/cli/ping`);
-  } catch (error) {
-    if (error instanceof CliRequestError && error.httpStatus !== void 0) {
-      console.error(`Could not connect to server at ${host}`);
-      process.exit(1);
-    }
-    throw error;
-  }
-  const baseVersion = (v) => v.replace(/[-+].*$/, "");
-  if (baseVersion(json.cliVersion) !== baseVersion(cliVersion)) {
-    console.warn(
-      `Your CLI version is different from the server version, please update. Your version is ${cliVersion}, but the server is ${json.cliVersion}.`
-    );
-  }
-  return json;
-}
-async function listCliKeys(host, projectId, accessToken, options) {
-  const searchParams = new URLSearchParams();
-  if (options.includeArchived) {
-    searchParams.set("includeArchived", "true");
-  }
-  if (options.query) {
-    searchParams.set("query", options.query);
-  }
-  const suffix = searchParams.size ? `?${searchParams.toString()}` : "";
-  return fetchCliJson(`${host}/api/cli/${projectId}/keys${suffix}`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-}
-async function getCliKey(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/keys/get`,
-    accessToken,
-    input
-  );
-}
-async function addCliKey(host, projectId, accessToken, input) {
-  return postCliJson(`${host}/api/cli/${projectId}/keys`, accessToken, input);
-}
-async function updateCliKey(host, projectId, accessToken, input) {
-  return patchCliJson(
-    `${host}/api/cli/${projectId}/keys/update`,
-    accessToken,
-    input
-  );
-}
-async function renameCliKey(host, projectId, accessToken, input) {
-  return patchCliJson(
-    `${host}/api/cli/${projectId}/keys/rename`,
-    accessToken,
-    input
-  );
-}
-async function archiveCliKey(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/keys/archive`,
-    accessToken,
-    input
-  );
-}
-async function unarchiveCliKey(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/keys/unarchive`,
-    accessToken,
-    input
-  );
-}
-async function upsertCliTranslation(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/translations/upsert`,
-    accessToken,
-    input
-  );
-}
-async function approveCliTranslation(host, projectId, accessToken, translationId) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/translations/approve`,
-    accessToken,
-    {
-      translationId
-    }
-  );
-}
-async function unapproveCliTranslation(host, projectId, accessToken, translationId) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/translations/unapprove`,
-    accessToken,
-    {
-      translationId
-    }
-  );
-}
-async function listCliOrganizations(host, accessToken) {
-  return fetchCliJson(`${host}/api/cli/organizations`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-}
-async function createCliProject(host, accessToken, input) {
-  return postCliJson(`${host}/api/cli/projects`, accessToken, input);
-}
-async function getCliProject(host, projectId, accessToken) {
-  return fetchCliJson(`${host}/api/cli/${projectId}/project`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-}
-async function updateCliProject(host, projectId, accessToken, input) {
-  return patchCliJson(
-    `${host}/api/cli/${projectId}/project`,
-    accessToken,
-    input
-  );
-}
-async function postCliJson(url, accessToken, body) {
-  return fetchCliJson(url, {
-    body: JSON.stringify(body),
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    method: "POST"
-  });
-}
-async function patchCliJson(url, accessToken, body) {
-  return fetchCliJson(url, {
-    body: JSON.stringify(body),
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    method: "PATCH"
-  });
-}
-async function fetchCliJson(url, init) {
-  return requestCliJson(url, init);
 }
 
 async function initProject(host, accessToken) {
@@ -4366,10 +5164,6 @@ const keyDescriptionFileSchema = z.object({
   ).max(1e5)
 }).superRefine(validateUniqueKeyIds);
 
-function printJson(value) {
-  console.info(JSON.stringify(value, null, 2));
-}
-
 function serializeCliError(error) {
   const message = error instanceof Error ? error.message : String(error);
   if (!(error instanceof CliRequestError)) return { message };
@@ -4551,17 +5345,7 @@ async function keyExportCommand(ctx, options) {
     language,
     keys
   };
-  const output = path$1.resolve(options.output);
-  const temporary = `${output}.${randomUUID()}.tmp`;
-  try {
-    await fs$1.writeFile(temporary, `${JSON.stringify(exported, null, 2)}
-`, {
-      flag: "wx"
-    });
-    await fs$1.rename(temporary, output);
-  } finally {
-    await fs$1.rm(temporary, { force: true });
-  }
+  const output = await writeJsonFile(options.output, exported);
   if (ctx.flags.json) {
     printJson({
       version: 1,
@@ -4576,33 +5360,6 @@ async function keyExportCommand(ctx, options) {
 }
 function invalidResponse(message) {
   return new CliRequestError({ message, code: "invalid_response" });
-}
-
-function count(amount, noun) {
-  return amount > 0 ? `${amount} ${noun}${amount === 1 ? "" : "s"}` : null;
-}
-function assertNoUnpushedChanges(status) {
-  if (!status.needPush) return;
-  const missingTranslations = Object.values(
-    status.toPush.missingTranslations
-  ).reduce((sum, keys) => sum + keys.length, 0);
-  const parts = [
-    count(status.toPush.newKeys.length, "new key"),
-    count(status.toPush.changedValues.length, "changed translation"),
-    count(missingTranslations, "missing translation"),
-    count(status.languages.localOnly.length, "local-only language")
-  ].filter((part) => part !== null);
-  const summary = parts.length > 0 ? ` (${parts.join(", ")})` : "";
-  throw new CliRequestError({
-    code: "unpushed_changes",
-    message: `Local files have changes that are not pushed${summary}. Run "babli push" first so the pull after renaming does not discard them, or pass --allow-unpushed.`
-  });
-}
-
-function exitAfterFlush(code) {
-  return new Promise(() => {
-    process.stdout.write("", () => process.exit(code));
-  });
 }
 
 const stateSchema = z.object({
@@ -4704,7 +5461,6 @@ async function validateKeyRenamePull(file, configs, project, serverKeys) {
       mergedKeysInLocalOrder: {},
       translationFilesConfig: configs,
       allLanguages: project.languages,
-      onlyApproved: false,
       emptyValueString: null,
       selectedKeys: void 0,
       allFilesByPattern: {},
@@ -4722,14 +5478,14 @@ async function validateKeyRenamePull(file, configs, project, serverKeys) {
 async function keyRenameFileCommand(ctx, options, configs) {
   let content;
   if (options.file === "-") {
-    if (stdin.isTTY)
+    if (stdin$1.isTTY)
       throw new CliRequestError({
         code: "invalid_rename_file",
         message: "Pipe a JSON manifest to --file -."
       });
-    stdin.setEncoding("utf8");
+    stdin$1.setEncoding("utf8");
     content = "";
-    for await (const chunk of stdin) content += String(chunk);
+    for await (const chunk of stdin$1) content += String(chunk);
   } else {
     content = await fs$1.readFile(options.file, "utf8");
   }
@@ -4846,20 +5602,6 @@ async function keyRenameFileCommand(ctx, options, configs) {
   }
 }
 
-function validateKeyRenameOptions(options) {
-  if (options.file !== void 0) {
-    if (!options.file.trim()) throw new Error("Provide a nonblank --file path.");
-    if ([options.key, options.keyId, options.namespace, options.to].some((value) => value !== void 0)) {
-      throw new Error("Use --file separately from single-key lookup and destination flags.");
-    }
-    return;
-  }
-  if (options.dryRun) throw new Error("--dry-run requires --file.");
-  if (options.allowUnpushed) throw new Error("--allow-unpushed requires --file.");
-  if (!options.to) throw new Error("Provide --to or --file.");
-  if (options.keyId !== void 0 === (options.key !== void 0)) throw new Error("Provide exactly one of --key-id or --key.");
-}
-
 async function loadTransform(transformPath, cwd) {
   const absolutePath = resolve(cwd, transformPath);
   let loaded;
@@ -4934,7 +5676,9 @@ async function projectListCommand(ctx, options) {
 }
 async function projectCreateCommand(ctx, options) {
   if (options.type !== "key" && options.type !== "document") {
-    throw new Error(`Invalid --type "${options.type}". Use "key" or "document".`);
+    throw new Error(
+      `Invalid --type "${options.type}". Use "key" or "document".`
+    );
   }
   const languages = options.languages?.split(",").map((code) => code.trim()).filter((code) => code.length > 0);
   const project = await createCliProject(ctx.host, ctx.accessToken, {
@@ -4953,153 +5697,23 @@ async function projectCreateCommand(ctx, options) {
     });
     return;
   }
-  console.info(`${FgGreen}Created project:${Reset} ${project.name} (${project.id})`);
+  console.info(
+    `${FgGreen}Created project:${Reset} ${project.name} (${project.id})`
+  );
   console.info(`${ctx.host}/app/project/${project.id}`);
-}
-async function projectGetByIdCommand(ctx, projectId) {
-  const result = await getCliProject(ctx.host, projectId, ctx.accessToken);
-  if (ctx.flags.json) {
-    printJson({
-      command: "project_get",
-      project: result.project,
-      status: "ok",
-      version: 1
-    });
-    return;
-  }
-  console.info(`${Bold}${result.project.name}${Reset}`);
-  console.info(`id: ${result.project.id}`);
-  console.info(`description: ${result.project.description}`);
-  console.info(`instructions: ${result.project.instructions}`);
-}
-
-async function proofreadCommand(ctx) {
-  const pending = await fetchPendingReviews(ctx.host, ctx.projectId, ctx.accessToken);
-  const filtered = ctx.languages ? pending.filter((p) => ctx.languages?.includes(p.languageCode)) : pending;
-  if (filtered.length === 0) {
-    if (ctx.flags.json) {
-      const output = {
-        version: 1,
-        command: "proofread",
-        status: "no-translations",
-        suggestions: []
-      };
-      console.info(JSON.stringify(output, null, 2));
-    } else {
-      console.info(`${FgGreen}No unapproved translations to proofread.${Reset}`);
-    }
-    return;
-  }
-  const byLanguage = /* @__PURE__ */ new Map();
-  for (const item of filtered) {
-    const existing = byLanguage.get(item.languageId) ?? [];
-    if (!existing.includes(item.keyId)) {
-      existing.push(item.keyId);
-    }
-    byLanguage.set(item.languageId, existing);
-  }
-  const totalKeys = new Set(filtered.map((p) => p.keyId)).size;
-  if (!ctx.flags.json) {
-    console.info(
-      `
-${Bold}Proofreading ${totalKeys} key(s) across ${byLanguage.size} language(s)...${Reset}`
-    );
-  }
-  if (!ctx.flags.noInteraction) {
-    const proceed = await confirm({ message: "Run proofreading?" });
-    if (!proceed) {
-      if (ctx.flags.json) {
-        const output = {
-          version: 1,
-          command: "proofread",
-          status: "skipped",
-          suggestions: []
-        };
-        console.info(JSON.stringify(output, null, 2));
-      }
-      return;
-    }
-  }
-  const allSuggestions = [];
-  for (const [languageId, keyIds] of byLanguage) {
-    const response = await requestProofread(
-      ctx.host,
-      ctx.projectId,
-      ctx.accessToken,
-      keyIds,
-      languageId
-    );
-    allSuggestions.push(...response.suggestions);
-  }
-  if (ctx.flags.json) {
-    const output = {
-      version: 1,
-      command: "proofread",
-      status: "complete",
-      suggestions: allSuggestions
-    };
-    console.info(JSON.stringify(output, null, 2));
-  } else {
-    if (allSuggestions.length === 0) {
-      console.info(`${FgGreen}No issues found. Translations look good.${Reset}`);
-    } else {
-      console.info(
-        `
-${FgYellow}${allSuggestions.length} suggestion(s) found:${Reset}
-`
-      );
-      for (const s of allSuggestions) {
-        console.info(`${Dim}[${s.languageCode}]${Reset} ${s.keyName}`);
-        for (const token of s.tokens) {
-          console.info(
-            `  ${FgYellow}${token.original}${Reset} \u2192 ${FgGreen}${token.modified}${Reset} ${Dim}(${token.description})${Reset}`
-          );
-        }
-      }
-      console.info(
-        `
-${Dim}Suggestions saved on server. Apply them in the Babli dashboard.${Reset}`
-      );
-    }
-  }
 }
 
 function buildAnswerNextActions(pairs) {
   return pairs.map((pair) => ({
-    command: pair.approved ? ["babli", "key", "get", "--key-id", pair.keyId, "--json"] : [
-      "babli",
-      "translate",
-      "--key-id",
-      pair.keyId,
-      "--languages",
-      pair.languageCode,
-      "--strategy",
-      "not-approved",
-      "--estimate",
-      "--json"
-    ],
-    reason: pair.approved ? `Inspect the approved ${pair.languageCode} wording against the saved answer. Do not silently unapprove it or claim the answer verified it.` : "Assess whether existing wording needs changing. This estimate spends nothing; explicit paid regeneration must retain this exact pair and use the remaining authorized --max-credits budget. Missing-only sync will skip existing text.",
+    command: ["babli", "key", "get", "--key-id", pair.keyId, "--json"],
+    reason: `Inspect the ${pair.languageCode} wording against the saved answer. Run an AI review or request a human review if it needs reassessment.`,
     paid: false
   }));
 }
 
-function answeredPairsScope(pairs) {
-  const languagesByKey = /* @__PURE__ */ new Map();
-  for (const pair of pairs) {
-    const languages = languagesByKey.get(pair.keyId) ?? [];
-    if (!languages.includes(pair.languageCode)) languages.push(pair.languageCode);
-    languagesByKey.set(pair.keyId, languages);
-  }
-  return {
-    pairs: [...languagesByKey].map(([keyId, languages]) => ({
-      keyId,
-      languages
-    }))
-  };
-}
-
 const MAX_TRANSLATION_ANSWERS = 500;
 const translationAnswerInput = z.object({
+  questionId: z.string().uuid().optional(),
   keyId: z.string().uuid(),
   languageId: z.string().uuid(),
   questionText: z.string().min(1),
@@ -5110,11 +5724,7 @@ const translationAnswersInput = z.object({
 }).strict().superRefine(({ answers }, ctx) => {
   const seen = /* @__PURE__ */ new Set();
   for (const [index, answer] of answers.entries()) {
-    const identity = JSON.stringify([
-      answer.keyId,
-      answer.languageId,
-      answer.questionText
-    ]);
+    const identity = answer.questionId ?? JSON.stringify([answer.keyId, answer.languageId, answer.questionText]);
     if (seen.has(identity)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -5134,7 +5744,7 @@ async function questionsCommand(ctx) {
   const answers = fileAnswers ?? [];
   if (ctx.scope && fileAnswers?.some(
     (answer) => !questions.some(
-      (question) => question.keyId === answer.keyId && question.languageId === answer.languageId && question.question === answer.questionText
+      (question) => (!answer.questionId || question.questionId === answer.questionId) && question.keyId === answer.keyId && question.languageId === answer.languageId && question.question === answer.questionText
     )
   )) {
     throw new Error(
@@ -5143,6 +5753,7 @@ async function questionsCommand(ctx) {
   }
   const affectedPairs = [];
   let answered = 0;
+  let retranslationRequired = false;
   async function saveAnswers() {
     const result = await submitAnswers(
       ctx.host,
@@ -5154,6 +5765,7 @@ async function questionsCommand(ctx) {
       throw new Error(
         `Server saved ${result.answered} of ${answers.length} answers. Fetch questions again before retrying.`
       );
+    retranslationRequired || (retranslationRequired = result.retranslationRequired ?? result.answered > 0);
     affectedPairs.push(...result.affectedPairs ?? []);
     answered += result.answered;
     answers.length = 0;
@@ -5178,6 +5790,7 @@ ${Bold}${questions.length} unanswered question(s):${Reset}
       const answer = (await input({ message: "Your answer (press Enter to skip):" })).trim();
       if (answer)
         answers.push({
+          ...question.questionId ? { questionId: question.questionId } : {},
           keyId: question.keyId,
           languageId: question.languageId,
           questionText: question.question,
@@ -5187,10 +5800,7 @@ ${Bold}${questions.length} unanswered question(s):${Reset}
     }
   }
   if (answers.length) await saveAnswers();
-  const followUp = answered ? await readTranslationFollowUp(
-    ctx,
-    ctx.scope ?? answeredPairsScope(affectedPairs)
-  ) : void 0;
+  const followUp = answered ? await readTranslationFollowUp(ctx, ctx.scope ?? {}) : void 0;
   const remaining = followUp?.questions ?? questions;
   if (ctx.flags.json) {
     console.info(
@@ -5201,7 +5811,7 @@ ${Bold}${questions.length} unanswered question(s):${Reset}
           status: answered ? "answered" : questions.length ? "skipped" : "none",
           summary: { total: questions.length, answered },
           questions: remaining,
-          retranslationRequired: answered > 0,
+          retranslationRequired,
           affected_pairs: affectedPairs,
           follow_up: followUp,
           next_actions: buildAnswerNextActions(affectedPairs)
@@ -5599,153 +6209,6 @@ function renderPushJson(pushPlan, filter, dryRun = false) {
     2
   );
 }
-function renderPullJson(status, pullResult) {
-  const removedKeys = pullResult?.removedKeys ?? [];
-  const totalPulled = Object.values(status.toPull.missingTranslations).reduce(
-    (sum, keys) => sum + keys.length,
-    0
-  );
-  return JSON.stringify(
-    {
-      version: 1,
-      command: "pull",
-      status: status.needPull ? "pulled" : "nothing_to_pull",
-      summary: {
-        missing_keys: status.toPull.missingKeys.map((k) => ({
-          key: k.key,
-          namespace: k.namespace
-        })),
-        missing_translations: status.toPull.missingTranslations
-      },
-      removed_keys: removedKeys.map((key) => ({
-        key: key.key,
-        namespace: key.namespace,
-        files: key.paths
-      })),
-      counts: {
-        missing_keys: status.toPull.missingKeys.length,
-        translations: totalPulled,
-        removed_keys: removedKeys.length
-      }
-    },
-    null,
-    2
-  );
-}
-
-async function reviewCommand(ctx) {
-  const pending = await fetchPendingReviews(ctx.host, ctx.projectId, ctx.accessToken);
-  if (pending.length === 0) {
-    if (ctx.flags.json) {
-      const output = {
-        version: 1,
-        command: "review",
-        status: "none",
-        summary: { total: 0, approved: 0 }
-      };
-      console.info(JSON.stringify(output, null, 2));
-    } else {
-      console.info(`${FgGreen}All translations are approved.${Reset}`);
-    }
-    return;
-  }
-  const threshold = ctx.scoreThreshold ?? 80;
-  const highScore = pending.filter((p) => p.score !== null && p.score >= threshold);
-  const lowScore = pending.filter((p) => p.score === null || p.score < threshold);
-  if (!ctx.flags.json) {
-    console.info(`
-${Bold}${pending.length} translation(s) pending review:${Reset}`);
-    if (highScore.length > 0) {
-      console.info(`  ${FgGreen}${highScore.length} with score >= ${threshold}${Reset}`);
-    }
-    if (lowScore.length > 0) {
-      console.info(`  ${FgYellow}${lowScore.length} with score < ${threshold} (or unscored)${Reset}`);
-    }
-    if (ctx.flags.full) {
-      console.info("");
-      for (const p of pending) {
-        const scoreLabel = p.score !== null ? `score: ${p.score}` : "unscored";
-        console.info(`  ${Dim}[${p.languageCode}]${Reset} ${p.keyName} ${Dim}(${scoreLabel})${Reset}`);
-        if (p.value) {
-          console.info(`    ${Dim}${truncate(p.value, 80)}${Reset}`);
-        }
-      }
-    }
-  }
-  if (ctx.flags.noInteraction) {
-    if (highScore.length > 0) {
-      const result = await approveTranslations(
-        ctx.host,
-        ctx.projectId,
-        ctx.accessToken,
-        highScore.map((p) => p.translationId)
-      );
-      if (ctx.flags.json) {
-        const output = {
-          version: 1,
-          command: "review",
-          status: "approved",
-          summary: { total: pending.length, approved: result.approved },
-          pending: lowScore
-        };
-        console.info(JSON.stringify(output, null, 2));
-      } else {
-        console.info(`
-${FgGreen}Auto-approved ${result.approved} translation(s) with score >= ${threshold}.${Reset}`);
-        if (lowScore.length > 0) {
-          console.info(`${FgYellow}${lowScore.length} translation(s) need manual review.${Reset}`);
-        }
-      }
-    } else {
-      if (ctx.flags.json) {
-        const output = {
-          version: 1,
-          command: "review",
-          status: "skipped",
-          summary: { total: pending.length, approved: 0 },
-          pending: lowScore
-        };
-        console.info(JSON.stringify(output, null, 2));
-      } else {
-        console.info(`${FgYellow}No translations meet the auto-approve threshold.${Reset}`);
-      }
-    }
-    return;
-  }
-  if (highScore.length > 0) {
-    const shouldApproveHigh = await confirm({
-      message: `Approve ${highScore.length} translation(s) with score >= ${threshold}?`
-    });
-    if (shouldApproveHigh) {
-      const result = await approveTranslations(
-        ctx.host,
-        ctx.projectId,
-        ctx.accessToken,
-        highScore.map((p) => p.translationId)
-      );
-      console.info(`${FgGreen}Approved ${result.approved} translation(s).${Reset}`);
-    }
-  }
-  if (lowScore.length > 0) {
-    const shouldApproveLow = await confirm({
-      message: `Approve remaining ${lowScore.length} translation(s) with lower scores?`,
-      default: false
-    });
-    if (shouldApproveLow) {
-      const result = await approveTranslations(
-        ctx.host,
-        ctx.projectId,
-        ctx.accessToken,
-        lowScore.map((p) => p.translationId)
-      );
-      console.info(`${FgGreen}Approved ${result.approved} translation(s).${Reset}`);
-    }
-  }
-}
-function truncate(str, maxLen) {
-  if (str.length <= maxLen) return str;
-  return str.slice(0, maxLen - 3) + "...";
-}
 
 async function keyListCommand(ctx, options) {
   const result = await listCliKeys(ctx.host, ctx.projectId, ctx.accessToken, {
@@ -5865,9 +6328,14 @@ async function keyArchiveCommand(ctx, options) {
   console.info(`${FgGreen}Archived key:${Reset} ${formatKeyLine(result.key)}`);
 }
 async function keyUnarchiveCommand(ctx, options) {
-  const result = await unarchiveCliKey(ctx.host, ctx.projectId, ctx.accessToken, {
-    locator: makeLocator(options)
-  });
+  const result = await unarchiveCliKey(
+    ctx.host,
+    ctx.projectId,
+    ctx.accessToken,
+    {
+      locator: makeLocator(options)
+    }
+  );
   if (ctx.flags.json) {
     printJson({
       command: "key_unarchive",
@@ -5877,7 +6345,9 @@ async function keyUnarchiveCommand(ctx, options) {
     });
     return;
   }
-  console.info(`${FgGreen}Unarchived key:${Reset} ${formatKeyLine(result.key)}`);
+  console.info(
+    `${FgGreen}Unarchived key:${Reset} ${formatKeyLine(result.key)}`
+  );
 }
 async function translationUpsertCommand(ctx, options) {
   if (!options.language) {
@@ -5889,7 +6359,6 @@ async function translationUpsertCommand(ctx, options) {
     ctx.projectId,
     ctx.accessToken,
     {
-      approve: options.approve,
       keyLocator: makeLocator(options),
       languageCode: options.language,
       value
@@ -5907,92 +6376,6 @@ async function translationUpsertCommand(ctx, options) {
   console.info(
     `${FgGreen}Upserted translation:${Reset} ${result.translation.id}`
   );
-}
-async function translationApproveCommand(ctx, translationId) {
-  const result = await approveCliTranslation(
-    ctx.host,
-    ctx.projectId,
-    ctx.accessToken,
-    translationId
-  );
-  if (ctx.flags.json) {
-    printJson({
-      command: "translation_approve",
-      status: "approved",
-      translation: result.translation,
-      version: 1
-    });
-    return;
-  }
-  console.info(`${FgGreen}Approved translation:${Reset} ${translationId}`);
-}
-async function translationUnapproveCommand(ctx, translationId) {
-  const result = await unapproveCliTranslation(
-    ctx.host,
-    ctx.projectId,
-    ctx.accessToken,
-    translationId
-  );
-  if (ctx.flags.json) {
-    printJson({
-      command: "translation_unapprove",
-      status: "unapproved",
-      translation: result.translation,
-      version: 1
-    });
-    return;
-  }
-  console.info(`${FgGreen}Unapproved translation:${Reset} ${translationId}`);
-}
-async function projectGetCommand(ctx) {
-  const result = await getCliProject(ctx.host, ctx.projectId, ctx.accessToken);
-  if (ctx.flags.json) {
-    printJson({
-      command: "project_get",
-      project: result.project,
-      status: "ok",
-      version: 1
-    });
-    return;
-  }
-  console.info(`${Bold}${result.project.name}${Reset}`);
-  console.info(`id: ${result.project.id}`);
-  console.info(`description: ${result.project.description}`);
-  console.info(`instructions: ${result.project.instructions}`);
-}
-async function projectUpdateCommand(ctx, options) {
-  const description = await readMutuallyExclusiveValue({
-    direct: options.description,
-    directName: "--description",
-    file: options.descriptionFile,
-    fileName: "--description-file",
-    flags: ctx.flags
-  });
-  const instructions = await readMutuallyExclusiveValue({
-    direct: options.instructions,
-    directName: "--instructions",
-    file: options.instructionsFile,
-    fileName: "--instructions-file",
-    flags: ctx.flags
-  });
-  if (options.name === void 0 && description === void 0 && instructions === void 0) {
-    throw new Error("Provide at least one project field to update.");
-  }
-  const result = await updateCliProject(ctx.host, ctx.projectId, ctx.accessToken, {
-    description,
-    instructions,
-    name: options.name
-  });
-  if (ctx.flags.json) {
-    printJson({
-      command: "project_update",
-      project: result.project,
-      status: "updated",
-      version: 1
-    });
-    return;
-  }
-  console.info(`${FgGreen}Updated project:${Reset} ${result.project.name}`);
 }
 function makeLocator(options) {
   if (options.keyId && options.key) {
@@ -6031,34 +6414,6 @@ async function readValue(options, flags) {
     throw new Error("Provide --value or --value-file.");
   }
   return value;
-}
-async function readMutuallyExclusiveValue(input) {
-  if (input.direct !== void 0 && input.file !== void 0) {
-    throw new Error(`Use either ${input.directName} or ${input.fileName}, not both.`);
-  }
-  if (input.direct !== void 0) {
-    return input.direct;
-  }
-  if (input.file === void 0) {
-    if (input.required) {
-      throw new Error(`Provide ${input.directName} or ${input.fileName}.`);
-    }
-    return void 0;
-  }
-  if (input.file === "-") {
-    if (stdin$1.isTTY && input.flags.noInteraction) {
-      throw new Error(`${input.fileName} - would read from an interactive terminal.`);
-    }
-    return readStdin();
-  }
-  return fs__default.readFile(input.file, "utf8");
-}
-async function readStdin() {
-  const chunks = [];
-  for await (const chunk of stdin$1) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
-  }
-  return Buffer.concat(chunks).toString("utf8");
 }
 function formatKeyLine(key) {
   const namespace = key.namespace ? `${key.namespace}:` : "";
@@ -6670,6 +7025,15 @@ function summarize(work, strategy) {
   };
 }
 async function translateCommand(input) {
+  try {
+    await getCliProject(input.host, input.projectId, input.accessToken);
+    if (input.strategy === "replace" && !input.keys?.length && !input.keyIds?.length && !input.namespaces?.length)
+      throw new Error(
+        "Replacement requires --key, --key-id, or --namespace to name the wording to replace."
+      );
+  } catch (error) {
+    return reportFailure(input, void 0, error);
+  }
   let work;
   try {
     validateLanguages(input);
@@ -6720,12 +7084,29 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
   let response;
   try {
     const apiWork = work.map(({ keyId, languages }) => ({ keyId, languages }));
-    response = input.maxCreditUnits === void 0 ? await requestTranslation(
+    const quality = translationQuality(input);
+    response = input.maxCreditUnits === void 0 ? quality ? await requestTranslation(
+      input.host,
+      input.projectId,
+      input.accessToken,
+      apiWork,
+      input.model,
+      void 0,
+      quality
+    ) : await requestTranslation(
       input.host,
       input.projectId,
       input.accessToken,
       apiWork,
       input.model
+    ) : quality ? await requestTranslation(
+      input.host,
+      input.projectId,
+      input.accessToken,
+      apiWork,
+      input.model,
+      input.maxCreditUnits,
+      quality
     ) : await requestTranslation(
       input.host,
       input.projectId,
@@ -6836,11 +7217,20 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
 async function runEstimate(input, work, summary) {
   let estimate;
   try {
-    estimate = await estimateTranslation(
+    const keys = work.map(({ keyId, languages }) => ({ keyId, languages }));
+    const quality = translationQuality(input);
+    estimate = quality ? await estimateTranslation(
       input.host,
       input.projectId,
       input.accessToken,
-      work.map(({ keyId, languages }) => ({ keyId, languages })),
+      keys,
+      input.model,
+      quality
+    ) : await estimateTranslation(
+      input.host,
+      input.projectId,
+      input.accessToken,
+      keys,
       input.model
     );
   } catch (err) {
@@ -6890,6 +7280,15 @@ ${Bold}Estimate: ${summary.keys} key(s), ${summary.language_pairs} language pair
     }
   }
   return 0;
+}
+function translationQuality(input) {
+  if (!input.primaryLanguage && !input.referenceMode && input.strategy !== "replace")
+    return void 0;
+  return {
+    primaryLanguage: input.primaryLanguage,
+    referenceMode: input.referenceMode,
+    ...input.strategy === "replace" ? { replaceExisting: true } : {}
+  };
 }
 function serializeChargedCredits(credits) {
   if (!credits) return void 0;
@@ -6990,6 +7389,20 @@ function serializeWorkItems(work) {
   }));
 }
 
+function validateKeyRenameOptions(options) {
+  if (options.file !== void 0) {
+    if (!options.file.trim()) throw new Error("Provide a nonblank --file path.");
+    if ([options.key, options.keyId, options.namespace, options.to].some((value) => value !== void 0)) {
+      throw new Error("Use --file separately from single-key lookup and destination flags.");
+    }
+    return;
+  }
+  if (options.dryRun) throw new Error("--dry-run requires --file.");
+  if (options.allowUnpushed) throw new Error("--allow-unpushed requires --file.");
+  if (!options.to) throw new Error("Provide --to or --file.");
+  if (options.keyId !== void 0 === (options.key !== void 0)) throw new Error("Provide exactly one of --key-id or --key.");
+}
+
 function validateKeyUpdateOptions(options) {
   if (options.file !== void 0) {
     if (!options.file.trim())
@@ -7052,8 +7465,6 @@ Commands:
 
   quality check|show|decide|retry  Review translations through your coding agent
   questions                    Show and answer translation questions
-  review                       Review and approve translations
-  proofread                    Run AI proofreading
 
   key list                     List remote keys
   key get                      Get one remote key
@@ -7065,18 +7476,19 @@ Commands:
   key unarchive                Unarchive a remote key
 
   translation upsert           Create or update a translation
-  translation approve          Approve a translation
-  translation unapprove        Unapprove a translation
 
+  project list|create          List or create projects
   project get                  Show remote project metadata
   project update               Update remote project metadata
+  organization list|get|update  Manage organizations and shared instructions
+  glossary                     Manage project and organization glossary terms
 
 ${agentTranslationGuidance}
 
 Examples:
   babli status
   babli push --no-interaction
-  babli pull --only-approved
+  babli pull
   babli translate --languages cs,de
   babli translate --key-id key_123 --languages cs,de
   babli key list --json
@@ -7147,7 +7559,7 @@ ${agentTranslationGuidance}
     });
   }
 );
-program.command("pull").description("Pull translations from server to local files").option("--only-approved", "Only pull translations that are approved").option(
+program.command("pull").description("Pull translations from server to local files").option(
   "--only-existing",
   "Only pull updates to keys that already exist locally"
 ).option(
@@ -7168,21 +7580,18 @@ program.command("pull").description("Pull translations from server to local file
   `
 Examples:
   babli pull                       # pull all translations
-  babli pull --only-approved       # only approved translations
   babli pull --only-existing       # skip new keys, update existing only
   babli pull --keep-local-only     # keep keys that exist only locally
   babli pull --key hello --key bye # only pull these keys
   babli pull --key auth:login      # pull a key in the 'auth' namespace
   babli pull --key "user.profile.*" # pull keys under a prefix
   babli pull --namespace checkout  # pull the whole checkout namespace
-
 --key and --namespace combine with AND (a key must match both).`
 ).action(
   async (options) => {
     await run({
       action: "pull",
       options: {
-        onlyApproved: options.onlyApproved,
         onlyExisting: options.onlyExisting,
         keepLocalOnly: options.keepLocalOnly === true,
         keys: options.key,
@@ -7215,7 +7624,7 @@ program.command("translate").description("Trigger AI translation for missing tra
 ${agentTranslationGuidance}
 `).option(
   "--strategy <strategy>",
-  "Which translations to (re)generate: missing | not-approved",
+  "Which values to generate: missing, not-approved (neither AI nor human approved), or replace",
   "missing"
 ).option(
   "--languages <codes>",
@@ -7254,9 +7663,15 @@ ${agentTranslationGuidance}
 ).option(
   "--wait",
   "Block and poll until the job finishes (non-interactive mode returns the job id immediately by default)"
-).option("--timeout <seconds>", "Max wait time when polling", "300").addHelpText(
+).option("--timeout <seconds>", "Max wait time when polling", "300").option(
+  "--primary-language <code>",
+  "Primary source language when the project has more than one source"
+).option(
+  "--reference-mode <mode>",
+  "Supporting references to use: either (default), ai, or human"
+).addHelpText(
   "after",
-  '\nExamples:\n  babli translate                    # translate all missing, interactive\n  babli translate --languages cs,de  # only Czech and German\n  babli translate --strategy not-approved  # also re-translate unapproved drafts\n  babli translate --only-existing    # skip keys not in local files\n  babli translate --key "auth:*"     # only translate the auth namespace\n  babli translate --namespace checkout  # only translate the checkout namespace\n  babli translate --key-ids key_1,key_2 --no-interaction\n  babli translate --dry-run --json   # complete work-set, no spend\n  babli translate --namespace speech --estimate --json\n  babli translate --namespace speech --max-credits 7.00 --wait --json\n  babli translate --json --no-interaction  # dispatch and return a job id\n\nInspect follow_up after completion: answer questions from evidence, ask the user about unknown product facts, and report anything unresolved.\nOn timeout, run `babli job <job_id> --wait`; do not dispatch translate again.\n--key and --namespace combine with AND (a key must match both).'
+  '\nExamples:\n  babli translate                    # translate all missing, interactive\n  babli translate --languages cs,de  # only Czech and German\n  babli translate --strategy missing       # generate values that are absent\n  babli translate --only-existing    # skip keys not in local files\n  babli translate --key "auth:*"     # only translate the auth namespace\n  babli translate --namespace checkout  # only translate the checkout namespace\n  babli translate --key-ids key_1,key_2 --no-interaction\n  babli translate --dry-run --json   # complete work-set, no spend\n  babli translate --namespace speech --estimate --json\n  babli translate --namespace speech --max-credits 7.00 --wait --json\n  babli translate --json --no-interaction  # dispatch and return a job id\n\nInspect follow_up after completion: answer questions from evidence, ask the user about unknown product facts, and report anything unresolved.\nOn timeout, run `babli job <job_id> --wait`; do not dispatch translate again.\n--key and --namespace combine with AND (a key must match both).'
 ).action(
   async (options) => {
     const timeout = parseInt(options.timeout, 10);
@@ -7266,14 +7681,20 @@ ${agentTranslationGuidance}
     if (options.dryRun && options.estimate) {
       throw new Error("Use either --dry-run or --estimate, not both.");
     }
-    if (options.strategy !== "missing" && options.strategy !== "not-approved") {
+    if (options.strategy !== "missing" && options.strategy !== "not-approved" && options.strategy !== "replace") {
       throw new Error(
-        `Invalid --strategy value: "${options.strategy}". Use "missing" or "not-approved".`
+        `Invalid --strategy value: "${options.strategy}". Use "missing", "replace", or "not-approved".`
       );
     }
     if (options.model !== "production" && options.model !== "preview") {
       throw new Error(
         `Invalid --model value: "${options.model}". Use "production" or "preview".`
+      );
+    }
+    const referenceMode = options.referenceMode === void 0 ? void 0 : options.referenceMode === "either" || options.referenceMode === "ai" || options.referenceMode === "human" ? options.referenceMode : null;
+    if (referenceMode === null) {
+      throw new Error(
+        `Invalid --reference-mode value: "${options.referenceMode}". Use "either", "ai", or "human".`
       );
     }
     const keyIds = [
@@ -7299,7 +7720,9 @@ ${agentTranslationGuidance}
         estimate: options.estimate === true,
         maxCreditUnits: options.maxCredits === void 0 ? void 0 : parseCreditUnits(options.maxCredits),
         timeout,
-        wait: options.wait === true
+        wait: options.wait === true,
+        primaryLanguage: options.primaryLanguage,
+        referenceMode
       }
     });
   }
@@ -7377,22 +7800,24 @@ withGlobalOptions(keyCommand.command("unarchive")).description("Unarchive one ke
   await run({ action: "key-unarchive", options });
 });
 const translationCommand = program.command("translation").description("Manage remote translations");
-withGlobalOptions(translationCommand.command("upsert")).description("Create or update one translation").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").requiredOption("--language <code>", "Language code").option("--value <text>", "Translation value").option("--value-file <path>", "Read translation value from a file or -").option("--approve", "Approve the translation").action(
+withGlobalOptions(translationCommand.command("upsert")).description("Create or update one translation").option("--key-id <id>", "Key id").option("--key <name>", "Key name").option("--namespace <namespace>", "Key namespace").requiredOption("--language <code>", "Language code").option("--value <text>", "Translation value").option("--value-file <path>", "Read translation value from a file or -").action(
   async (options) => {
     await run({
       action: "translation-upsert",
-      options: { ...options, approve: options.approve === true }
+      options
     });
   }
 );
-withGlobalOptions(translationCommand.command("approve")).description("Approve one translation").argument("<translation-id>").action(async (translationId) => {
-  await run({ action: "translation-approve", translationId });
-});
-withGlobalOptions(translationCommand.command("unapprove")).description("Unapprove one translation").argument("<translation-id>").action(async (translationId) => {
-  await run({ action: "translation-unapprove", translationId });
-});
+registerAdministrationCommands(
+  program,
+  async (input) => run({ action: "administration", input }),
+  withGlobalOptions
+);
 const projectCommand = program.command("project").description("Manage remote project metadata");
-withGlobalOptions(projectCommand.command("get")).description("Get remote project metadata").option("--project <id>", "Project id (defaults to babli.json project)").action(async (options) => {
+withGlobalOptions(projectCommand.command("get")).description("Get remote project metadata").option("--project <id>", "Project id (defaults to babli.json project)").option(
+  "--include-inherited",
+  "Include company instructions and their precedence"
+).action(async (options) => {
   await run({ action: "project-get", options });
 });
 withGlobalOptions(projectCommand.command("list")).description("List projects across your organizations").option("--organization <id>", "Filter to one organization").action(async (options) => {
@@ -7406,17 +7831,15 @@ withGlobalOptions(projectCommand.command("create")).description("Create a new pr
     await run({ action: "project-create", options });
   }
 );
-withGlobalOptions(projectCommand.command("update")).description("Update remote project metadata").option("--name <name>", "Project name").option("--description <text>", "Project description").option(
+withGlobalOptions(projectCommand.command("update")).description("Update remote project metadata").option("--project <id>", "Project id (defaults to babli.json project)").option("--name <name>", "Project name").option("--description <text>", "Project description").option(
   "--description-file <path>",
   "Read project description from a file or -"
 ).option("--instructions <text>", "Project translation instructions").option(
   "--instructions-file <path>",
   "Read project instructions from a file or -"
-).action(
-  async (options) => {
-    await run({ action: "project-update", options });
-  }
-);
+).action(async (options) => {
+  await run({ action: "project-update", options });
+});
 program.command("sync-and-translate").description("Push local changes, translate, and pull results").option(
   "--allow-empty-prune",
   "Allow archiving when no configured local translation files are found"
@@ -7483,6 +7906,41 @@ registerQualityCommands(
   },
   withGlobalOptions
 );
+const humanReview = program.command("human-review").description("Ask subscribed colleagues to check wording");
+withGlobalOptions(humanReview.command("request")).description("Email subscribed reviewers for the selected translations").option(
+  "--translation-id <id>",
+  "Translation UUID (repeatable)",
+  collectOption,
+  []
+).option(
+  "--key <name>",
+  "Key or namespace:key (repeatable)",
+  collectOption,
+  []
+).option(
+  "--language <code>",
+  "Limit --key selection to this language (repeatable)",
+  collectOption,
+  []
+).option("--reason <text>", "Why this review is needed", "").option("--source <code>", "Source language to review against").option("--request-id <uuid>", "Reuse after an uncertain submission").action(
+  async (options) => {
+    process.exit(
+      await humanReviewCommand({
+        action: "request",
+        options: { ...options, json: getGlobalFlags().json }
+      })
+    );
+  }
+);
+withGlobalOptions(humanReview.command("status")).description("Show whether invited wording has a later human decision").requiredOption("--invitation <id>", "Invitation id returned by request").action(async (options) => {
+  process.exit(
+    await humanReviewCommand({
+      action: "status",
+      invitationId: options.invitation,
+      json: options.json
+    })
+  );
+});
 program.command("questions").option("--job <id>", "Inspect questions for the exact translation job scope").option(
   "--key <pattern>",
   "Only matching namespaced keys (repeatable)",
@@ -7514,39 +7972,6 @@ program.command("questions").option("--job <id>", "Inspect questions for the exa
     });
   }
 );
-program.command("review").description("Review and approve translations").option(
-  "--score-threshold <score>",
-  "Min score for auto-approval in non-interactive mode",
-  "80"
-).addHelpText(
-  "after",
-  "\nExamples:\n  babli review                       # interactive review\n  babli review --no-interaction      # auto-approve high-score translations\n  babli review --score-threshold 90  # custom threshold"
-).action(async (options) => {
-  const scoreThreshold = parseInt(options.scoreThreshold, 10);
-  if (Number.isNaN(scoreThreshold) || scoreThreshold < 0 || scoreThreshold > 100) {
-    throw new Error(
-      `Invalid --score-threshold value: "${options.scoreThreshold}"`
-    );
-  }
-  await run({
-    action: "review",
-    options: { scoreThreshold }
-  });
-});
-program.command("proofread").description("Run AI proofreading on unapproved translations").option(
-  "--languages <codes>",
-  "Only proofread these languages (comma-separated)"
-).addHelpText(
-  "after",
-  "\nExamples:\n  babli proofread                    # proofread all unapproved\n  babli proofread --languages cs,de  # only Czech and German"
-).action(async (options) => {
-  await run({
-    action: "proofread",
-    options: {
-      languages: options.languages?.split(",").map((l) => l.trim())
-    }
-  });
-});
 program.command("init").description("Initialize a new Babli project").option("--host <host>", "Babli server host URL", defaultHost).action(async (options) => {
   await run({
     action: "init",
@@ -7774,8 +8199,19 @@ async function runAction(cliInput, flags) {
     await projectCreateCommand(orgCtx, cliInput.options);
     return { needPush: false, needPull: false };
   }
-  if (cliInput.action === "project-get" && cliInput.options?.project) {
-    await projectGetByIdCommand(orgCtx, cliInput.options.project);
+  if (cliInput.action === "administration") {
+    const context = { ...orgCtx, projectId: parsed?.projectId };
+    if (cliInput.input.kind === "organization")
+      await organizationCommand(context, cliInput.input);
+    else await glossaryCommand(context, cliInput.input);
+    return { needPush: false, needPull: false };
+  }
+  if (cliInput.action === "project-get" || cliInput.action === "project-update") {
+    await projectMetadataCommand(
+      { ...orgCtx, projectId: parsed?.projectId },
+      cliInput.action === "project-get" ? "get" : "update",
+      cliInput.options
+    );
     return { needPush: false, needPull: false };
   }
   if (!parsed) {
@@ -7840,22 +8276,6 @@ async function runAction(cliInput, flags) {
   }
   if (cliInput.action === "translation-upsert") {
     await translationUpsertCommand(surgicalCtx, cliInput.options);
-    return { needPush: false, needPull: false };
-  }
-  if (cliInput.action === "translation-approve") {
-    await translationApproveCommand(surgicalCtx, cliInput.translationId);
-    return { needPush: false, needPull: false };
-  }
-  if (cliInput.action === "translation-unapprove") {
-    await translationUnapproveCommand(surgicalCtx, cliInput.translationId);
-    return { needPush: false, needPull: false };
-  }
-  if (cliInput.action === "project-get") {
-    await projectGetCommand(surgicalCtx);
-    return { needPush: false, needPull: false };
-  }
-  if (cliInput.action === "project-update") {
-    await projectUpdateCommand(surgicalCtx, cliInput.options);
     return { needPush: false, needPull: false };
   }
   const transformConfigs = translationFilesConfig.filter((c) => c.transform);
@@ -7945,7 +8365,6 @@ async function runAction(cliInput, flags) {
         await doSync({
           action: "pull",
           options: {
-            onlyApproved: false,
             keys: workflowKeys,
             namespaces: workflowNamespaces,
             selectedKeys: workflowSelectedKeys,
@@ -8019,26 +8438,6 @@ async function runAction(cliInput, flags) {
     });
     return { needPush: false, needPull: false };
   }
-  if (cliInput.action === "review") {
-    await reviewCommand({
-      host,
-      projectId,
-      accessToken,
-      flags,
-      scoreThreshold: cliInput.options.scoreThreshold
-    });
-    return { needPush: false, needPull: false };
-  }
-  if (cliInput.action === "proofread") {
-    await proofreadCommand({
-      host,
-      projectId,
-      accessToken,
-      flags,
-      languages: cliInput.options.languages
-    });
-    return { needPush: false, needPull: false };
-  }
   const syncCliInput = cliInput.action === "translate" ? { action: "status" } : cliInput;
   const shouldMuteOutput = flags.json && (cliInput.action === "push" || cliInput.action === "pull");
   const originalInfo = console.info;
@@ -8089,7 +8488,7 @@ async function runAction(cliInput, flags) {
     }
   }
   if (cliInput.action === "pull" && flags.json) {
-    console.info(renderPullJson(result.status, result.pullResult));
+    console.info(renderPullJson(unwrap(result.pullResult)));
   }
   if (cliInput.action === "translate") {
     const projectInfo = await fetchProjectInfo(host, projectId, accessToken);
@@ -8112,6 +8511,8 @@ async function runAction(cliInput, flags) {
       dryRun: cliInput.options.dryRun,
       estimate: cliInput.options.estimate,
       maxCreditUnits: cliInput.options.maxCreditUnits,
+      primaryLanguage: cliInput.options.primaryLanguage,
+      referenceMode: cliInput.options.referenceMode,
       timeout: cliInput.options.timeout,
       wait: cliInput.options.wait
     });

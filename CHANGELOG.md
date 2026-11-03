@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-03
+
+### Added
+
+- Manage organization metadata and shared translation instructions with `organization list`, `get`, and `update`.
+- Manage project and organization glossaries: list, inspect, create/update, remove, import/export, and move project terms to the organization.
+- Request human review of selected translations and inspect invitation status with `human-review request` and `human-review status`.
+- Select a primary source language and supporting-reference approval mode for translation with `--primary-language` and `--reference-mode`.
+
+### Changed
+
+- **Breaking:** stored-key operations require the new server review contract. Upgrade the CLI when the server is upgraded; older clients are rejected.
+- Approval now comes from a current AI pass or explicit human approval. Saved wording and imports do not automatically approve translations, and old approval flags are not migrated. Source wording may need review before translation.
+- `quality check` uses the Argon reviewer (`gemini-4-argon`) and shared batch estimates; a current successful AI review grants AI approval.
+- Replacement translation requires an explicit key, key ID, or namespace scope.
+- **Breaking:** `pull --json` now uses output version 2. It reports completed additions, updates, removals, changed files, and translations still missing locally instead of the previous missing-key and missing-translation summary. Translation totals include updates, and changed-only or removal-only pulls report `pulled`.
+
+### Fixed
+
+- Pull reports reflect files actually written, including custom-transform output.
+
+### Removed
+
+- Legacy `review` and `proofread` commands, `translation approve` and `translation unapprove`, approval-on-upsert flags, and approved-only pull flags. Use `quality` for AI review and the human-review workspace for human decisions.
+
 ## [0.9.0] - 2026-10-20
 
 ### Added

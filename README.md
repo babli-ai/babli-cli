@@ -1,4 +1,5 @@
-> Read-only mirror of the published `babli` CLI. Source lives in the monorepo (infi-pc/babli). Install with `npm i -g babli`.
+> Read-only mirror of the published `babli` CLI. Source lives in the monorepo
+> (infi-pc/babli). Install with `npm i -g babli`.
 
 # Babli CLI
 
@@ -89,11 +90,12 @@ babli questions --namespace checkout --languages de,fr --json
 babli questions --answers-file answers.json --json --no-interaction
 ```
 
-JSON listing never prompts. It includes each question's `keyId`, `languageId`, `languageCode`, `keyName`, and `question`. Build `answers.json` from those identifiers:
+JSON listing never prompts. It includes unanswered generation, human, and AI-review questions, with `questionId`, `origin`, `keyId`, `languageId`, `languageCode`, `keyName`, and `question`. Build `answers.json` from those identifiers:
 
 ```json
 {
   "answers": [{
+    "questionId": "<question UUID from questions>",
     "keyId": "<key UUID from questions>",
     "languageId": "<language UUID from questions>",
     "questionText": "<exact question text>",
@@ -102,11 +104,19 @@ JSON listing never prompts. It includes each question's `keyId`, `languageId`, `
 }
 ```
 
-Answer submission requires a user token from `babli login`; project API keys can list questions but cannot submit answers. A batch of up to 500 answers is validated and saved atomically. Unknown questions, duplicate entries, and blank answers are rejected.
+Answer submission requires a user token from `babli login`; project API keys can list questions but cannot submit answers. A batch of up to 500 answers is validated and saved atomically. Unknown questions, duplicate entries, and blank answers are rejected. Include `questionId` to distinguish questions with identical text. Older answer files without it remain supported when exactly one question matches.
 
-The response contains remaining questions, exact `affected_pairs`, safe `next_actions`, and the legacy `retranslationRequired` hint. Inspect or review the affected wording with the new answers; regenerate only when needed and explicitly authorized. Saving an answer clears their cached scores; earlier jobs cannot restore those scores without the saved answers in their input. Answers apply only to their key and language.
+The response contains remaining questions, exact `affected_pairs`, safe `next_actions`, and the legacy `retranslationRequired` hint. Inspect or review the affected wording with the new answers; regenerate only when needed and explicitly authorized. Answering a human or AI-review question records the reply without clearing scores or requesting regeneration. Generation answers clear cached scores; earlier jobs cannot restore those scores without the saved answers in their input. Answers apply only to their key and language.
 
 Generation and saving check ICU arguments, format specifiers, select branches, explicit plural selectors, rich-text component tags, and common `{{name}}` placeholders. Locale-specific plural categories may change. Invalid output is retried during generation and rejected before saving. These checks do not establish linguistic correctness; arbitrary HTML, printf syntax, and custom template formats are not covered.
+
+### Request human review
+
+Use `--source` to choose the source language in projects with multiple sources:
+
+```bash
+babli human-review request --key checkout.title --language de --source en --reason "Description updated"
+```
 
 ### Review translations through your coding agent
 
@@ -119,9 +129,13 @@ babli quality check --namespace checkout --languages de,fr --source en --estimat
 babli quality show <run-id> --wait --json
 ```
 
-Review uses one configured model (default `gpt-4.1`; `--model` also accepts the configured Gemini reviewers). It checks source meaning, descriptions, instructions, glossary, saved answers, usages, and supported technical constraints. It neither generates missing translations nor approves output. The first release supports default-type translations in stored-key projects. Ambiguous source selection requires `--source`.
+Review uses Gemini 4 Argon only. `--model gemini-4-argon` remains accepted; other reviewer models are disabled. It checks source meaning, descriptions, instructions, glossary, saved answers, usages, and supported technical constraints. It does not generate missing translations. A current no-issues result is sufficient approval, with human approval as an alternative. The first release supports default-type translations in stored-key projects. Ambiguous source selection requires `--source`.
 
-Pricing is 1 credit (100 units) per batch of at most four targets in one locale, with at most 12,000 estimated input tokens and 8,000 output tokens. Technical failures are reported before paid linguistic review. Estimate first; `--max-credits` is mandatory for submission. Track the overall translation/review/recheck budget yourself and pass the remaining allowance to each paid command. Preserve the printed request ID and reuse it with identical arguments after an uncertain submission; `show` resumes existing work without another charge.
+Each batch costs 1 credit (100 units). Review shares translation's token accounting and two-stage packer: group targets by locale, pack using the standard 8,000-token key-size heuristic, then check the complete prompt and split oversized groups. All message parts, context, and the response schema are counted with 30% headroom. The reviewer performs all six checks but returns only clean-key IDs and detailed findings. Output estimates assume 5% of fresh keys have findings (a planning heuristic, not a measured defect rate); rechecks reserve full finding detail. There is no fixed key-count limit per batch. Each batch must fit the shared 100,000 estimated input tokens and Argon's 32,768-token output allowance. One quarter of that output allowance is reserved for reasoning. Oversized inputs or reports are skipped with a reason. Partially filled batches still cost the full batch price. Estimates include `credit_units_per_batch`, total credits, and `batch_estimates` with target counts, token estimates, reasoning reserves, and limits. Use the estimate for the actual scope; the number of keys alone does not determine the price.
+
+Argon can resume a truncated response once using its native continuation token, within a total 32,768-token allowance. Missing IDs, duplicate IDs, and unfinished output never count as a pass. Historical runs from disabled reviewers or older prompt contracts remain readable, but cannot execute or be retried. Estimate a new Argon review to recheck their translations.
+
+Technical failures are reported before paid linguistic review. Estimate first; `--max-credits` is mandatory for submission. Track the overall translation/review/recheck budget yourself and pass the remaining allowance to each paid command. Preserve the printed request ID and reuse it with identical arguments after an uncertain submission; `show` resumes existing work without another charge.
 
 Inspect each finding against repository evidence. A suggestion is a claim to evaluate. Apply supported corrections, dismiss evidenced false positives with reasons, clarify unknown product meaning, or defer judgments you cannot substantiate. Do not invent product facts, silently unapprove existing wording, or claim that model agreement proves correctness.
 
@@ -155,7 +169,7 @@ Applying wording creates an unapproved version. Dismissal preserves the reviewer
 
 Provider execution retries are bounded and successful results are retained. Permanently failed items refund their allocated charge once. `babli quality retry <run-id> --wait --json` permits the original requesting user one additional execution attempt without another debit; refunds already issued remain. A different model or changed inputs requires a new quoted run. Questions/defects in a valid review are billable results.
 
-Final reports must distinguish reviewer outcome (`no_issues_found`, `issues_found`, `needs_context`), agent decisions, stale/unavailable evidence, incomplete execution, unanswered generation questions, and publication approval. Review findings do not change exit code 0; execution failure/timeout or rejected batch decisions return 2. The new web Review tab is read-only and shows reports, findings, decisions, and scoped CLI guidance. Existing `babli review` remains score-based approval; approved-only pull does not certify linguistic review.
+Final reports must distinguish reviewer outcome (`no_issues_found`, `issues_found`, `needs_context`), agent decisions, stale/unavailable evidence, incomplete execution, unanswered generation questions, and publication approval. Review findings do not change exit code 0; execution failure/timeout or rejected batch decisions return 2. The new web Review tab is read-only and shows reports, findings, decisions, and scoped CLI guidance. Approval requires a current AI pass or human approval. Scores do not grant approval, and pulls include every value.
 
 ### Write key descriptions from code context
 
@@ -423,6 +437,38 @@ If the version is a prerelease such as `0.1.0-beta.1`, CI publishes it under the
 
 - set `BABLI_API_KEY` env variable (find it in your project settings)
 - run `babli sync-and-translate --json --no-interaction` to safely push, wait, and pull
+
+## Manage metadata and glossaries
+
+```bash
+babli organization list
+babli organization get --organization ORG_ID
+babli organization update --organization ORG_ID --name "Acme"
+babli organization update --organization ORG_ID --instructions-file ./company-instructions.md
+babli project get --project PROJECT_ID --include-inherited
+babli project update --project PROJECT_ID --name "Customer portal"
+babli project update --description-file ./project-description.md --instructions-file ./project-instructions.md
+
+babli glossary list --include-inherited
+babli glossary list --organization ORG_ID
+babli glossary upsert --term "Workspace" --source-language en --translation cs="Pracovní prostor"
+babli glossary upsert --organization ORG_ID --term "Babli" --source-language en --description "Do not translate."
+babli glossary update TERM_ID --translation de="Arbeitsbereich"
+babli glossary update TERM_ID --remove-translation de
+babli glossary remove TERM_ID
+babli glossary move-to-organization TERM_ID
+babli glossary export --output ./glossary.json
+babli glossary import --file ./glossary.json --dry-run
+babli glossary import --file ./glossary.json
+```
+
+Project commands default to `babli.json`; `--project` selects another project. Glossary commands accept either `--project` or `--organization`, and explicit selectors work without a config. Organization commands require a user token from `babli login`; project API keys can manage only their project. Organization editors can edit company instructions and glossary terms; renaming requires owner permissions.
+
+Metadata updates preserve omitted fields. Text fields also accept `--instructions-file` or `--description-file`, with `-` for stdin. An empty string clears instructions or descriptions. Organizations have a name and instructions; projects also have a description. `project get --include-inherited` shows company instructions alongside project instructions.
+
+Glossary upserts merge supplied target languages and preserve omitted notes and languages. Use `update --remove-translation` to delete a translation, or `--description ""` to clear a note. Project terms override company translations for the same term, source language, and target language. `list --include-inherited` labels each term's owning scope. Moving a project term to its organization requires organization management permissions and fails on a duplicate term/source pair.
+
+Exports contain owned terms only, using `{ "version": 1, "terms": [{ "term": "Workspace", "sourceLanguageCode": "en", "description": null, "translations": { "cs": "Pracovní prostor" } }] }`. Imports validate the whole file and merge atomically, preserving unrelated terms and omitted translations. `--dry-run` also checks write permissions. All commands support `--json` and `--no-interaction`.
 
 ## Create a project from the CLI
 
