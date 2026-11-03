@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-03
+
+### Fixed
+
+- Include the patched validation and glob-matching code in the installed CLI so npm users receive the same security fixes as the monorepo.
+- Exclude locally cached login credentials from CLI package archives.
+- Verify a clean package installation and audit its runtime dependencies before publishing.
+
 ## [0.10.0] - 2026-11-03
 
 ### Added

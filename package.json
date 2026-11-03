@@ -1,6 +1,6 @@
 {
   "name": "babli",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -12,7 +12,8 @@
     "babli": "./dist/index.js"
   },
   "files": [
-    "dist",
+    "dist/index.js",
+    "dist/build-info.json",
     "README.md",
     "CHANGELOG.md",
     "babli-json-schema.json"
@@ -33,19 +34,17 @@
     "glob": "^14.0.2",
     "ignore": "^7.0.5",
     "js-yaml": "^4.1.1",
-    "minimatch": "^10.2.5",
     "open": "^10.2.0",
     "pofile": "^1.1.4",
     "web-tree-sitter": "^0.26.8",
-    "yaml": "^2.8.3",
-    "zod": "^3.25.76",
-    "zod-validation-error": "^3.5.4"
+    "yaml": "^2.8.3"
   },
   "devDependencies": {
     "@rollup/plugin-json": "^6.1.0",
     "@rollup/plugin-node-resolve": "^15.3.1",
     "@types/node": "^24.12.0",
     "babli-sync": "workspace:*",
+    "minimatch": "^10.2.5",
     "rollup": "^4.60.1",
     "rollup-plugin-esbuild": "^6.2.1",
     "rollup-plugin-tsconfig-paths": "^1.5.2",
@@ -58,7 +57,8 @@
     "vite-tsconfig-paths": "^5.1.4",
     "vitest": "^4.1.12",
     "zod": "^3.25.76",
-    "zod-to-json-schema": "^3.25.2"
+    "zod-to-json-schema": "^3.25.2",
+    "zod-validation-error": "^3.5.4"
   },
   "checks": {
     "scripts": [
