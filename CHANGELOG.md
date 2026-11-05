@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-05
+
+### Added
+
+- `translate --allow-unapproved-sources` permits translation without current AI or human source approval. Unresolved concerns still block translation.
+
+### Changed
+
+- Scoped `push --dry-run` compares every local value using compact fingerprints, preserves the exact withheld-change count, and downloads wording only for selected keys when supported by the server. Older servers continue to use the existing lookup.
+
 ## [0.10.1] - 2026-11-03
 
 ### Fixed

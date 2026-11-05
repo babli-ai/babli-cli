@@ -1,12 +1,15 @@
 #!/usr/bin/env node
+import yaml from 'js-yaml';
+import PO from 'pofile';
+import { Parser, Language, Query } from 'web-tree-sitter';
+import path$2, { join, resolve } from 'path';
+import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'fs/promises';
 import fs__default from 'fs/promises';
 import { stdin, env } from 'process';
-import { randomUUID } from 'node:crypto';
 import fs$1, { readFile } from 'node:fs/promises';
 import path$1 from 'node:path';
 import open from 'open';
-import path$2, { join, resolve } from 'path';
 import { glob } from 'glob';
 import { parse, stringify } from 'yaml';
 import { setTimeout as setTimeout$1 } from 'node:timers/promises';
@@ -15,12 +18,474 @@ import { select, input, checkbox, confirm } from '@inquirer/prompts';
 import fsSync from 'fs';
 import ignore from 'ignore';
 import { stdin as stdin$1 } from 'node:process';
-import PO from 'pofile';
 import { pathToFileURL } from 'url';
-import yaml from 'js-yaml';
-import { Parser, Language, Query } from 'web-tree-sitter';
 
+function exists(value, message) {
+  if (value === null || value === void 0) {
+    throw new Error(message ?? "Assertion failed: Value is null or undefined");
+  }
+  return value;
+}
 function assertNever$1(x) {
+  throw new Error(`Unexpected value: ${x}`);
+}
+
+function nonNullable(value) {
+  return value !== null && value !== void 0;
+}
+
+function gatherTranslationsFromMaybeNestedObject(source, projectSeparator) {
+  const translations = /* @__PURE__ */ new Map();
+  if (typeof source !== "object") return translations;
+  if (Array.isArray(source)) return translations;
+  if (source == null) return translations;
+  for (const [key, value] of Object.entries(source)) {
+    if (typeof value === "string") {
+      translations.set(key, {
+        value
+      });
+    } else if (value === null || value === void 0) {
+      translations.set(key, {
+        value
+      });
+    } else {
+      const nestedTranslations = gatherTranslationsFromMaybeNestedObject(
+        value,
+        projectSeparator
+      );
+      for (const [nestedKey, nestedValue] of nestedTranslations.entries()) {
+        translations.set(`${key}${projectSeparator}${nestedKey}`, nestedValue);
+      }
+    }
+  }
+  return translations;
+}
+
+let initialized = null;
+async function typescriptProcessor(fileContent, projectSeparator) {
+  if (!initialized) {
+    await Parser.init({
+      locateFile(scriptName) {
+        return `/${scriptName}`;
+      }
+    });
+    const parser2 = new Parser();
+    const JavaScript2 = await Language.load("/parsers/tree-sitter-tsx.wasm");
+    parser2.setLanguage(JavaScript2);
+    initialized = { parser: parser2, JavaScript: JavaScript2 };
+  }
+  const { parser, JavaScript } = initialized;
+  const tree = parser.parse(fileContent);
+  if (!tree) {
+    return { keys: /* @__PURE__ */ new Map(), fileFormat: "typescript" };
+  }
+  let translations = /* @__PURE__ */ new Map();
+  const startingNode = findStartingNode(tree.rootNode, JavaScript);
+  if (startingNode) {
+    const plainObject = extractObject(startingNode);
+    translations = gatherTranslationsFromMaybeNestedObject(
+      plainObject,
+      projectSeparator
+    );
+  }
+  return { keys: translations, fileFormat: "typescript" };
+}
+function findStartingNode(node, JavaScript) {
+  let queryStr = `
+  (export_statement (expression) @exported)
+  `;
+  let query = new Query(JavaScript, queryStr);
+  let matches = query.matches(node);
+  for (const match of matches) {
+    for (const capture of match.captures) {
+      if (capture.name === "exported") {
+        return capture.node;
+      }
+    }
+  }
+  queryStr = `
+  (expression_statement (assignment_expression left: (member_expression
+    object: (identifier) @object
+    property: (property_identifier) @property
+  ) right: (object) @exported))
+  `;
+  query = new Query(JavaScript, queryStr);
+  matches = query.matches(node);
+  for (const match of matches) {
+    if (match.captures.some(
+      (capture) => capture.name === "object" && capture.node.text === "module"
+    ) && match.captures.some(
+      (capture) => capture.name === "property" && capture.node.text === "exports"
+    )) {
+      for (const capture of match.captures) {
+        if (capture.name === "exported") {
+          return capture.node;
+        }
+      }
+    }
+  }
+  return null;
+}
+function extractObject(node) {
+  if (node.type !== "object") {
+    throw new Error("Node is not an object.");
+  }
+  const obj = {};
+  node.namedChildren.forEach((child) => {
+    if (child?.type === "pair") {
+      const keyNode = child.namedChildren.find(
+        (n) => n?.type === "property_identifier" || n?.type === "string"
+      );
+      const valueNode = child.namedChildren.find(
+        (n) => n?.type !== "property_identifier" && (n?.type === "string" || n?.type === "object")
+      );
+      if (keyNode && valueNode) {
+        const key = keyNode.text;
+        let value;
+        if (valueNode.type === "object") {
+          value = extractObject(valueNode);
+        } else {
+          value = valueNode.text.slice(1, -1);
+        }
+        obj[key] = value;
+      }
+    }
+  });
+  return obj;
+}
+
+const fileProcessors = {
+  json: async (fileContent, projectSeparator) => {
+    const parsed = JSON.parse(fileContent);
+    return {
+      keys: gatherTranslationsFromMaybeNestedObject(parsed, projectSeparator),
+      fileFormat: "json"
+    };
+  },
+  yaml: async (fileContent, projectSeparator, fileOptions, languageCode) => {
+    let parsed = yaml.load(fileContent, {
+      json: true
+    });
+    if (fileOptions?.topLevelLanguageCode) {
+      parsed = parsed[languageCode];
+    }
+    return {
+      keys: gatherTranslationsFromMaybeNestedObject(parsed, projectSeparator),
+      fileFormat: "yaml"
+    };
+  },
+  neon: async (fileContent, projectSeparator, fileOptions, languageCode) => {
+    let parsed = yaml.load(fileContent, { json: true });
+    if (fileOptions?.topLevelLanguageCode) {
+      parsed = parsed[languageCode];
+    }
+    return {
+      keys: gatherTranslationsFromMaybeNestedObject(parsed, projectSeparator),
+      fileFormat: "neon"
+    };
+  },
+  typescript: typescriptProcessor,
+  po: async (fileContent, projectSeparator) => {
+    const translations = /* @__PURE__ */ new Map();
+    const po = PO.parse(fileContent);
+    for (const item of po.items) {
+      if (!item.msgid) continue;
+      if (item.msgid_plural && item.msgstr.length > 1) {
+        const pluralForms = ["zero", "one", "two", "few", "many", "other"];
+        for (let i = 0; i < item.msgstr.length; i++) {
+          if (item.msgstr[i]) {
+            const pluralKey = `${item.msgid}${projectSeparator}${pluralForms[i] || i}`;
+            const val = {
+              value: item.msgstr[i],
+              meta: {
+                msgctxt: item.msgctxt,
+                references: item.references,
+                extractedComments: item.extractedComments,
+                flags: item.flags
+              }
+            };
+            if (item.comments.length > 0) {
+              val.description = item.comments.join(" ");
+            }
+            translations.set(pluralKey, val);
+          }
+        }
+      } else {
+        const val = {
+          value: item.msgstr[0] || null,
+          meta: {
+            msgctxt: item.msgctxt,
+            references: item.references,
+            extractedComments: item.extractedComments,
+            flags: item.flags
+          }
+        };
+        if (item.comments.length > 0) {
+          val.description = item.comments.join(" ");
+        }
+        translations.set(item.msgid, val);
+      }
+    }
+    return { keys: translations, fileFormat: "po" };
+  },
+  flutterArb: async (fileContent) => {
+    const translations = /* @__PURE__ */ new Map();
+    const parsed = JSON.parse(fileContent);
+    for (const [key, value] of Object.entries(parsed)) {
+      if (key.startsWith("@")) continue;
+      if (typeof value === "string") {
+        const metadata = parsed[`@${key}`];
+        const description = typeof metadata?.description === "string" ? metadata.description : void 0;
+        const val = {
+          value,
+          meta: metadata ?? {}
+        };
+        if (description) {
+          val.description = description;
+        }
+        translations.set(key, val);
+      } else {
+        throw new Error(
+          `We don't support nested objects in Flutter ARB files yet. Key: ${key}`
+        );
+      }
+    }
+    return { keys: translations, fileFormat: "flutterArb" };
+  }
+};
+async function detectAndProcessTranslationFile({
+  format,
+  content,
+  projectSeparator,
+  fileOptions,
+  langCode
+}) {
+  switch (format) {
+    case "json": {
+      const processor = fileProcessors.json;
+      return processor(content, projectSeparator, fileOptions, langCode);
+    }
+    case "flutterArb": {
+      const processor = fileProcessors.flutterArb;
+      return processor(content, projectSeparator);
+    }
+    case "typescript": {
+      const processor = fileProcessors.typescript;
+      return processor(content, projectSeparator);
+    }
+    case "yaml": {
+      const processor = fileProcessors.yaml;
+      return processor(content, projectSeparator, fileOptions, langCode);
+    }
+    case "neon": {
+      const processor = fileProcessors.neon;
+      return processor(content, projectSeparator, fileOptions, langCode);
+    }
+    case "po": {
+      const processor = fileProcessors.po;
+      return processor(content, projectSeparator, fileOptions, langCode);
+    }
+    default:
+      return assertNever$1(format);
+  }
+}
+
+function processLocalValue(value, emptyValueString) {
+  if (emptyValueString != null && value === emptyValueString) {
+    return null;
+  }
+  return value;
+}
+
+async function gatherLocalKeys({
+  allFilesByPattern,
+  keySeparator,
+  emptyValueString
+}) {
+  var _a, _b;
+  const localAllFiles = [];
+  const mergedKeysByKeyByNamespace = {};
+  const mergedKeysInLocalOrder = {};
+  const languagesOnLocal = /* @__PURE__ */ new Set();
+  for (const allFilesForTemplate of Object.values(allFilesByPattern)) {
+    for (const file of allFilesForTemplate) {
+      languagesOnLocal.add(file.lang);
+      const format = file.fileFormat;
+      if (!format) {
+        throw new Error(`File format not found`);
+      }
+      const processed = await detectAndProcessTranslationFile({
+        content: file.content,
+        format,
+        projectSeparator: keySeparator,
+        fileOptions: file.usedOptions ?? void 0,
+        langCode: file.lang
+      });
+      const { fileFormat } = processed;
+      const keys = extendKeysWithNamespaceAndSource(
+        processed.keys,
+        file.namespace,
+        file.source
+      );
+      file.fileFormat = fileFormat;
+      mergedKeysByKeyByNamespace[_a = file.namespace] ?? (mergedKeysByKeyByNamespace[_a] = {});
+      const mergedKeysByKey = mergedKeysByKeyByNamespace[file.namespace];
+      for (const [key, val] of keys) {
+        if (mergedKeysByKey[key]) {
+          mergedKeysByKey[key].translations[file.lang] = {
+            local: {
+              value: processLocalValue(val.value, emptyValueString)
+            }
+          };
+        } else {
+          mergedKeysByKey[key] = {
+            key,
+            translations: {
+              [file.lang]: {
+                local: {
+                  value: processLocalValue(val.value, emptyValueString)
+                }
+              }
+            },
+            local: {
+              // filePathTemplate: pathTemplate,
+              fileFormat,
+              description: val.description,
+              meta: val.meta,
+              namespace: file.namespace,
+              source: file.source
+            }
+          };
+        }
+        mergedKeysInLocalOrder[_b = file.path] ?? (mergedKeysInLocalOrder[_b] = { lang: file.lang, keys: [] });
+        mergedKeysInLocalOrder[file.path].keys.push(mergedKeysByKey[key]);
+      }
+    }
+    localAllFiles.push(...allFilesForTemplate);
+  }
+  return {
+    languagesOnLocal,
+    mergedKeysByKeyByNamespace,
+    mergedKeysInLocalOrder
+  };
+}
+function extendKeysWithNamespaceAndSource(keys, namespace, source) {
+  return new Map(
+    [...keys.entries()].map(([key, value]) => {
+      return [
+        key,
+        {
+          ...value,
+          namespace,
+          source
+        }
+      ];
+    })
+  );
+}
+
+async function gatherTransformKeys({
+  transformConfigs,
+  transforms,
+  fileAPI,
+  emptyValueString,
+  cwd
+}) {
+  const mergedKeysByKeyByNamespace = {};
+  const languagesOnLocal = /* @__PURE__ */ new Set();
+  for (const config of transformConfigs) {
+    const namespace = exists(config.namespace, "Transform must have namespace");
+    const transform = exists(
+      transforms.get(config.path),
+      `Transform not loaded for "${config.path}"`
+    );
+    const pathPattern = config.path.replace(/^\.\//, "");
+    const fullPath = cwd ? join(cwd, pathPattern) : pathPattern;
+    const content = await fileAPI.readFile(fullPath);
+    let result;
+    try {
+      result = transform.push(content);
+    } catch (err) {
+      throw new Error(
+        `Transform push failed for "${config.path}": ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    mergedKeysByKeyByNamespace[namespace] ?? (mergedKeysByKeyByNamespace[namespace] = {});
+    const mergedKeysByKey = mergedKeysByKeyByNamespace[namespace];
+    for (const [lang, keys] of Object.entries(result)) {
+      if (config.languages && !config.languages.includes(lang)) {
+        continue;
+      }
+      const remoteLang = config.mapLocalToRemote?.[lang] ?? lang;
+      languagesOnLocal.add(remoteLang);
+      for (const [key, value] of Object.entries(keys)) {
+        if (mergedKeysByKey[key]) {
+          mergedKeysByKey[key].translations[remoteLang] = {
+            local: {
+              value: processLocalValue(value, emptyValueString)
+            }
+          };
+        } else {
+          mergedKeysByKey[key] = {
+            key,
+            translations: {
+              [remoteLang]: {
+                local: {
+                  value: processLocalValue(value, emptyValueString)
+                }
+              }
+            },
+            local: {
+              fileFormat: "json",
+              namespace,
+              source: ""
+            }
+          };
+        }
+      }
+    }
+  }
+  return { mergedKeysByKeyByNamespace, languagesOnLocal };
+}
+
+async function gatherSyncLocalKeys({
+  allFilesByPattern,
+  keySeparator,
+  emptyValueString,
+  transformConfigs = [],
+  transforms = /* @__PURE__ */ new Map(),
+  fileAPI,
+  cwd
+}) {
+  const result = await gatherLocalKeys({
+    allFilesByPattern,
+    keySeparator,
+    emptyValueString
+  });
+  const { languagesOnLocal, mergedKeysByKeyByNamespace } = result;
+  const hasTransforms = transformConfigs.length > 0 && fileAPI;
+  if (hasTransforms) {
+    const transformResult = await gatherTransformKeys({
+      transformConfigs,
+      transforms,
+      fileAPI,
+      emptyValueString,
+      cwd
+    });
+    for (const [ns, keys] of Object.entries(
+      transformResult.mergedKeysByKeyByNamespace
+    )) {
+      mergedKeysByKeyByNamespace[ns] ?? (mergedKeysByKeyByNamespace[ns] = {});
+      Object.assign(mergedKeysByKeyByNamespace[ns], keys);
+    }
+    for (const lang of transformResult.languagesOnLocal) {
+      languagesOnLocal.add(lang);
+    }
+  }
+  return result;
+}
+
+function assertNever(x) {
   throw new Error(`Unexpected value: ${x}`);
 }
 
@@ -3883,47 +4348,68 @@ const coerce = {
     date: ((arg) => ZodDate.create({ ...arg, coerce: true })),
 };
 
-const languageCode = stringType().min(1);
-const fields = {
-  term: stringType().min(1),
-  sourceLanguageCode: languageCode,
-  description: stringType().nullable().optional(),
-  translations: recordType(languageCode, stringType()).optional()
-};
-const glossaryUpsertSchema = objectType(fields).strict();
-const glossaryUpdateSchema = objectType({
-  ...fields,
-  term: fields.term.optional(),
-  sourceLanguageCode: fields.sourceLanguageCode.optional(),
-  removeTranslations: arrayType(languageCode).optional()
+function keyIdentity(key) {
+  return JSON.stringify([key.namespace, key.key]);
+}
+
+const SCOPED_PUSH_PREVIEW_CAPABILITY = "scoped-push-preview-v1";
+const pushPreviewSelection = objectType({
+  keys: arrayType(stringType().min(1).max(1e3)).max(1e3),
+  namespaces: arrayType(stringType().min(1).max(1e3)).max(1e3),
+  prune: booleanType(),
+  localKeys: arrayType(
+    objectType({
+      key: stringType().min(1),
+      namespace: stringType(),
+      translations: recordType(
+        stringType().min(1).max(50),
+        stringType().regex(/^[a-f0-9]{64}$/).nullable()
+      )
+    })
+  ).max(25e4)
 }).strict().refine(
-  (input) => Object.values(input).some((value) => value !== void 0),
+  (input) => {
+    const patterns = [...input.keys, ...input.namespaces];
+    return patterns.length <= 64 && patterns.reduce((sum, pattern) => sum + pattern.length, 0) <= 4096 && patterns.every((pattern) => !/[{}]/.test(pattern));
+  },
+  { message: "Selection requires the complete lookup" }
+).refine((input) => input.keys.length + input.namespaces.length > 0, {
+  message: "A key or namespace selection is required"
+}).refine(
+  (input) => new Set(input.localKeys.map(keyIdentity)).size === input.localKeys.length,
   {
-    message: "Provide at least one field to update."
+    message: "Local key identities must be unique"
   }
-).refine(
-  (input) => !input.removeTranslations?.some(
-    (code) => input.translations?.[code] !== void 0
-  ),
-  { message: "Cannot set and remove the same translation." }
 );
-const glossaryFileSchema = objectType({
-  version: literalType(1),
-  terms: arrayType(glossaryUpsertSchema).max(1e4)
-}).strict().superRefine((file, ctx) => {
-  const seen = /* @__PURE__ */ new Set();
-  file.terms.forEach((term, index) => {
-    const identity = JSON.stringify([term.term, term.sourceLanguageCode]);
-    if (seen.has(identity)) {
-      ctx.addIssue({
-        code: ZodIssueCode.custom,
-        path: ["terms", index],
-        message: "Duplicate term and source language."
-      });
-    }
-    seen.add(identity);
-  });
-});
+
+function getNamespace$1(key) {
+  if ("namespace" in key) {
+    return key.namespace;
+  }
+  return key.local?.namespace ?? key.server?.namespace ?? "";
+}
+function getComparisonKey(key) {
+  return `${getNamespace$1(key)}:${key.key}`;
+}
+function formatNamespacedKey(key) {
+  const namespace = getNamespace$1(key);
+  return namespace ? `${key.key} [${namespace}]` : key.key;
+}
+
+function createPushPreviewManifest(local) {
+  return Object.values(local.mergedKeysByKeyByNamespace).flatMap(
+    (keys) => Object.values(keys).map((key) => ({
+      key: key.key,
+      namespace: getNamespace$1(key),
+      translations: Object.fromEntries(
+        Object.entries(key.translations).map(([language, translation]) => [
+          language,
+          translation.local?.value == null ? null : createHash("sha256").update(translation.local.value).digest("hex")
+        ])
+      )
+    }))
+  );
+}
 
 function hasCurrentApproval(summary) {
   if (!summary) return false;
@@ -4094,6 +4580,289 @@ function withReviewCapability(init) {
 function sleep$1(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+async function fetchServerKeys(host, projectId, accessToken) {
+  return requestCliJson(`${host}/api/cli/${projectId}/allKeys`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+}
+async function fetchProjectInfo(host, projectId, accessToken) {
+  const result = await requestCliJson(
+    `${host}/api/cli/${projectId}/project`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      }
+    }
+  );
+  return result.project;
+}
+async function getCliProject(host, projectId, accessToken) {
+  return fetchCliJson(`${host}/api/cli/${projectId}/project`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+}
+async function requestTranslation(host, projectId, accessToken, keys, model = "production", maxCreditUnits, quality) {
+  return requestCliJson(
+    `${host}/api/cli/${projectId}/translate`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        keys,
+        model,
+        maxCreditUnits,
+        ...qualityFields(quality)
+      })
+    }
+  );
+}
+async function estimateTranslation(host, projectId, accessToken, keys, model = "production", quality) {
+  return requestCliJson(
+    `${host}/api/cli/${projectId}/estimate`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ keys, model, ...qualityFields(quality) })
+    }
+  );
+}
+function qualityFields(quality) {
+  return {
+    ...quality?.primaryLanguage ? { primaryLanguage: quality.primaryLanguage } : {},
+    ...quality?.referenceMode ? { referenceMode: quality.referenceMode } : {},
+    ...quality?.replaceExisting ? { replaceExisting: true } : {},
+    ...quality?.allowUnapprovedSources ? { allowUnapprovedSources: true } : {}
+  };
+}
+async function fetchJobStatus(host, projectId, accessToken, jobId) {
+  const result = await requestCliJson(`${host}/api/cli/${projectId}/job/${jobId}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+  return { ...result, failures: result.failures ?? [] };
+}
+async function fetchQuestions(host, projectId, accessToken, scope) {
+  const json = await requestCliJson(
+    `${host}/api/cli/${projectId}/questions${scope ? `?scope=${encodeURIComponent(JSON.stringify(scope))}` : ""}`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }
+  );
+  if (scope && json.scopeVersion !== 1)
+    throw new CliRequestError({
+      code: "unsupported_question_scope",
+      message: "This server does not support scoped question inspection. Update the server before trusting job-scoped follow-up."
+    });
+  return json.questions;
+}
+async function submitAnswers(host, projectId, accessToken, answers) {
+  return requestCliJson(`${host}/api/cli/${projectId}/answers`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ answers })
+  });
+}
+async function fetchPendingReviews(host, projectId, accessToken) {
+  const json = await requestCliJson(
+    `${host}/api/cli/${projectId}/pendingReviews`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }
+  );
+  return json.pending;
+}
+async function pingServer(host, cliVersion) {
+  let json;
+  try {
+    json = await requestCliJson(`${host}/api/cli/ping`);
+  } catch (error) {
+    if (error instanceof CliRequestError && error.httpStatus !== void 0) {
+      console.error(`Could not connect to server at ${host}`);
+      process.exit(1);
+    }
+    throw error;
+  }
+  const baseVersion = (v) => v.replace(/[-+].*$/, "");
+  if (baseVersion(json.cliVersion) !== baseVersion(cliVersion)) {
+    console.warn(
+      `Your CLI version is different from the server version, please update. Your version is ${cliVersion}, but the server is ${json.cliVersion}.`
+    );
+  }
+  return json;
+}
+async function listCliKeys(host, projectId, accessToken, options) {
+  const searchParams = new URLSearchParams();
+  if (options.includeArchived) {
+    searchParams.set("includeArchived", "true");
+  }
+  if (options.query) {
+    searchParams.set("query", options.query);
+  }
+  const suffix = searchParams.size ? `?${searchParams.toString()}` : "";
+  return fetchCliJson(`${host}/api/cli/${projectId}/keys${suffix}`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+}
+async function getCliKey(host, projectId, accessToken, input) {
+  return postCliJson(
+    `${host}/api/cli/${projectId}/keys/get`,
+    accessToken,
+    input
+  );
+}
+async function addCliKey(host, projectId, accessToken, input) {
+  return postCliJson(`${host}/api/cli/${projectId}/keys`, accessToken, input);
+}
+async function updateCliKey(host, projectId, accessToken, input) {
+  return patchCliJson(
+    `${host}/api/cli/${projectId}/keys/update`,
+    accessToken,
+    input
+  );
+}
+async function renameCliKey(host, projectId, accessToken, input) {
+  return patchCliJson(
+    `${host}/api/cli/${projectId}/keys/rename`,
+    accessToken,
+    input
+  );
+}
+async function archiveCliKey(host, projectId, accessToken, input) {
+  return postCliJson(
+    `${host}/api/cli/${projectId}/keys/archive`,
+    accessToken,
+    input
+  );
+}
+async function unarchiveCliKey(host, projectId, accessToken, input) {
+  return postCliJson(
+    `${host}/api/cli/${projectId}/keys/unarchive`,
+    accessToken,
+    input
+  );
+}
+async function upsertCliTranslation(host, projectId, accessToken, input) {
+  return postCliJson(
+    `${host}/api/cli/${projectId}/translations/upsert`,
+    accessToken,
+    input
+  );
+}
+async function listCliOrganizations(host, accessToken) {
+  return fetchCliJson(`${host}/api/cli/organizations`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+}
+async function createCliProject(host, accessToken, input) {
+  return postCliJson(`${host}/api/cli/projects`, accessToken, input);
+}
+async function postCliJson(url, accessToken, body) {
+  return fetchCliJson(url, {
+    body: JSON.stringify(body),
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    method: "POST"
+  });
+}
+async function patchCliJson(url, accessToken, body) {
+  return fetchCliJson(url, {
+    body: JSON.stringify(body),
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    method: "PATCH"
+  });
+}
+async function fetchCliJson(url, init) {
+  return requestCliJson(url, init);
+}
+
+async function fetchSyncKeys(context, input, localKeys) {
+  const selection = input.action === "push" && input.dryRun && !input.keysToRemove?.length && (input.keys?.length ?? 0) + (input.namespaces?.length ?? 0) > 0 && context.capabilities.includes(SCOPED_PUSH_PREVIEW_CAPABILITY);
+  const request = selection ? pushPreviewSelection.safeParse({
+    keys: input.keys ?? [],
+    namespaces: input.namespaces ?? [],
+    prune: input.prune === true,
+    localKeys: createPushPreviewManifest(localKeys)
+  }) : null;
+  if (!request?.success)
+    return {
+      keys: await fetchServerKeys(
+        context.host,
+        context.projectId,
+        context.accessToken
+      )
+    };
+  return requestCliJson(
+    `${context.host}/api/cli/${context.projectId}/pushPreview`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${context.accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(request.data)
+    }
+  );
+}
+
+const languageCode = stringType().min(1);
+const fields = {
+  term: stringType().min(1),
+  sourceLanguageCode: languageCode,
+  description: stringType().nullable().optional(),
+  translations: recordType(languageCode, stringType()).optional()
+};
+const glossaryUpsertSchema = objectType(fields).strict();
+const glossaryUpdateSchema = objectType({
+  ...fields,
+  term: fields.term.optional(),
+  sourceLanguageCode: fields.sourceLanguageCode.optional(),
+  removeTranslations: arrayType(languageCode).optional()
+}).strict().refine(
+  (input) => Object.values(input).some((value) => value !== void 0),
+  {
+    message: "Provide at least one field to update."
+  }
+).refine(
+  (input) => !input.removeTranslations?.some(
+    (code) => input.translations?.[code] !== void 0
+  ),
+  { message: "Cannot set and remove the same translation." }
+);
+const glossaryFileSchema = objectType({
+  version: literalType(1),
+  terms: arrayType(glossaryUpsertSchema).max(1e4)
+}).strict().superRefine((file, ctx) => {
+  const seen = /* @__PURE__ */ new Set();
+  file.terms.forEach((term, index) => {
+    const identity = JSON.stringify([term.term, term.sourceLanguageCode]);
+    if (seen.has(identity)) {
+      ctx.addIssue({
+        code: ZodIssueCode.custom,
+        path: ["terms", index],
+        message: "Duplicate term and source language."
+      });
+    }
+    seen.add(identity);
+  });
+});
 
 function administrationRequest(ctx, path, method = "GET", body) {
   return requestCliJson(`${ctx.host}/api/cli/${path}`, {
@@ -4299,7 +5068,7 @@ async function glossaryCommand(ctx, input) {
       break;
     }
     default:
-      assertNever$1(action);
+      assertNever(action);
   }
   if (ctx.flags.json) {
     printJson({
@@ -4455,20 +5224,6 @@ const zConfigFileInput = zConfigFileInternal.extend({
   translationFiles: arrayType(zTranslationFileConfigInput)
 });
 
-function getNamespace$1(key) {
-  if ("namespace" in key) {
-    return key.namespace;
-  }
-  return key.local?.namespace ?? key.server?.namespace ?? "";
-}
-function getComparisonKey(key) {
-  return `${getNamespace$1(key)}:${key.key}`;
-}
-function formatNamespacedKey(key) {
-  const namespace = getNamespace$1(key);
-  return namespace ? `${key.key} [${namespace}]` : key.key;
-}
-
 function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysByKeyByNamespace, emptyValueString) {
   const missingLanguagesOnLocal = /* @__PURE__ */ new Set();
   const missingLanguagesOnServer = /* @__PURE__ */ new Set();
@@ -4551,20 +5306,6 @@ function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysBy
     missingTranslationsOnLocalPerLanguage,
     missingOrDifferentKeysOnServer
   };
-}
-
-function exists(value, message) {
-  if (value === null || value === void 0) {
-    throw new Error(message ?? "Assertion failed: Value is null or undefined");
-  }
-  return value;
-}
-function assertNever(x) {
-  throw new Error(`Unexpected value: ${x}`);
-}
-
-function nonNullable(value) {
-  return value !== null && value !== void 0;
 }
 
 function computePushPlan(comparison) {
@@ -8009,356 +8750,6 @@ class AllLanguagesGatherer {
   }
 }
 
-function gatherTranslationsFromMaybeNestedObject(source, projectSeparator) {
-  const translations = /* @__PURE__ */ new Map();
-  if (typeof source !== "object") return translations;
-  if (Array.isArray(source)) return translations;
-  if (source == null) return translations;
-  for (const [key, value] of Object.entries(source)) {
-    if (typeof value === "string") {
-      translations.set(key, {
-        value
-      });
-    } else if (value === null || value === void 0) {
-      translations.set(key, {
-        value
-      });
-    } else {
-      const nestedTranslations = gatherTranslationsFromMaybeNestedObject(
-        value,
-        projectSeparator
-      );
-      for (const [nestedKey, nestedValue] of nestedTranslations.entries()) {
-        translations.set(`${key}${projectSeparator}${nestedKey}`, nestedValue);
-      }
-    }
-  }
-  return translations;
-}
-
-let initialized = null;
-async function typescriptProcessor(fileContent, projectSeparator) {
-  if (!initialized) {
-    await Parser.init({
-      locateFile(scriptName) {
-        return `/${scriptName}`;
-      }
-    });
-    const parser2 = new Parser();
-    const JavaScript2 = await Language.load("/parsers/tree-sitter-tsx.wasm");
-    parser2.setLanguage(JavaScript2);
-    initialized = { parser: parser2, JavaScript: JavaScript2 };
-  }
-  const { parser, JavaScript } = initialized;
-  const tree = parser.parse(fileContent);
-  if (!tree) {
-    return { keys: /* @__PURE__ */ new Map(), fileFormat: "typescript" };
-  }
-  let translations = /* @__PURE__ */ new Map();
-  const startingNode = findStartingNode(tree.rootNode, JavaScript);
-  if (startingNode) {
-    const plainObject = extractObject(startingNode);
-    translations = gatherTranslationsFromMaybeNestedObject(
-      plainObject,
-      projectSeparator
-    );
-  }
-  return { keys: translations, fileFormat: "typescript" };
-}
-function findStartingNode(node, JavaScript) {
-  let queryStr = `
-  (export_statement (expression) @exported)
-  `;
-  let query = new Query(JavaScript, queryStr);
-  let matches = query.matches(node);
-  for (const match of matches) {
-    for (const capture of match.captures) {
-      if (capture.name === "exported") {
-        return capture.node;
-      }
-    }
-  }
-  queryStr = `
-  (expression_statement (assignment_expression left: (member_expression
-    object: (identifier) @object
-    property: (property_identifier) @property
-  ) right: (object) @exported))
-  `;
-  query = new Query(JavaScript, queryStr);
-  matches = query.matches(node);
-  for (const match of matches) {
-    if (match.captures.some(
-      (capture) => capture.name === "object" && capture.node.text === "module"
-    ) && match.captures.some(
-      (capture) => capture.name === "property" && capture.node.text === "exports"
-    )) {
-      for (const capture of match.captures) {
-        if (capture.name === "exported") {
-          return capture.node;
-        }
-      }
-    }
-  }
-  return null;
-}
-function extractObject(node) {
-  if (node.type !== "object") {
-    throw new Error("Node is not an object.");
-  }
-  const obj = {};
-  node.namedChildren.forEach((child) => {
-    if (child?.type === "pair") {
-      const keyNode = child.namedChildren.find(
-        (n) => n?.type === "property_identifier" || n?.type === "string"
-      );
-      const valueNode = child.namedChildren.find(
-        (n) => n?.type !== "property_identifier" && (n?.type === "string" || n?.type === "object")
-      );
-      if (keyNode && valueNode) {
-        const key = keyNode.text;
-        let value;
-        if (valueNode.type === "object") {
-          value = extractObject(valueNode);
-        } else {
-          value = valueNode.text.slice(1, -1);
-        }
-        obj[key] = value;
-      }
-    }
-  });
-  return obj;
-}
-
-const fileProcessors = {
-  json: async (fileContent, projectSeparator) => {
-    const parsed = JSON.parse(fileContent);
-    return {
-      keys: gatherTranslationsFromMaybeNestedObject(parsed, projectSeparator),
-      fileFormat: "json"
-    };
-  },
-  yaml: async (fileContent, projectSeparator, fileOptions, languageCode) => {
-    let parsed = yaml.load(fileContent, {
-      json: true
-    });
-    if (fileOptions?.topLevelLanguageCode) {
-      parsed = parsed[languageCode];
-    }
-    return {
-      keys: gatherTranslationsFromMaybeNestedObject(parsed, projectSeparator),
-      fileFormat: "yaml"
-    };
-  },
-  neon: async (fileContent, projectSeparator, fileOptions, languageCode) => {
-    let parsed = yaml.load(fileContent, { json: true });
-    if (fileOptions?.topLevelLanguageCode) {
-      parsed = parsed[languageCode];
-    }
-    return {
-      keys: gatherTranslationsFromMaybeNestedObject(parsed, projectSeparator),
-      fileFormat: "neon"
-    };
-  },
-  typescript: typescriptProcessor,
-  po: async (fileContent, projectSeparator) => {
-    const translations = /* @__PURE__ */ new Map();
-    const po = PO.parse(fileContent);
-    for (const item of po.items) {
-      if (!item.msgid) continue;
-      if (item.msgid_plural && item.msgstr.length > 1) {
-        const pluralForms = ["zero", "one", "two", "few", "many", "other"];
-        for (let i = 0; i < item.msgstr.length; i++) {
-          if (item.msgstr[i]) {
-            const pluralKey = `${item.msgid}${projectSeparator}${pluralForms[i] || i}`;
-            const val = {
-              value: item.msgstr[i],
-              meta: {
-                msgctxt: item.msgctxt,
-                references: item.references,
-                extractedComments: item.extractedComments,
-                flags: item.flags
-              }
-            };
-            if (item.comments.length > 0) {
-              val.description = item.comments.join(" ");
-            }
-            translations.set(pluralKey, val);
-          }
-        }
-      } else {
-        const val = {
-          value: item.msgstr[0] || null,
-          meta: {
-            msgctxt: item.msgctxt,
-            references: item.references,
-            extractedComments: item.extractedComments,
-            flags: item.flags
-          }
-        };
-        if (item.comments.length > 0) {
-          val.description = item.comments.join(" ");
-        }
-        translations.set(item.msgid, val);
-      }
-    }
-    return { keys: translations, fileFormat: "po" };
-  },
-  flutterArb: async (fileContent) => {
-    const translations = /* @__PURE__ */ new Map();
-    const parsed = JSON.parse(fileContent);
-    for (const [key, value] of Object.entries(parsed)) {
-      if (key.startsWith("@")) continue;
-      if (typeof value === "string") {
-        const metadata = parsed[`@${key}`];
-        const description = typeof metadata?.description === "string" ? metadata.description : void 0;
-        const val = {
-          value,
-          meta: metadata ?? {}
-        };
-        if (description) {
-          val.description = description;
-        }
-        translations.set(key, val);
-      } else {
-        throw new Error(
-          `We don't support nested objects in Flutter ARB files yet. Key: ${key}`
-        );
-      }
-    }
-    return { keys: translations, fileFormat: "flutterArb" };
-  }
-};
-async function detectAndProcessTranslationFile({
-  format,
-  content,
-  projectSeparator,
-  fileOptions,
-  langCode
-}) {
-  switch (format) {
-    case "json": {
-      const processor = fileProcessors.json;
-      return processor(content, projectSeparator, fileOptions, langCode);
-    }
-    case "flutterArb": {
-      const processor = fileProcessors.flutterArb;
-      return processor(content, projectSeparator);
-    }
-    case "typescript": {
-      const processor = fileProcessors.typescript;
-      return processor(content, projectSeparator);
-    }
-    case "yaml": {
-      const processor = fileProcessors.yaml;
-      return processor(content, projectSeparator, fileOptions, langCode);
-    }
-    case "neon": {
-      const processor = fileProcessors.neon;
-      return processor(content, projectSeparator, fileOptions, langCode);
-    }
-    case "po": {
-      const processor = fileProcessors.po;
-      return processor(content, projectSeparator, fileOptions, langCode);
-    }
-    default:
-      return assertNever(format);
-  }
-}
-
-function processLocalValue(value, emptyValueString) {
-  if (emptyValueString != null && value === emptyValueString) {
-    return null;
-  }
-  return value;
-}
-
-async function gatherLocalKeys({
-  allFilesByPattern,
-  keySeparator,
-  emptyValueString
-}) {
-  var _a, _b;
-  const localAllFiles = [];
-  const mergedKeysByKeyByNamespace = {};
-  const mergedKeysInLocalOrder = {};
-  const languagesOnLocal = /* @__PURE__ */ new Set();
-  for (const allFilesForTemplate of Object.values(allFilesByPattern)) {
-    for (const file of allFilesForTemplate) {
-      languagesOnLocal.add(file.lang);
-      const format = file.fileFormat;
-      if (!format) {
-        throw new Error(`File format not found`);
-      }
-      const processed = await detectAndProcessTranslationFile({
-        content: file.content,
-        format,
-        projectSeparator: keySeparator,
-        fileOptions: file.usedOptions ?? void 0,
-        langCode: file.lang
-      });
-      const { fileFormat } = processed;
-      const keys = extendKeysWithNamespaceAndSource(
-        processed.keys,
-        file.namespace,
-        file.source
-      );
-      file.fileFormat = fileFormat;
-      mergedKeysByKeyByNamespace[_a = file.namespace] ?? (mergedKeysByKeyByNamespace[_a] = {});
-      const mergedKeysByKey = mergedKeysByKeyByNamespace[file.namespace];
-      for (const [key, val] of keys) {
-        if (mergedKeysByKey[key]) {
-          mergedKeysByKey[key].translations[file.lang] = {
-            local: {
-              value: processLocalValue(val.value, emptyValueString)
-            }
-          };
-        } else {
-          mergedKeysByKey[key] = {
-            key,
-            translations: {
-              [file.lang]: {
-                local: {
-                  value: processLocalValue(val.value, emptyValueString)
-                }
-              }
-            },
-            local: {
-              // filePathTemplate: pathTemplate,
-              fileFormat,
-              description: val.description,
-              meta: val.meta,
-              namespace: file.namespace,
-              source: file.source
-            }
-          };
-        }
-        mergedKeysInLocalOrder[_b = file.path] ?? (mergedKeysInLocalOrder[_b] = { lang: file.lang, keys: [] });
-        mergedKeysInLocalOrder[file.path].keys.push(mergedKeysByKey[key]);
-      }
-    }
-    localAllFiles.push(...allFilesForTemplate);
-  }
-  return {
-    languagesOnLocal,
-    mergedKeysByKeyByNamespace,
-    mergedKeysInLocalOrder
-  };
-}
-function extendKeysWithNamespaceAndSource(keys, namespace, source) {
-  return new Map(
-    [...keys.entries()].map(([key, value]) => {
-      return [
-        key,
-        {
-          ...value,
-          namespace,
-          source
-        }
-      ];
-    })
-  );
-}
-
 function gatherServerKeys({
   allServerKeys,
   mergedKeysByKeyByNamespace,
@@ -8416,70 +8807,6 @@ function gatherServerKeys({
       }
     }
   }
-}
-
-async function gatherTransformKeys({
-  transformConfigs,
-  transforms,
-  fileAPI,
-  emptyValueString,
-  cwd
-}) {
-  const mergedKeysByKeyByNamespace = {};
-  const languagesOnLocal = /* @__PURE__ */ new Set();
-  for (const config of transformConfigs) {
-    const namespace = exists(config.namespace, "Transform must have namespace");
-    const transform = exists(
-      transforms.get(config.path),
-      `Transform not loaded for "${config.path}"`
-    );
-    const pathPattern = config.path.replace(/^\.\//, "");
-    const fullPath = cwd ? join(cwd, pathPattern) : pathPattern;
-    const content = await fileAPI.readFile(fullPath);
-    let result;
-    try {
-      result = transform.push(content);
-    } catch (err) {
-      throw new Error(
-        `Transform push failed for "${config.path}": ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-    mergedKeysByKeyByNamespace[namespace] ?? (mergedKeysByKeyByNamespace[namespace] = {});
-    const mergedKeysByKey = mergedKeysByKeyByNamespace[namespace];
-    for (const [lang, keys] of Object.entries(result)) {
-      if (config.languages && !config.languages.includes(lang)) {
-        continue;
-      }
-      const remoteLang = config.mapLocalToRemote?.[lang] ?? lang;
-      languagesOnLocal.add(remoteLang);
-      for (const [key, value] of Object.entries(keys)) {
-        if (mergedKeysByKey[key]) {
-          mergedKeysByKey[key].translations[remoteLang] = {
-            local: {
-              value: processLocalValue(value, emptyValueString)
-            }
-          };
-        } else {
-          mergedKeysByKey[key] = {
-            key,
-            translations: {
-              [remoteLang]: {
-                local: {
-                  value: processLocalValue(value, emptyValueString)
-                }
-              }
-            },
-            local: {
-              fileFormat: "json",
-              namespace,
-              source: ""
-            }
-          };
-        }
-      }
-    }
-  }
-  return { mergedKeysByKeyByNamespace, languagesOnLocal };
 }
 
 function generateTranslationConfig(detectedFiles) {
@@ -9896,26 +10223,42 @@ async function readPullOutput(input) {
   return { keys: mergedKeysByKeyByNamespace, changedFiles };
 }
 
-const MATCH_OPTS = { nocomment: true, dot: true };
+function createKeySelectionMatcher(keys, namespaces) {
+  const compiled = /* @__PURE__ */ new Map();
+  const match = (value, pattern) => {
+    let matcher = compiled.get(pattern);
+    if (!matcher) {
+      matcher = new Minimatch(pattern, { nocomment: true, dot: true });
+      compiled.set(pattern, matcher);
+    }
+    return matcher.match(value);
+  };
+  const matchNamespace = (namespace, pattern) => namespace === "" && (pattern === "*" || pattern === "**") || match(namespace, pattern);
+  const keyPatterns = [...new Set(keys)];
+  const namespacePatterns = [...new Set(namespaces)];
+  return (key) => {
+    const namespace = getNamespace$1(key);
+    const matchedKeys = keyPatterns.filter((pattern) => {
+      if (getComparisonKey(key) === pattern || namespace === "" && key.key === pattern)
+        return true;
+      const colon = pattern.indexOf(":");
+      if (colon !== -1)
+        return matchNamespace(namespace, pattern.slice(0, colon)) && match(key.key, pattern.slice(colon + 1));
+      return (pattern === "*" || pattern === "**" || namespaces.length > 0 || namespace === "") && match(key.key, pattern);
+    });
+    const matchedNamespaces = namespacePatterns.filter(
+      (pattern) => matchNamespace(namespace, pattern)
+    );
+    return {
+      matchedKeys,
+      matchedNamespaces,
+      matches: (!keys.length || matchedKeys.length > 0) && (!namespaces.length || matchedNamespaces.length > 0)
+    };
+  };
+}
+
 function isGlob(pattern) {
   return /[*?[\]{}!]/.test(pattern);
-}
-function matchNamespace(ns, pattern) {
-  if (ns === "" && (pattern === "*" || pattern === "**")) return true;
-  return minimatch(ns, pattern, MATCH_OPTS);
-}
-function matchKeyPattern(pattern, key, ns, matchBareKeyInAnyNamespace) {
-  if (getComparisonKey(key) === pattern) return true;
-  if (ns === "" && key.key === pattern) return true;
-  const colon = pattern.indexOf(":");
-  if (colon !== -1) {
-    const nsGlob = pattern.slice(0, colon);
-    const keyGlob = pattern.slice(colon + 1);
-    return matchNamespace(ns, nsGlob) && minimatch(key.key, keyGlob, MATCH_OPTS);
-  }
-  if (pattern === "*" || pattern === "**")
-    return minimatch(key.key, pattern, MATCH_OPTS);
-  return (matchBareKeyInAnyNamespace || ns === "") && minimatch(key.key, pattern, MATCH_OPTS);
 }
 function resolveSelectedKeys(requestedKeys, mergedKeysByKeyByNamespace, requestedNamespaces = []) {
   const allKeys = Object.values(mergedKeysByKeyByNamespace).flatMap(
@@ -9926,21 +10269,18 @@ function resolveSelectedKeys(requestedKeys, mergedKeysByKeyByNamespace, requeste
   const namespaceHits = new Map(
     requestedNamespaces.map((p) => [p, 0])
   );
+  const match = createKeySelectionMatcher(requestedKeys, requestedNamespaces);
   for (const key of allKeys) {
-    const ns = getNamespace$1(key);
-    const matchedKeyPatterns = requestedKeys.filter(
-      (p) => matchKeyPattern(p, key, ns, requestedNamespaces.length > 0)
-    );
-    const keyMatches = requestedKeys.length === 0 || matchedKeyPatterns.length > 0;
-    const matchedNamespacePatterns = requestedNamespaces.filter(
-      (p) => matchNamespace(ns, p)
-    );
-    const namespaceMatches = requestedNamespaces.length === 0 || matchedNamespacePatterns.length > 0;
+    const {
+      matchedKeys: matchedKeyPatterns,
+      matchedNamespaces: matchedNamespacePatterns,
+      matches
+    } = match(key);
     for (const p of matchedKeyPatterns)
       keyHits.set(p, (keyHits.get(p) ?? 0) + 1);
     for (const p of matchedNamespacePatterns)
       namespaceHits.set(p, (namespaceHits.get(p) ?? 0) + 1);
-    if (keyMatches && namespaceMatches) {
+    if (matches) {
       selected.add(getComparisonKey(key));
     }
   }
@@ -10055,6 +10395,8 @@ async function runCli({
   allFilesByPattern,
   projectInfo,
   allServerKeys,
+  withheldChanges,
+  localKeys,
   getFilePatternOrPath,
   writeFile,
   removeFile,
@@ -10074,30 +10416,16 @@ async function runCli({
     languagesOnLocal,
     mergedKeysByKeyByNamespace,
     mergedKeysInLocalOrder
-  } = await gatherLocalKeys({
+  } = localKeys ?? await gatherSyncLocalKeys({
     allFilesByPattern,
     keySeparator: projectInfo.keySeparator,
-    emptyValueString
+    emptyValueString,
+    transformConfigs,
+    transforms,
+    fileAPI,
+    cwd
   });
   const hasTransforms = transformConfigs.length > 0 && fileAPI;
-  if (hasTransforms) {
-    const transformResult = await gatherTransformKeys({
-      transformConfigs,
-      transforms,
-      fileAPI,
-      emptyValueString,
-      cwd
-    });
-    for (const [ns, keys] of Object.entries(
-      transformResult.mergedKeysByKeyByNamespace
-    )) {
-      mergedKeysByKeyByNamespace[ns] ?? (mergedKeysByKeyByNamespace[ns] = {});
-      Object.assign(mergedKeysByKeyByNamespace[ns], keys);
-    }
-    for (const lang of transformResult.languagesOnLocal) {
-      languagesOnLocal.add(lang);
-    }
-  }
   let pullResult;
   gatherServerKeys({
     allServerKeys,
@@ -10143,7 +10471,7 @@ async function runCli({
       const pushed = Object.keys(scopedComparison.missingOrDifferentKeysOnServer).length + (scopedComparison.keysToRemove?.length ?? 0);
       pushFilterSummary = {
         pushed,
-        withheld: keysBefore - pushed,
+        withheld: withheldChanges ?? keysBefore - pushed,
         patterns: [...filterKeys ?? [], ...filterNamespaces ?? []].join(
           ", "
         )
@@ -10264,217 +10592,6 @@ const CliFileApi = {
     return glob(pattern, { cwd: options?.cwd, posix: true });
   }
 };
-
-async function fetchServerKeys(host, projectId, accessToken) {
-  return requestCliJson(`${host}/api/cli/${projectId}/allKeys`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    }
-  });
-}
-async function fetchProjectInfo(host, projectId, accessToken) {
-  const result = await requestCliJson(
-    `${host}/api/cli/${projectId}/project`,
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`
-      }
-    }
-  );
-  return result.project;
-}
-async function getCliProject(host, projectId, accessToken) {
-  return fetchCliJson(`${host}/api/cli/${projectId}/project`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-}
-async function requestTranslation(host, projectId, accessToken, keys, model = "production", maxCreditUnits, quality) {
-  return requestCliJson(
-    `${host}/api/cli/${projectId}/translate`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        keys,
-        model,
-        maxCreditUnits,
-        ...qualityFields(quality)
-      })
-    }
-  );
-}
-async function estimateTranslation(host, projectId, accessToken, keys, model = "production", quality) {
-  return requestCliJson(
-    `${host}/api/cli/${projectId}/estimate`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ keys, model, ...qualityFields(quality) })
-    }
-  );
-}
-function qualityFields(quality) {
-  return {
-    ...quality?.primaryLanguage ? { primaryLanguage: quality.primaryLanguage } : {},
-    ...quality?.referenceMode ? { referenceMode: quality.referenceMode } : {},
-    ...quality?.replaceExisting ? { replaceExisting: true } : {}
-  };
-}
-async function fetchJobStatus(host, projectId, accessToken, jobId) {
-  const result = await requestCliJson(`${host}/api/cli/${projectId}/job/${jobId}`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    }
-  });
-  return { ...result, failures: result.failures ?? [] };
-}
-async function fetchQuestions(host, projectId, accessToken, scope) {
-  const json = await requestCliJson(
-    `${host}/api/cli/${projectId}/questions${scope ? `?scope=${encodeURIComponent(JSON.stringify(scope))}` : ""}`,
-    {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    }
-  );
-  if (scope && json.scopeVersion !== 1)
-    throw new CliRequestError({
-      code: "unsupported_question_scope",
-      message: "This server does not support scoped question inspection. Update the server before trusting job-scoped follow-up."
-    });
-  return json.questions;
-}
-async function submitAnswers(host, projectId, accessToken, answers) {
-  return requestCliJson(`${host}/api/cli/${projectId}/answers`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ answers })
-  });
-}
-async function fetchPendingReviews(host, projectId, accessToken) {
-  const json = await requestCliJson(
-    `${host}/api/cli/${projectId}/pendingReviews`,
-    {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    }
-  );
-  return json.pending;
-}
-async function pingServer(host, cliVersion) {
-  let json;
-  try {
-    json = await requestCliJson(`${host}/api/cli/ping`);
-  } catch (error) {
-    if (error instanceof CliRequestError && error.httpStatus !== void 0) {
-      console.error(`Could not connect to server at ${host}`);
-      process.exit(1);
-    }
-    throw error;
-  }
-  const baseVersion = (v) => v.replace(/[-+].*$/, "");
-  if (baseVersion(json.cliVersion) !== baseVersion(cliVersion)) {
-    console.warn(
-      `Your CLI version is different from the server version, please update. Your version is ${cliVersion}, but the server is ${json.cliVersion}.`
-    );
-  }
-  return json;
-}
-async function listCliKeys(host, projectId, accessToken, options) {
-  const searchParams = new URLSearchParams();
-  if (options.includeArchived) {
-    searchParams.set("includeArchived", "true");
-  }
-  if (options.query) {
-    searchParams.set("query", options.query);
-  }
-  const suffix = searchParams.size ? `?${searchParams.toString()}` : "";
-  return fetchCliJson(`${host}/api/cli/${projectId}/keys${suffix}`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-}
-async function getCliKey(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/keys/get`,
-    accessToken,
-    input
-  );
-}
-async function addCliKey(host, projectId, accessToken, input) {
-  return postCliJson(`${host}/api/cli/${projectId}/keys`, accessToken, input);
-}
-async function updateCliKey(host, projectId, accessToken, input) {
-  return patchCliJson(
-    `${host}/api/cli/${projectId}/keys/update`,
-    accessToken,
-    input
-  );
-}
-async function renameCliKey(host, projectId, accessToken, input) {
-  return patchCliJson(
-    `${host}/api/cli/${projectId}/keys/rename`,
-    accessToken,
-    input
-  );
-}
-async function archiveCliKey(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/keys/archive`,
-    accessToken,
-    input
-  );
-}
-async function unarchiveCliKey(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/keys/unarchive`,
-    accessToken,
-    input
-  );
-}
-async function upsertCliTranslation(host, projectId, accessToken, input) {
-  return postCliJson(
-    `${host}/api/cli/${projectId}/translations/upsert`,
-    accessToken,
-    input
-  );
-}
-async function listCliOrganizations(host, accessToken) {
-  return fetchCliJson(`${host}/api/cli/organizations`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-}
-async function createCliProject(host, accessToken, input) {
-  return postCliJson(`${host}/api/cli/projects`, accessToken, input);
-}
-async function postCliJson(url, accessToken, body) {
-  return fetchCliJson(url, {
-    body: JSON.stringify(body),
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    method: "POST"
-  });
-}
-async function patchCliJson(url, accessToken, body) {
-  return fetchCliJson(url, {
-    body: JSON.stringify(body),
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    method: "PATCH"
-  });
-}
-async function fetchCliJson(url, init) {
-  return requestCliJson(url, init);
-}
 
 async function humanReviewCommand(input) {
   const parsed = await loadConfigFile(CliFileApi);
@@ -11222,10 +11339,10 @@ function computeTranslationWork(params) {
       if (!serverId) continue;
       if (onlyExisting && !key.local) continue;
       if (selectedKeys && !selectedKeys.has(getComparisonKey(key))) continue;
-      const hasSourceApproval = Object.entries(key.translations).some(
-        ([code, translation]) => !targetLanguages.includes(code) && hasCurrentApproval(translation.server?.quality) && !translation.server?.quality?.unresolvedConcernIds.length && Boolean(translation.server?.currentValue?.trim())
+      const hasUsableSource = Object.entries(key.translations).some(
+        ([code, translation]) => !targetLanguages.includes(code) && (params.allowUnapprovedSources || hasCurrentApproval(translation.server?.quality)) && !translation.server?.quality?.unresolvedConcernIds.length && Boolean(translation.server?.currentValue?.trim())
       );
-      if (!hasSourceApproval) continue;
+      if (!hasUsableSource) continue;
       const missingLanguages = [];
       for (const lang of targetLanguages) {
         if (languageFilter && !languageFilter.has(lang)) continue;
@@ -13874,11 +13991,12 @@ ${Bold}Estimate: ${summary.keys} key(s), ${summary.language_pairs} language pair
   return 0;
 }
 function translationQuality(input) {
-  if (!input.primaryLanguage && !input.referenceMode && input.strategy !== "replace")
+  if (!input.primaryLanguage && !input.referenceMode && !input.allowUnapprovedSources && input.strategy !== "replace")
     return void 0;
   return {
     primaryLanguage: input.primaryLanguage,
     referenceMode: input.referenceMode,
+    ...input.allowUnapprovedSources ? { allowUnapprovedSources: true } : {},
     ...input.strategy === "replace" ? { replaceExisting: true } : {}
   };
 }
@@ -13963,6 +14081,7 @@ function computeWork(input) {
   }
   return computeTranslationWork({
     mergedKeysByKeyByNamespace: input.syncResult.mergedKeysByKeyByNamespace,
+    allowUnapprovedSources: input.allowUnapprovedSources,
     targetLanguages: input.targetLanguages,
     strategy: input.strategy,
     onlyExisting: input.onlyExisting,
@@ -14256,6 +14375,9 @@ ${agentTranslationGuidance}
   "--wait",
   "Block and poll until the job finishes (non-interactive mode returns the job id immediately by default)"
 ).option("--timeout <seconds>", "Max wait time when polling", "300").option(
+  "--allow-unapproved-sources",
+  "Translate sources without a current AI pass or human approval"
+).option(
   "--primary-language <code>",
   "Primary source language when the project has more than one source"
 ).option(
@@ -14314,6 +14436,7 @@ ${agentTranslationGuidance}
         timeout,
         wait: options.wait === true,
         primaryLanguage: options.primaryLanguage,
+        allowUnapprovedSources: options.allowUnapprovedSources,
         referenceMode
       }
     });
@@ -14707,11 +14830,6 @@ async function performSync(ctx, cliInput, translationFilesConfig, transforms) {
     ctx.projectId,
     ctx.accessToken
   );
-  const allServerKeys = await fetchServerKeys(
-    ctx.host,
-    ctx.projectId,
-    ctx.accessToken
-  );
   const standardConfigs = translationFilesConfig.filter((c) => !c.transform);
   const transformConfigs = translationFilesConfig.filter((c) => c.transform);
   const allFilesByPattern = await gatherLocalFiles(
@@ -14722,6 +14840,16 @@ async function performSync(ctx, cliInput, translationFilesConfig, transforms) {
     translationFilesConfig: standardConfigs,
     defaultFilePattern: ctx.defaultFilePattern
   });
+  const localKeys = await gatherSyncLocalKeys({
+    allFilesByPattern,
+    keySeparator: projectInfo.keySeparator,
+    emptyValueString: ctx.emptyValueString,
+    transformConfigs,
+    transforms,
+    fileAPI: CliFileApi,
+    cwd: process.cwd()
+  });
+  const snapshot = await fetchSyncKeys(ctx, cliInput, localKeys);
   const noInteractionPrompt = {
     confirm: async () => true,
     select: async ({ choices }) => choices[0]?.value ?? ""
@@ -14735,7 +14863,9 @@ async function performSync(ctx, cliInput, translationFilesConfig, transforms) {
     cliInput: resolvedCliInput,
     allFilesByPattern,
     projectInfo,
-    allServerKeys,
+    allServerKeys: snapshot.keys,
+    withheldChanges: "withheldChanges" in snapshot ? snapshot.withheldChanges : void 0,
+    localKeys,
     getFilePatternOrPath,
     writeFile,
     removeFile: (file) => fs__default.rm(file, { force: true }),
@@ -14884,6 +15014,7 @@ async function runAction(cliInput, flags) {
     projectId,
     accessToken,
     flags,
+    capabilities: server.capabilities ?? [],
     emptyValueString: parsed.emptyValueString,
     defaultFilePattern: parsed.defaultFilePattern
   };
@@ -15104,6 +15235,7 @@ async function runAction(cliInput, flags) {
       estimate: cliInput.options.estimate,
       maxCreditUnits: cliInput.options.maxCreditUnits,
       primaryLanguage: cliInput.options.primaryLanguage,
+      allowUnapprovedSources: cliInput.options.allowUnapprovedSources,
       referenceMode: cliInput.options.referenceMode,
       timeout: cliInput.options.timeout,
       wait: cliInput.options.wait
