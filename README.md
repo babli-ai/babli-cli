@@ -1,5 +1,4 @@
-> Read-only mirror of the published `babli` CLI. Source lives in the monorepo
-> (infi-pc/babli). Install with `npm i -g babli`.
+> Read-only mirror of the published `babli` CLI. Source lives in the monorepo (infi-pc/babli). Install with `npm i -g babli`.
 
 # Babli CLI
 

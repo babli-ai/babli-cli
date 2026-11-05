@@ -491,7 +491,7 @@ function assertNever(x) {
 
 function unwrap(value, message) {
   if (value === null || value === void 0) {
-    throw new Error("Unwrap failed: value is null or undefined");
+    throw new Error(message ?? "Unwrap failed: value is null or undefined");
   }
   return value;
 }
@@ -4581,10 +4581,21 @@ function sleep$1(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const COMPACT_CLI_QUALITY_HEADER = "X-Babli-Quality";
+const COMPACT_CLI_QUALITY_VERSION = "compact-v1";
+function summarizeCliQuality(quality) {
+  if (quality && "approved" in quality) return quality;
+  return {
+    approved: hasCurrentApproval(quality),
+    blocked: Boolean(quality?.unresolvedConcernIds.length)
+  };
+}
+
 async function fetchServerKeys(host, projectId, accessToken) {
   return requestCliJson(`${host}/api/cli/${projectId}/allKeys`, {
     headers: {
-      Authorization: `Bearer ${accessToken}`
+      Authorization: `Bearer ${accessToken}`,
+      [COMPACT_CLI_QUALITY_HEADER]: COMPACT_CLI_QUALITY_VERSION
     }
   });
 }
@@ -5224,6 +5235,14 @@ const zConfigFileInput = zConfigFileInternal.extend({
   translationFiles: arrayType(zTranslationFileConfigInput)
 });
 
+function compareTranslationValues(local, server, emptyValueString) {
+  return {
+    missingOnLocal: local == null && server != null && !(emptyValueString === "" && server === ""),
+    missingOnServer: server == null && local != null,
+    different: local != null && server != null && local !== server
+  };
+}
+
 function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysByKeyByNamespace, emptyValueString) {
   const missingLanguagesOnLocal = /* @__PURE__ */ new Set();
   const missingLanguagesOnServer = /* @__PURE__ */ new Set();
@@ -5254,17 +5273,21 @@ function compareLocalAndServer(languagesOnServer, languagesOnLocal, mergedKeysBy
         missingOrDifferentKeysOnServer[comparisonKey] = key;
       }
       for (const [lang, translation] of Object.entries(key.translations)) {
-        const configuredEmptyOnBothSides = emptyValueString === "" && translation?.local?.value == null && translation?.server?.currentValue === "";
-        if (translation?.local?.value == void 0 && translation?.server?.currentValue != void 0 && !configuredEmptyOnBothSides) {
+        const difference = compareTranslationValues(
+          translation?.local?.value,
+          translation?.server?.currentValue,
+          emptyValueString
+        );
+        if (difference.missingOnLocal) {
           missingTranslationsOnLocalPerLanguage[lang] ?? (missingTranslationsOnLocalPerLanguage[lang] = []);
           missingTranslationsOnLocalPerLanguage[lang].push(key);
         }
-        if (translation?.server?.currentValue == void 0 && translation?.local?.value != void 0) {
+        if (difference.missingOnServer) {
           missingTranslationsOnServerPerLanguage[lang] ?? (missingTranslationsOnServerPerLanguage[lang] = []);
           missingTranslationsOnServerPerLanguage[lang].push(key);
           missingOrDifferentKeysOnServer[getComparisonKey(key)] = key;
         }
-        if (translation?.local?.value != void 0 && translation?.server?.currentValue != void 0 && translation.local.value !== translation.server.currentValue) {
+        if (difference.different) {
           differentTranslationsLanguage[lang] ?? (differentTranslationsLanguage[lang] = []);
           differentTranslationsLanguage[lang].push(key);
           missingOrDifferentKeysOnServer[getComparisonKey(key)] = key;
@@ -11171,6 +11194,23 @@ if (major < 20 || major === 20 && minor < 11) {
   process.exit(1);
 }
 
+function summarizeSyncStatus(status) {
+  const translations = Object.values(status.toPull.missingTranslations);
+  return {
+    newKeys: status.toPush.newKeys.length,
+    changedValues: status.toPush.changedValues.length,
+    newLanguages: status.languages.localOnly.length,
+    pushLanguages: Object.keys(status.toPush.missingTranslations).length,
+    pullKeys: status.toPull.missingKeys.length,
+    pullTranslations: translations.reduce((sum, keys) => sum + keys.length, 0),
+    pullLanguages: Object.keys(status.toPull.missingTranslations).length,
+    pullDistinctKeys: new Set(translations.flat()).size,
+    serverOnlyKeys: status.issues.serverOnlyKeys.length,
+    needPush: status.needPush,
+    needPull: status.needPull
+  };
+}
+
 const agentTranslationGuidance = `Agents must prepare descriptions before translation.
 1. Push new keys and source changes first: babli push --json --no-interaction.
 2. Export current context: babli key export --language <source-code> --output keys.json.
@@ -11182,7 +11222,7 @@ const agentTranslationGuidance = `Agents must prepare descriptions before transl
 Record unclear keys as unresolved; leave them out of translation until clarified.
 Use sync-and-translate only after descriptions cover its selected keys and source changes.`;
 
-function count(amount, noun) {
+function count$1(amount, noun) {
   return amount > 0 ? `${amount} ${noun}${amount === 1 ? "" : "s"}` : null;
 }
 function assertNoUnpushedChanges(status) {
@@ -11191,10 +11231,10 @@ function assertNoUnpushedChanges(status) {
     status.toPush.missingTranslations
   ).reduce((sum, keys) => sum + keys.length, 0);
   const parts = [
-    count(status.toPush.newKeys.length, "new key"),
-    count(status.toPush.changedValues.length, "changed translation"),
-    count(missingTranslations, "missing translation"),
-    count(status.languages.localOnly.length, "local-only language")
+    count$1(status.toPush.newKeys.length, "new key"),
+    count$1(status.toPush.changedValues.length, "changed translation"),
+    count$1(missingTranslations, "missing translation"),
+    count$1(status.languages.localOnly.length, "local-only language")
   ].filter((part) => part !== null);
   const summary = parts.length > 0 ? ` (${parts.join(", ")})` : "";
   throw new CliRequestError({
@@ -11203,33 +11243,14 @@ function assertNoUnpushedChanges(status) {
   });
 }
 
-function countLanguages(missingTranslations) {
-  return Object.keys(missingTranslations).length;
-}
-function countDistinctKeys(missingTranslations) {
-  const keys = /* @__PURE__ */ new Set();
-  for (const keyList of Object.values(missingTranslations)) {
-    for (const key of keyList) {
-      keys.add(key);
-    }
-  }
-  return keys.size;
-}
-function sumTranslations(missingTranslations) {
-  let total = 0;
-  for (const keys of Object.values(missingTranslations)) {
-    total += keys.length;
-  }
-  return total;
-}
 function plural(n, word) {
   return `${n} ${word}${n !== 1 ? "s" : ""}`;
 }
 function buildPushDetail(status) {
-  const newKeys = status.toPush.newKeys.length;
-  const changed = status.toPush.changedValues.length;
-  const newLangs = status.languages.localOnly.length;
-  const translationLangs = countLanguages(status.toPush.missingTranslations);
+  const newKeys = status.newKeys;
+  const changed = status.changedValues;
+  const newLangs = status.newLanguages;
+  const translationLangs = status.pushLanguages;
   const parts = [];
   const keyPart = newKeys > 0 && changed > 0 ? `${plural(newKeys + changed, "key")} (${newKeys} new)` : newKeys > 0 ? `${plural(newKeys, "new key")}` : `${plural(changed, "changed value")}`;
   parts.push(keyPart);
@@ -11241,10 +11262,10 @@ function buildPushDetail(status) {
   return parts.join(" \xB7 ");
 }
 function buildPullDetail(status) {
-  const newKeys = status.toPull.missingKeys.length;
-  const translationCount = sumTranslations(status.toPull.missingTranslations);
-  const langCount = countLanguages(status.toPull.missingTranslations);
-  const distinctKeys = countDistinctKeys(status.toPull.missingTranslations);
+  const newKeys = status.pullKeys;
+  const translationCount = status.pullTranslations;
+  const langCount = status.pullLanguages;
+  const distinctKeys = status.pullDistinctKeys;
   const totalKeys = distinctKeys + newKeys;
   const parts = [];
   if (totalKeys > 0) {
@@ -11260,8 +11281,8 @@ function buildPullDetail(status) {
   return parts.join(" \xB7 ");
 }
 function computeDashboard(status, questionsCount, projectName, options) {
-  const pushCount = status.toPush.newKeys.length + status.toPush.changedValues.length;
-  const pullCount = status.toPull.missingKeys.length + sumTranslations(status.toPull.missingTranslations);
+  const pushCount = status.newKeys + status.changedValues;
+  const pullCount = status.pullKeys + status.pullTranslations;
   const badges = [];
   if (pushCount > 0) {
     badges.push({
@@ -11290,10 +11311,10 @@ function computeDashboard(status, questionsCount, projectName, options) {
   const isInSync = badges.length === 0;
   const menuItems = [];
   if (!isInSync) {
-    if (status.needPush || status.issues.serverOnlyKeys.length > 0) {
+    if (status.needPush || status.serverOnlyKeys > 0) {
       menuItems.push({
         value: "sync-and-translate",
-        label: status.issues.serverOnlyKeys.length > 0 ? `Sync & Translate  (review ${plural(status.issues.serverOnlyKeys.length, "server-only key")}, push, translate, pull)` : `Sync & Translate  (push ${pushCount} new, translate, pull results)`
+        label: status.serverOnlyKeys > 0 ? `Sync & Translate  (review ${plural(status.serverOnlyKeys, "server-only key")}, push, translate, pull)` : `Sync & Translate  (push ${pushCount} new, translate, pull results)`
       });
     }
     if (status.needPush) {
@@ -11313,6 +11334,120 @@ function computeDashboard(status, questionsCount, projectName, options) {
     warnings.push("Failed to fetch questions");
   }
   return { projectName, badges, menuItems, isInSync, warnings };
+}
+
+function badgeColor(icon) {
+  if (icon === "\u2B06") return FgGreen;
+  if (icon === "\u2B07") return FgBlue;
+  return FgYellow;
+}
+function renderDashboardHuman(model) {
+  const lines = [];
+  lines.push("");
+  lines.push(`${Bold}babli${Reset}  ${model.projectName}`);
+  lines.push("");
+  if (model.isInSync && model.warnings.length === 0) {
+    lines.push(`  ${FgGreen}Everything is in sync.${Reset}`);
+    lines.push("");
+    return lines.join("\n");
+  }
+  for (const badge of model.badges) {
+    if (badge.detail) {
+      lines.push(`  ${badgeColor(badge.icon)}${badge.icon} ${badge.detail}${Reset}`);
+    }
+  }
+  for (const warning of model.warnings) {
+    lines.push(`  ${FgYellow}\u26A0 ${warning}${Reset}`);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+function renderDashboardJson(model, status, questionsCount) {
+  const toPush = {
+    new_keys: status.newKeys,
+    changed_values: status.changedValues
+  };
+  const toPull = {
+    translations: status.pullTranslations,
+    server_only_keys: status.serverOnlyKeys
+  };
+  const infoLines = [];
+  const pushTotal = toPush.new_keys + toPush.changed_values;
+  const pullTotal = toPull.translations + toPull.server_only_keys;
+  if (pushTotal > 0 && pullTotal > 0) {
+    infoLines.push(
+      `${pushTotal} local changes to push, ${pullTotal} translations available to pull.`
+    );
+  } else if (pushTotal > 0) {
+    infoLines.push(`${pushTotal} local changes to push.`);
+  } else if (pullTotal > 0) {
+    infoLines.push(`${pullTotal} translations available to pull.`);
+  } else {
+    infoLines.push("Everything is in sync.");
+  }
+  if (!model.isInSync) {
+    infoLines.push("");
+    infoLines.push("Suggested next steps:");
+    if (status.needPush) {
+      infoLines.push(
+        "- `babli sync-and-translate --json` \u2014 push your changes, translate, pull results"
+      );
+    }
+    if (status.needPull) {
+      infoLines.push(
+        "- `babli pull --json` \u2014 pull all available translations"
+      );
+    }
+    infoLines.push(
+      "- `babli status --json --full` \u2014 see detailed breakdown"
+    );
+  }
+  return JSON.stringify(
+    {
+      version: 1,
+      status: model.isInSync ? "clean" : "has_changes",
+      summary: { to_push: toPush, to_pull: toPull, questions: questionsCount },
+      warnings: model.warnings,
+      info: infoLines.join("\n"),
+      conflicts: []
+    },
+    null,
+    2
+  );
+}
+
+async function chooseWorkflowAction(input) {
+  let questionsFetchFailed = false;
+  const [summary, questions] = await Promise.all([
+    input.loadSummary(),
+    input.loadQuestions().catch(() => {
+      questionsFetchFailed = true;
+      return [];
+    })
+  ]);
+  const dashboard = computeDashboard(
+    summary,
+    questions.length,
+    input.projectName,
+    { questionsFetchFailed }
+  );
+  if (input.flags.json) {
+    console.info(renderDashboardJson(dashboard, summary, questions.length));
+    return {
+      choice: "exit",
+      needPush: summary.needPush,
+      needPull: summary.needPull
+    };
+  }
+  console.info(renderDashboardHuman(dashboard));
+  const choice = dashboard.isInSync ? "exit" : await select({
+    message: "What would you like to do?",
+    choices: dashboard.menuItems.map((item) => ({
+      value: item.value,
+      name: item.label
+    }))
+  });
+  return { choice, needPush: false, needPull: false };
 }
 
 function computeTranslationWork(params) {
@@ -11340,7 +11475,10 @@ function computeTranslationWork(params) {
       if (onlyExisting && !key.local) continue;
       if (selectedKeys && !selectedKeys.has(getComparisonKey(key))) continue;
       const hasUsableSource = Object.entries(key.translations).some(
-        ([code, translation]) => !targetLanguages.includes(code) && (params.allowUnapprovedSources || hasCurrentApproval(translation.server?.quality)) && !translation.server?.quality?.unresolvedConcernIds.length && Boolean(translation.server?.currentValue?.trim())
+        ([code, translation]) => {
+          const quality = summarizeCliQuality(translation.server?.quality);
+          return !targetLanguages.includes(code) && (params.allowUnapprovedSources || quality.approved) && !quality.blocked && Boolean(translation.server?.currentValue?.trim());
+        }
       );
       if (!hasUsableSource) continue;
       const missingLanguages = [];
@@ -11350,7 +11488,7 @@ function computeTranslationWork(params) {
         const missing = serverTranslation?.currentValue == null || emptyValueString === "" && serverTranslation.currentValue === "";
         if (strategy === "missing") {
           if (missing) missingLanguages.push(lang);
-        } else if (strategy === "replace" || missing || !hasCurrentApproval(serverTranslation?.quality)) {
+        } else if (strategy === "replace" || missing || !summarizeCliQuality(serverTranslation?.quality).approved) {
           missingLanguages.push(lang);
         }
       }
@@ -12311,6 +12449,140 @@ async function keyRenameFileCommand(ctx, options, configs) {
   }
 }
 
+function fingerprintSyncTranslations(translations) {
+  return createHash("sha256").update(
+    JSON.stringify(
+      Object.entries(translations).filter(([, value]) => value !== null).sort(
+        ([left], [right]) => left < right ? -1 : left > right ? 1 : 0
+      )
+    )
+  ).digest("hex");
+}
+
+const SYNC_SUMMARY_CAPABILITY = "sync-summary-v1";
+const syncManifestKey = objectType({
+  key: stringType().min(1),
+  namespace: stringType(),
+  translations: recordType(
+    stringType().min(1).max(50),
+    unionType([literalType(""), stringType().regex(/^[a-f0-9]{64}$/)]).nullable()
+  )
+});
+const syncSummaryInput = objectType({
+  localKeys: arrayType(
+    syncManifestKey.extend({
+      fingerprint: stringType().regex(/^[a-f0-9]{64}$/),
+      translations: syncManifestKey.shape.translations.optional()
+    })
+  ).max(25e4),
+  localLanguages: arrayType(stringType().min(1).max(50)).max(1e3),
+  emptyStringIsMissing: booleanType()
+}).strict().refine(
+  (input) => new Set(input.localKeys.map(keyIdentity)).size === input.localKeys.length,
+  { message: "Local key identities must be unique" }
+);
+const count = numberType().int().nonnegative();
+const syncSummary = objectType({
+  newKeys: count,
+  changedValues: count,
+  newLanguages: count,
+  pushLanguages: count,
+  pullKeys: count,
+  pullTranslations: count,
+  pullLanguages: count,
+  pullDistinctKeys: count,
+  serverOnlyKeys: count,
+  needPush: booleanType(),
+  needPull: booleanType()
+});
+const syncSummaryResponse = unionType([
+  objectType({ summary: syncSummary }),
+  objectType({
+    requiredKeys: arrayType(
+      syncManifestKey.pick({ key: true, namespace: true })
+    )
+  })
+]).nullable();
+
+function createSyncManifest(local) {
+  return Object.values(local.mergedKeysByKeyByNamespace).flatMap(
+    (keys) => Object.values(keys).map((key) => ({
+      key: key.key,
+      namespace: getNamespace$1(key),
+      translations: Object.fromEntries(
+        Object.entries(key.translations).map(([language, translation]) => {
+          const value = translation.local?.value;
+          return [
+            language,
+            value == null ? null : value === "" ? "" : createHash("sha256").update(value).digest("hex")
+          ];
+        })
+      )
+    }))
+  );
+}
+
+async function loadStartupSummary(input) {
+  if (!input.capabilities.includes(SYNC_SUMMARY_CAPABILITY))
+    return input.fallback();
+  const local = await gatherSyncLocalKeys({
+    allFilesByPattern: await gatherLocalFiles(
+      input.translationFilesConfig,
+      CliFileApi
+    ),
+    keySeparator: input.projectInfo.keySeparator,
+    emptyValueString: input.emptyValueString,
+    transformConfigs: input.translationFilesConfig.filter(
+      (config) => config.transform
+    ),
+    transforms: input.transforms,
+    fileAPI: CliFileApi,
+    cwd: process.cwd()
+  });
+  const manifests = createSyncManifest(local);
+  const byName = new Map(manifests.map((key) => [keyIdentity(key), key]));
+  const request = syncSummaryInput.safeParse({
+    localKeys: manifests.map(({ key, namespace, translations }) => ({
+      key,
+      namespace,
+      fingerprint: fingerprintSyncTranslations(translations)
+    })),
+    localLanguages: [...local.languagesOnLocal],
+    emptyStringIsMissing: input.emptyValueString === ""
+  });
+  if (!request.success) return input.fallback();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = syncSummaryResponse.parse(
+      await requestCliJson(
+        `${input.host}/api/cli/${input.projectId}/syncSummary`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${input.accessToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(request.data)
+        }
+      )
+    );
+    if (!response) return input.fallback();
+    if ("summary" in response) return response.summary;
+    const required = new Set(
+      response.requiredKeys.map((key) => {
+        const identity = keyIdentity(key);
+        unwrap(byName.get(identity), "Server requested an unknown local key");
+        return identity;
+      })
+    );
+    for (const key of request.data.localKeys) {
+      if (required.has(keyIdentity(key))) {
+        key.translations = unwrap(byName.get(keyIdentity(key))).translations;
+      }
+    }
+  }
+  return input.fallback();
+}
+
 async function loadTransform(transformPath, cwd) {
   const absolutePath = resolve(cwd, transformPath);
   let loaded;
@@ -12530,89 +12802,6 @@ ${Bold}${questions.length} unanswered question(s):${Reset}
       )
     );
   }
-}
-
-function badgeColor(icon) {
-  if (icon === "\u2B06") return FgGreen;
-  if (icon === "\u2B07") return FgBlue;
-  return FgYellow;
-}
-function renderDashboardHuman(model) {
-  const lines = [];
-  lines.push("");
-  lines.push(`${Bold}babli${Reset}  ${model.projectName}`);
-  lines.push("");
-  if (model.isInSync && model.warnings.length === 0) {
-    lines.push(`  ${FgGreen}Everything is in sync.${Reset}`);
-    lines.push("");
-    return lines.join("\n");
-  }
-  for (const badge of model.badges) {
-    if (badge.detail) {
-      lines.push(`  ${badgeColor(badge.icon)}${badge.icon} ${badge.detail}${Reset}`);
-    }
-  }
-  for (const warning of model.warnings) {
-    lines.push(`  ${FgYellow}\u26A0 ${warning}${Reset}`);
-  }
-  lines.push("");
-  return lines.join("\n");
-}
-function renderDashboardJson(model, status, questionsCount) {
-  const toPush = {
-    new_keys: status.toPush.newKeys.length,
-    changed_values: status.toPush.changedValues.length
-  };
-  const toPull = {
-    translations: Object.values(status.toPull.missingTranslations).reduce(
-      (sum, keys) => sum + keys.length,
-      0
-    ),
-    server_only_keys: status.issues.serverOnlyKeys.length
-  };
-  const infoLines = [];
-  const pushTotal = toPush.new_keys + toPush.changed_values;
-  const pullTotal = toPull.translations + toPull.server_only_keys;
-  if (pushTotal > 0 && pullTotal > 0) {
-    infoLines.push(
-      `${pushTotal} local changes to push, ${pullTotal} translations available to pull.`
-    );
-  } else if (pushTotal > 0) {
-    infoLines.push(`${pushTotal} local changes to push.`);
-  } else if (pullTotal > 0) {
-    infoLines.push(`${pullTotal} translations available to pull.`);
-  } else {
-    infoLines.push("Everything is in sync.");
-  }
-  if (!model.isInSync) {
-    infoLines.push("");
-    infoLines.push("Suggested next steps:");
-    if (status.needPush) {
-      infoLines.push(
-        "- `babli sync-and-translate --json` \u2014 push your changes, translate, pull results"
-      );
-    }
-    if (status.needPull) {
-      infoLines.push(
-        "- `babli pull --json` \u2014 pull all available translations"
-      );
-    }
-    infoLines.push(
-      "- `babli status --json --full` \u2014 see detailed breakdown"
-    );
-  }
-  return JSON.stringify(
-    {
-      version: 1,
-      status: model.isInSync ? "clean" : "has_changes",
-      summary: { to_push: toPush, to_pull: toPull, questions: questionsCount },
-      warnings: model.warnings,
-      info: infoLines.join("\n"),
-      conflicts: []
-    },
-    null,
-    2
-  );
 }
 
 function renderPushPreview(plan) {
@@ -15039,7 +15228,6 @@ async function runAction(cliInput, flags) {
     const projectInfo = await fetchProjectInfo(host, projectId, accessToken);
     const projectName = projectInfo.name;
     const targetLanguages = getTargetLanguageCodes(projectInfo.languages);
-    let questionsFetchFailed = false;
     const workflowKeys = cliInput.action === "sync-and-translate" ? cliInput.options.keys : [];
     const workflowNamespaces = cliInput.action === "sync-and-translate" ? cliInput.options.namespaces : [];
     const statusInput = {
@@ -15047,13 +15235,28 @@ async function runAction(cliInput, flags) {
       keys: workflowKeys,
       namespaces: workflowNamespaces
     };
-    const [result2, questions] = await Promise.all([
-      doSync(statusInput),
-      fetchQuestions(host, projectId, accessToken).catch(() => {
-        questionsFetchFailed = true;
-        return [];
-      })
-    ]);
+    const choice = cliInput.action === "workflow" ? await chooseWorkflowAction({
+      projectName,
+      flags,
+      loadSummary: () => loadStartupSummary({
+        ...syncCtx,
+        projectInfo,
+        translationFilesConfig,
+        transforms,
+        fallback: async () => summarizeSyncStatus((await doSync(statusInput)).status)
+      }),
+      loadQuestions: () => fetchQuestions(host, projectId, accessToken)
+    }) : { choice: "sync-and-translate", needPush: false, needPull: false };
+    if (choice.choice === "exit") return choice;
+    if (choice.choice === "questions") {
+      await questionsCommand({ host, projectId, accessToken, flags });
+      return { needPush: false, needPull: false };
+    }
+    if (choice.choice === "push") {
+      await doSync({ action: "push" });
+      return { needPush: false, needPull: false };
+    }
+    const result2 = await doSync(statusInput);
     const workflowSelectedKeys = workflowKeys.length > 0 || workflowNamespaces.length > 0 ? resolveSelectedKeys(
       workflowKeys,
       result2.mergedKeysByKeyByNamespace,
@@ -15096,54 +15299,17 @@ async function runAction(cliInput, flags) {
         });
       }
     };
-    if (cliInput.action === "sync-and-translate") {
+    if (choice.choice === "sync-and-translate") {
       const exitCode = await syncAndTranslate(s2tInput);
       return { needPush: false, needPull: false, exitCode };
     }
-    const dashboard = computeDashboard(
-      result2.status,
-      questions.length,
-      projectName,
-      {
-        questionsFetchFailed
-      }
-    );
-    if (flags.json) {
-      console.info(
-        renderDashboardJson(dashboard, result2.status, questions.length)
-      );
-      return {
-        needPush: result2.status.needPush,
-        needPull: result2.status.needPull
-      };
-    }
-    console.info(renderDashboardHuman(dashboard));
-    if (dashboard.isInSync) {
-      return { needPush: false, needPull: false };
-    }
-    const choice = await select({
-      message: "What would you like to do?",
-      choices: dashboard.menuItems.map((item) => ({
-        value: item.value,
-        name: item.label
-      }))
-    });
-    if (choice === "exit") {
-      return { needPush: false, needPull: false };
-    }
-    if (choice === "sync-and-translate") {
-      await syncAndTranslate(s2tInput);
-    } else if (choice === "push") {
-      await doSync({ action: "push" });
-    } else if (choice === "pull") {
+    if (choice.choice === "pull") {
       await pullFromDashboard({
         flags,
         syncResult: result2,
         doPull: s2tInput.doPull
       });
-    } else if (choice === "questions") {
-      await questionsCommand({ host, projectId, accessToken, flags });
-    } else if (choice === "details") {
+    } else if (choice.choice === "details") {
       console.info(
         renderStatusHuman(result2.comparison, result2.status, { full: false })
       );

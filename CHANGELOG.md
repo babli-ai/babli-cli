@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-05
+
+### Fixed
+
+- Reduce startup time and memory use for large projects by comparing compact key fingerprints instead of downloading all translations and review details before showing the menu. Existing servers retain the full-comparison fallback.
+
+### Changed
+
+- Request compact approval and blocking flags instead of full review summaries when supported by the server, preserving stale-approval handling and unresolved-concern blockers.
+- Omit unused internal quality plans from translation estimates and job responses while retaining credit information, quotes and job IDs. Server approval and billing checks still apply.
+
 ## [0.11.0] - 2026-11-05
 
 ### Added
