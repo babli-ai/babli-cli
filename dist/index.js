@@ -485,17 +485,6 @@ async function gatherSyncLocalKeys({
   return result;
 }
 
-function assertNever(x) {
-  throw new Error(`Unexpected value: ${x}`);
-}
-
-function unwrap(value, message) {
-  if (value === null || value === void 0) {
-    throw new Error(message ?? "Unwrap failed: value is null or undefined");
-  }
-  return value;
-}
-
 var util;
 (function (util) {
     util.assertEqual = (_) => { };
@@ -4348,6 +4337,85 @@ const coerce = {
     date: ((arg) => ZodDate.create({ ...arg, coerce: true })),
 };
 
+function hasCurrentApproval(summary) {
+  if (!summary) return false;
+  return summary.ai.outcome === "no_issues_found" && summary.ai.freshness === "current" || summary.human.outcome === "approved" && summary.human.freshness === "current";
+}
+
+const humanReviewOutcome = enumType(["approved", "changes_requested"]);
+const referenceMode = enumType(["either", "ai", "human"]);
+const reviewSubjectKind = enumType(["translation", "source_wording"]);
+const QUALITY_CONTRACT_CAPABILITY = "quality-contract-v2";
+objectType({
+  requestId: stringType().uuid(),
+  translationId: stringType().uuid(),
+  expectedTargetVersionId: stringType().uuid(),
+  expectedSourceVersionId: stringType().uuid().nullable(),
+  expectedHeadId: stringType().uuid().nullable(),
+  expectedContextGeneration: numberType().int().nonnegative(),
+  expectedContextHash: stringType().length(64),
+  create: objectType({ keyId: stringType().uuid(), languageId: stringType().uuid() }).optional(),
+  expectedConcernIds: arrayType(stringType().uuid()).max(50),
+  outcome: humanReviewOutcome,
+  note: stringType().trim().max(4e3).default(""),
+  translation: stringType().max(32e3).optional(),
+  acknowledgedConcernIds: arrayType(stringType().uuid()).max(50).default([]),
+  sourceLanguageCode: stringType().max(32).default(""),
+  subjectKind: reviewSubjectKind.default("translation")
+}).strict();
+objectType({
+  requestId: stringType().uuid(),
+  questionId: stringType().uuid(),
+  text: stringType().trim().min(1).max(4e3),
+  scope: enumType(["key_language", "project", "recheck"]),
+  recheckResultId: stringType().uuid().optional(),
+  keyId: stringType().uuid().nullable(),
+  languageCode: stringType().max(32).nullable()
+}).strict();
+objectType({
+  requestId: stringType().uuid(),
+  reason: stringType().trim().max(2e3).default(""),
+  translationIds: arrayType(stringType().uuid()).min(1).max(500),
+  sourceLanguageCode: stringType().min(1).max(32).optional()
+}).strict();
+objectType({
+  requestId: stringType().uuid(),
+  sourceLanguageCode: stringType().min(1).max(32).optional(),
+  action: enumType(["save_only", "request_review", "mark_stale"]),
+  scope: enumType(["listed", "project"]).default("listed"),
+  translationIds: arrayType(stringType().uuid()).max(500).default([]),
+  keyIds: arrayType(stringType().uuid()).max(200).default([]),
+  reviewKinds: arrayType(enumType(["ai", "human"])).min(1),
+  reason: stringType().trim().max(2e3).default("")
+}).strict();
+
+const SCOPED_TRANSLATION_ESTIMATE_CAPABILITY = "scoped-translation-estimate-v1";
+objectType({
+  keys: arrayType(stringType().min(1)).default([]),
+  namespaces: arrayType(stringType()).default([]),
+  keyIds: arrayType(stringType().uuid()).default([]),
+  languages: arrayType(stringType().min(1)).optional(),
+  strategy: enumType(["missing", "not-approved", "replace"]),
+  onlyExisting: booleanType(),
+  localKeys: arrayType(objectType({ key: stringType(), namespace: stringType() })),
+  emptyValueString: stringType().nullable().optional(),
+  model: enumType(["production", "preview"]),
+  primaryLanguage: stringType().min(1).optional(),
+  referenceMode: referenceMode.optional(),
+  allowUnapprovedSources: booleanType().optional()
+}).strict();
+
+function assertNever(x) {
+  throw new Error(`Unexpected value: ${x}`);
+}
+
+function unwrap(value, message) {
+  if (value === null || value === void 0) {
+    throw new Error(message ?? "Unwrap failed: value is null or undefined");
+  }
+  return value;
+}
+
 function keyIdentity(key) {
   return JSON.stringify([key.namespace, key.key]);
 }
@@ -4410,58 +4478,6 @@ function createPushPreviewManifest(local) {
     }))
   );
 }
-
-function hasCurrentApproval(summary) {
-  if (!summary) return false;
-  return summary.ai.outcome === "no_issues_found" && summary.ai.freshness === "current" || summary.human.outcome === "approved" && summary.human.freshness === "current";
-}
-
-const humanReviewOutcome = enumType(["approved", "changes_requested"]);
-enumType(["either", "ai", "human"]);
-const reviewSubjectKind = enumType(["translation", "source_wording"]);
-const QUALITY_CONTRACT_CAPABILITY = "quality-contract-v2";
-objectType({
-  requestId: stringType().uuid(),
-  translationId: stringType().uuid(),
-  expectedTargetVersionId: stringType().uuid(),
-  expectedSourceVersionId: stringType().uuid().nullable(),
-  expectedHeadId: stringType().uuid().nullable(),
-  expectedContextGeneration: numberType().int().nonnegative(),
-  expectedContextHash: stringType().length(64),
-  create: objectType({ keyId: stringType().uuid(), languageId: stringType().uuid() }).optional(),
-  expectedConcernIds: arrayType(stringType().uuid()).max(50),
-  outcome: humanReviewOutcome,
-  note: stringType().trim().max(4e3).default(""),
-  translation: stringType().max(32e3).optional(),
-  acknowledgedConcernIds: arrayType(stringType().uuid()).max(50).default([]),
-  sourceLanguageCode: stringType().max(32).default(""),
-  subjectKind: reviewSubjectKind.default("translation")
-}).strict();
-objectType({
-  requestId: stringType().uuid(),
-  questionId: stringType().uuid(),
-  text: stringType().trim().min(1).max(4e3),
-  scope: enumType(["key_language", "project", "recheck"]),
-  recheckResultId: stringType().uuid().optional(),
-  keyId: stringType().uuid().nullable(),
-  languageCode: stringType().max(32).nullable()
-}).strict();
-objectType({
-  requestId: stringType().uuid(),
-  reason: stringType().trim().max(2e3).default(""),
-  translationIds: arrayType(stringType().uuid()).min(1).max(500),
-  sourceLanguageCode: stringType().min(1).max(32).optional()
-}).strict();
-objectType({
-  requestId: stringType().uuid(),
-  sourceLanguageCode: stringType().min(1).max(32).optional(),
-  action: enumType(["save_only", "request_review", "mark_stale"]),
-  scope: enumType(["listed", "project"]).default("listed"),
-  translationIds: arrayType(stringType().uuid()).max(500).default([]),
-  keyIds: arrayType(stringType().uuid()).max(200).default([]),
-  reviewKinds: arrayType(enumType(["ai", "human"])).min(1),
-  reason: stringType().trim().max(2e3).default("")
-}).strict();
 
 var __defProp$2 = Object.defineProperty;
 var __defNormalProp$2 = (obj, key, value) => key in obj ? __defProp$2(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
@@ -11183,6 +11199,142 @@ function renderPullJson(result) {
   );
 }
 
+function summarize(work, strategy) {
+  const languages = /* @__PURE__ */ new Set();
+  let languagePairs = 0;
+  for (const item of work) {
+    languagePairs += item.languages.length;
+    for (const lang of item.languages) languages.add(lang);
+  }
+  return {
+    keys: work.length,
+    language_pairs: languagePairs,
+    languages: [...languages].sort(),
+    strategy
+  };
+}
+function serializeWorkItems(work) {
+  return work.map((item) => ({
+    key_id: item.keyId,
+    key: item.key,
+    namespace: item.namespace,
+    missing_languages: item.languages
+  }));
+}
+
+function printTranslationEstimate({
+  flags,
+  work,
+  summary,
+  estimate,
+  blocked
+}) {
+  const credits = {
+    total: estimate.creditsToUse.total,
+    monthly: estimate.creditsToUse.monthly,
+    persistent: estimate.creditsToUse.persistent,
+    has_enough: estimate.creditsToUse.hasEnough,
+    need_to_buy: estimate.creditsToUse.needToBuy,
+    unit_scale: 100,
+    display_total: estimate.creditsToUse.total / 100,
+    display_monthly: estimate.creditsToUse.monthly / 100,
+    display_persistent: estimate.creditsToUse.persistent / 100,
+    display_need_to_buy: estimate.creditsToUse.needToBuy / 100
+  };
+  if (flags.json) {
+    console.info(
+      JSON.stringify(
+        {
+          version: 1,
+          command: "translate",
+          status: work.length ? "estimate" : "skipped",
+          ...blocked.length ? { blocked } : {},
+          summary,
+          work_items: serializeWorkItems(work),
+          process_counts: {
+            total: estimate.numberOfProcesses,
+            finished: 0,
+            failed: 0
+          },
+          billing: estimate.numberOfBillableProcesses === void 0 ? void 0 : { billable_processes: estimate.numberOfBillableProcesses },
+          credits
+        },
+        null,
+        2
+      )
+    );
+  } else {
+    console.info(
+      `
+${Bold}Estimate: ${summary.keys} key(s), ${summary.language_pairs} language pair(s).${Reset}`
+    );
+    console.info(
+      `${Dim}Credits needed: ${credits.display_total} (monthly ${credits.display_monthly}, persistent ${credits.display_persistent})${Reset}`
+    );
+    if (credits.has_enough) {
+      console.info(`${FgGreen}You have enough credits.${Reset}`);
+    } else {
+      console.info(
+        `${FgYellow}Not enough credits \u2014 need to buy ${credits.display_need_to_buy} more.${Reset}`
+      );
+    }
+  }
+  if (!flags.json && blocked.length)
+    console.info(
+      `Blocked keys: ${blocked.map((key) => `${key.keyId}: ${key.reason === "missing_approval" ? "source approval required" : key.reason}`).join(", ")}`
+    );
+  return 0;
+}
+
+function serializeCliError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!(error instanceof CliRequestError)) return { message };
+  return {
+    message,
+    ...error.code ? { code: error.code } : {},
+    ...error.httpStatus !== void 0 ? { http_status: error.httpStatus } : {},
+    ...error.details !== void 0 ? { details: error.details } : {}
+  };
+}
+
+async function scopedEstimateCommand(context, input) {
+  try {
+    const result = await requestCliJson(
+      `${context.host}/api/cli/${context.projectId}/estimateSelection`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${context.accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(input)
+      }
+    );
+    return printTranslationEstimate({
+      flags: context.flags,
+      work: result.work,
+      summary: summarize(result.work, input.strategy),
+      estimate: result,
+      blocked: result.blocked
+    });
+  } catch (error) {
+    if (context.flags.json)
+      console.info(
+        JSON.stringify({
+          version: 1,
+          command: "translate",
+          status: "failed",
+          error: serializeCliError(error)
+        })
+      );
+    else
+      console.error(
+        `${FgRed}Translation failed: ${serializeCliError(error).message}${Reset}`
+      );
+    return 2;
+  }
+}
+
 const nodeParts = process.versions.node.split(".").map(Number);
 const major = nodeParts[0] ?? 0;
 const minor = nodeParts[1] ?? 0;
@@ -12010,17 +12162,6 @@ const keyDescriptionFileSchema = objectType({
     ])
   ).max(1e5)
 }).superRefine(validateUniqueKeyIds);
-
-function serializeCliError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  if (!(error instanceof CliRequestError)) return { message };
-  return {
-    message,
-    ...error.code ? { code: error.code } : {},
-    ...error.httpStatus !== void 0 ? { http_status: error.httpStatus } : {},
-    ...error.details !== void 0 ? { details: error.details } : {}
-  };
-}
 
 async function keyDescriptionFileCommand(ctx, options) {
   const parsed = keyDescriptionFileSchema.safeParse(
@@ -13908,20 +14049,6 @@ async function pullFromDashboard(input) {
 function emitJson(output) {
   console.info(JSON.stringify(output, null, 2));
 }
-function summarize(work, strategy) {
-  const languages = /* @__PURE__ */ new Set();
-  let languagePairs = 0;
-  for (const item of work) {
-    languagePairs += item.languages.length;
-    for (const lang of item.languages) languages.add(lang);
-  }
-  return {
-    keys: work.length,
-    language_pairs: languagePairs,
-    languages: [...languages].sort(),
-    strategy
-  };
-}
 async function translateCommand(input) {
   try {
     await getCliProject(input.host, input.projectId, input.accessToken);
@@ -14134,50 +14261,13 @@ async function runEstimate(input, work, summary) {
   } catch (err) {
     return reportFailure(input, void 0, err);
   }
-  const credits = {
-    total: estimate.creditsToUse.total,
-    monthly: estimate.creditsToUse.monthly,
-    persistent: estimate.creditsToUse.persistent,
-    has_enough: estimate.creditsToUse.hasEnough,
-    need_to_buy: estimate.creditsToUse.needToBuy,
-    unit_scale: 100,
-    display_total: estimate.creditsToUse.total / 100,
-    display_monthly: estimate.creditsToUse.monthly / 100,
-    display_persistent: estimate.creditsToUse.persistent / 100,
-    display_need_to_buy: estimate.creditsToUse.needToBuy / 100
-  };
-  if (input.flags.json) {
-    emitJson({
-      version: 1,
-      command: "translate",
-      status: "estimate",
-      summary,
-      work_items: serializeWorkItems(work),
-      process_counts: {
-        total: estimate.numberOfProcesses,
-        finished: 0,
-        failed: 0
-      },
-      billing: estimate.numberOfBillableProcesses === void 0 ? void 0 : { billable_processes: estimate.numberOfBillableProcesses },
-      credits
-    });
-  } else {
-    console.info(
-      `
-${Bold}Estimate: ${summary.keys} key(s), ${summary.language_pairs} language pair(s).${Reset}`
-    );
-    console.info(
-      `${Dim}Credits needed: ${credits.display_total} (monthly ${credits.display_monthly}, persistent ${credits.display_persistent})${Reset}`
-    );
-    if (credits.has_enough) {
-      console.info(`${FgGreen}You have enough credits.${Reset}`);
-    } else {
-      console.info(
-        `${FgYellow}Not enough credits \u2014 need to buy ${credits.display_need_to_buy} more.${Reset}`
-      );
-    }
-  }
-  return 0;
+  return printTranslationEstimate({
+    flags: input.flags,
+    work,
+    summary,
+    estimate,
+    blocked: []
+  });
 }
 function translationQuality(input) {
   if (!input.primaryLanguage && !input.referenceMode && !input.allowUnapprovedSources && input.strategy !== "replace")
@@ -14279,14 +14369,6 @@ function computeWork(input) {
     keys: input.keys,
     namespaces: input.namespaces
   });
-}
-function serializeWorkItems(work) {
-  return work.map((item) => ({
-    key_id: item.keyId,
-    key: item.key,
-    namespace: item.namespace,
-    missing_languages: item.languages
-  }));
 }
 
 function validateKeyRenameOptions(options) {
@@ -15197,6 +15279,45 @@ async function runAction(cliInput, flags) {
       process.cwd()
     );
     transforms.set(config.path, transform);
+  }
+  if (cliInput.action === "translate" && cliInput.options.estimate && !cliInput.options.dryRun && server.capabilities?.includes(SCOPED_TRANSLATION_ESTIMATE_CAPABILITY)) {
+    const options = cliInput.options;
+    const localKeys = [];
+    if (!options.keyIds.length && (options.onlyExisting || options.keys.length || options.namespaces.length)) {
+      const project = await fetchProjectInfo(host, projectId, accessToken);
+      const gathered = await gatherSyncLocalKeys({
+        allFilesByPattern: await gatherLocalFiles(
+          translationFilesConfig,
+          CliFileApi
+        ),
+        keySeparator: project.keySeparator,
+        emptyValueString: parsed.emptyValueString,
+        transformConfigs,
+        transforms,
+        fileAPI: CliFileApi,
+        cwd: process.cwd()
+      });
+      for (const [namespace, keys] of Object.entries(
+        gathered.mergedKeysByKeyByNamespace
+      ))
+        for (const key of Object.values(keys))
+          localKeys.push({ key: key.key, namespace });
+    }
+    const exitCode = await scopedEstimateCommand(surgicalCtx, {
+      keys: options.keys,
+      namespaces: options.namespaces,
+      keyIds: options.keyIds,
+      languages: options.languages,
+      strategy: options.strategy,
+      onlyExisting: options.onlyExisting,
+      localKeys,
+      emptyValueString: parsed.emptyValueString,
+      model: options.model,
+      primaryLanguage: options.primaryLanguage,
+      referenceMode: options.referenceMode,
+      allowUnapprovedSources: options.allowUnapprovedSources
+    });
+    return { needPush: false, needPull: false, exitCode };
   }
   const syncCtx = {
     host,

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-11-06
+
+### Changed
+
+- Speed up `translate --estimate` by requesting only the selected translation work instead of downloading all project translations on supporting servers. Older servers retain the existing estimate flow.
+
+### Fixed
+
+- Report source approval blockers in translation estimates without counting blocked keys as work to translate.
+
 ## [0.11.1] - 2026-11-05
 
 ### Fixed
