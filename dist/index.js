@@ -4450,6 +4450,14 @@ const pushPreviewSelection = objectType({
   }
 );
 
+const SCOPED_SYNC_CAPABILITY = "scoped-sync-v1";
+const scopedSyncSelection = objectType({
+  selection: pushPreviewSelection,
+  selectedKeys: arrayType(stringType().min(1).max(2001)).max(25e4).optional(),
+  includeWithheldChanges: booleanType(),
+  keysToRemove: arrayType(objectType({ key: stringType(), namespace: stringType() }).strict()).max(25e4).optional()
+}).strict();
+
 function getNamespace$1(key) {
   if ("namespace" in key) {
     return key.namespace;
@@ -4821,14 +4829,24 @@ async function fetchCliJson(url, init) {
 }
 
 async function fetchSyncKeys(context, input, localKeys) {
-  const selection = input.action === "push" && input.dryRun && !input.keysToRemove?.length && (input.keys?.length ?? 0) + (input.namespaces?.length ?? 0) > 0 && context.capabilities.includes(SCOPED_PUSH_PREVIEW_CAPABILITY);
-  const request = selection ? pushPreviewSelection.safeParse({
-    keys: input.keys ?? [],
-    namespaces: input.namespaces ?? [],
-    prune: input.prune === true,
-    localKeys: createPushPreviewManifest(localKeys)
+  const scope = input.action === "pull" ? input.options : input.action === "push" || input.action === "status" ? input : void 0;
+  const supportsSync = context.capabilities.includes(SCOPED_SYNC_CAPABILITY);
+  const supportsPreview = input.action === "push" && input.dryRun && !input.keysToRemove?.length && context.capabilities.includes(SCOPED_PUSH_PREVIEW_CAPABILITY);
+  const selection = scope && (scope.keys?.length ?? 0) + (scope.namespaces?.length ?? 0) > 0 && (supportsSync || supportsPreview) ? pushPreviewSelection.safeParse({
+    keys: scope.keys ?? [],
+    namespaces: scope.namespaces ?? [],
+    prune: input.action === "push" && input.prune === true,
+    localKeys: input.action === "push" ? createPushPreviewManifest(localKeys) : []
   }) : null;
-  if (!request?.success)
+  const selectedKeys = input.action === "status" ? input.selectedKeys : input.action === "pull" ? input.options.selectedKeys : void 0;
+  const scoped = selection?.success && supportsSync ? scopedSyncSelection.safeParse({
+    selection: selection.data,
+    selectedKeys: selectedKeys ? [...selectedKeys] : void 0,
+    includeWithheldChanges: input.action === "push",
+    keysToRemove: input.action === "push" ? input.keysToRemove : void 0
+  }) : null;
+  const request = scoped?.success ? { endpoint: "scopedSync", data: scoped.data } : selection?.success && supportsPreview ? { endpoint: "pushPreview", data: selection.data } : null;
+  if (!request)
     return {
       keys: await fetchServerKeys(
         context.host,
@@ -4837,7 +4855,7 @@ async function fetchSyncKeys(context, input, localKeys) {
       )
     };
   return requestCliJson(
-    `${context.host}/api/cli/${context.projectId}/pushPreview`,
+    `${context.host}/api/cli/${context.projectId}/${request.endpoint}`,
     {
       method: "POST",
       headers: {
@@ -10814,6 +10832,7 @@ const defaultReviewModel = "gemini-4-argon";
 const reviewModel = literalType(defaultReviewModel);
 
 const reviewSelection = objectType({
+  scope: enumType(["translation", "source_wording"]).optional(),
   jobId: stringType().uuid().optional(),
   keys: arrayType(stringType().min(1)).default([]),
   namespaces: arrayType(stringType()).default([]),
@@ -10921,7 +10940,7 @@ const reviewDecisionInput = objectType({
 
 async function inspectQualityRun(context, runId, wait, timeout) {
   const id = stringType().uuid().parse(runId);
-  const deadline = Date.now() + numberType().int().min(1).max(3600).parse(timeout) * 1e3;
+  const deadline = Date.now() + numberType().int().min(1).parse(timeout) * 1e3;
   while (true) {
     const raw = await requestCliJson(
       `${context.host}/api/cli/${context.projectId}/quality/runs/${id}`,
@@ -10981,6 +11000,7 @@ async function qualityCommand(context, input) {
   } else {
     const options = input.options;
     const selection = reviewSelection.parse({
+      ...options.sources ? { scope: "source_wording" } : {},
       jobId: options.job,
       keys: options.key,
       namespaces: options.namespace,
@@ -10996,7 +11016,7 @@ async function qualityCommand(context, input) {
     else {
       if (options.maxCredits === void 0)
         throw new Error(
-          "Review submission requires --max-credits. Use --estimate first; review does not apply corrections or approve text."
+          "Review submission requires --max-credits. Use --estimate first; a current AI pass grants AI approval without applying corrections."
         );
       const requestId = stringType().uuid().parse(options.requestId ?? randomUUID());
       process.stderr.write(
@@ -11134,7 +11154,10 @@ function registerQualityCommands(program, run, withGlobalOptions) {
     "Exact translation UUID (repeatable)",
     collect,
     []
-  ).option("--languages <codes>", "Target language codes (comma-separated)").option("--source <code>", "Declared source language").addOption(
+  ).option("--languages <codes>", "Target language codes (comma-separated)").option("--source <code>", "Declared source language").option(
+    "--sources",
+    "Review source wording selected by exact --translation-id values"
+  ).addOption(
     new Option("--model <model>", "Reviewer; 1 credit per batch").choices([defaultReviewModel]).default(defaultReviewModel)
   ).option(
     "--recheck <result-id>",
@@ -11247,7 +11270,7 @@ function printTranslationEstimate({
         {
           version: 1,
           command: "translate",
-          status: work.length ? "estimate" : "skipped",
+          status: work.length ? "estimate" : blocked.length ? "blocked" : "skipped",
           ...blocked.length ? { blocked } : {},
           summary,
           work_items: serializeWorkItems(work),
@@ -11335,6 +11358,25 @@ async function scopedEstimateCommand(context, input) {
   }
 }
 
+function validateSourceApprovalOptions(options) {
+  if (options.allowUnapprovedSources && (options.reviewSources || options.sourceReviewRun || options.sourceReviewRequestId)) {
+    throw new Error(
+      "Choose --review-sources or --allow-unapproved-sources, not both."
+    );
+  }
+  if (options.sourceReviewRequestId && !options.reviewSources) {
+    throw new Error("--source-review-request-id requires --review-sources.");
+  }
+  if (options.sourceReviewRun && options.sourceReviewRequestId) {
+    throw new Error(
+      "Resume with --source-review-run without a new request ID."
+    );
+  }
+  for (const id of [options.sourceReviewRequestId, options.sourceReviewRun]) {
+    if (id !== void 0) stringType().uuid().parse(id);
+  }
+}
+
 const nodeParts = process.versions.node.split(".").map(Number);
 const major = nodeParts[0] ?? 0;
 const minor = nodeParts[1] ?? 0;
@@ -11371,6 +11413,10 @@ const agentTranslationGuidance = `Agents must prepare descriptions before transl
 4. Check and save drafts: babli key update --file descriptions.json --dry-run,
    then babli key update --file descriptions.json. Resolve conflicts first.
 5. Estimate, translate, and pull only keys with prepared descriptions.
+6. If sources need approval, sync with --review-sources (recommended) and a
+   --max-credits cap for review plus translation, or explicitly choose
+   --allow-unapproved-sources. Inspect blocked keys and review findings;
+   a skipped translation phase does not mean all translations are present.
 Record unclear keys as unresolved; leave them out of translation until clarified.
 Use sync-and-translate only after descriptions cover its selected keys and source changes.`;
 
@@ -11602,59 +11648,62 @@ async function chooseWorkflowAction(input) {
   return { choice, needPush: false, needPull: false };
 }
 
-function computeTranslationWork(params) {
-  const {
-    mergedKeysByKeyByNamespace,
-    targetLanguages,
-    strategy,
-    onlyExisting,
-    emptyValueString,
-    languages,
-    keys,
-    namespaces
-  } = params;
-  const languageFilter = languages ? new Set(languages) : void 0;
-  const selectedKeys = params.selectedKeys ?? (keys && keys.length > 0 || namespaces && namespaces.length > 0 ? resolveSelectedKeys(
-    keys ?? [],
-    mergedKeysByKeyByNamespace,
-    namespaces ?? []
+function computeTranslationPlan(params) {
+  const selected = params.selectedKeys ?? ((params.keys?.length ?? 0) + (params.namespaces?.length ?? 0) > 0 ? resolveSelectedKeys(
+    params.keys ?? [],
+    params.mergedKeysByKeyByNamespace,
+    params.namespaces ?? []
   ) : void 0);
-  const result = [];
-  for (const keysInNamespace of Object.values(mergedKeysByKeyByNamespace)) {
-    for (const key of Object.values(keysInNamespace)) {
-      const serverId = key.server?.id;
-      if (!serverId) continue;
-      if (onlyExisting && !key.local) continue;
-      if (selectedKeys && !selectedKeys.has(getComparisonKey(key))) continue;
-      const hasUsableSource = Object.entries(key.translations).some(
-        ([code, translation]) => {
-          const quality = summarizeCliQuality(translation.server?.quality);
-          return !targetLanguages.includes(code) && (params.allowUnapprovedSources || quality.approved) && !quality.blocked && Boolean(translation.server?.currentValue?.trim());
-        }
+  const work = [];
+  const blocked = [];
+  for (const namespace of Object.values(params.mergedKeysByKeyByNamespace)) {
+    for (const key of Object.values(namespace)) {
+      if (!key.server || params.onlyExisting && !key.local || selected && !selected.has(getComparisonKey(key)))
+        continue;
+      const languages = params.targetLanguages.filter((language) => {
+        if (params.languages && !params.languages.includes(language))
+          return false;
+        const translation = key.translations[language]?.server;
+        const missing = translation?.currentValue == null || params.emptyValueString === "" && translation.currentValue === "";
+        return missing || params.strategy === "replace" || params.strategy === "not-approved" && !summarizeCliQuality(translation?.quality).approved;
+      });
+      if (!languages.length) continue;
+      const item = {
+        keyId: key.server.id,
+        key: key.key,
+        namespace: key.server.namespace,
+        languages
+      };
+      const sources = Object.entries(key.translations).flatMap(
+        ([language, translation]) => !params.targetLanguages.includes(language) && (!params.primaryLanguage || params.primaryLanguage === language) && translation.server?.currentValue?.trim() ? [
+          {
+            translationId: translation.server.id,
+            language,
+            quality: summarizeCliQuality(translation.server.quality)
+          }
+        ] : []
       );
-      if (!hasUsableSource) continue;
-      const missingLanguages = [];
-      for (const lang of targetLanguages) {
-        if (languageFilter && !languageFilter.has(lang)) continue;
-        const serverTranslation = key.translations[lang]?.server;
-        const missing = serverTranslation?.currentValue == null || emptyValueString === "" && serverTranslation.currentValue === "";
-        if (strategy === "missing") {
-          if (missing) missingLanguages.push(lang);
-        } else if (strategy === "replace" || missing || !summarizeCliQuality(serverTranslation?.quality).approved) {
-          missingLanguages.push(lang);
-        }
+      const usable = sources.filter((source) => !source.quality.blocked);
+      if (usable.some(
+        (source) => params.allowUnapprovedSources || source.quality.approved
+      )) {
+        work.push(item);
+        continue;
       }
-      if (missingLanguages.length > 0) {
-        result.push({
-          keyId: serverId,
-          key: key.key,
-          namespace: key.server?.namespace ?? key.local?.namespace ?? "",
-          languages: missingLanguages
-        });
-      }
+      blocked.push({
+        ...item,
+        reason: !sources.length ? "missing_source" : !usable.length ? "unresolved_concern" : usable.length > 1 ? "primary_source_required" : "missing_approval",
+        sources: (usable.length ? usable : sources).map(
+          ({ translationId, language }) => ({ translationId, language })
+        )
+      });
     }
   }
-  return result;
+  return { work, blocked };
+}
+
+function computeTranslationWork(params) {
+  return computeTranslationPlan(params).work;
 }
 
 function computeTranslationCoverage(input) {
@@ -13517,6 +13566,9 @@ async function collectKeysToRemove(input) {
 }
 
 function getSyncQuestionScope(input) {
+  const languages = input.languages ?? input.targetLanguages;
+  if (!input.onlyExisting && !input.selectedKeys && !input.keys?.length && !input.namespaces?.length && !input.keyIds?.length)
+    return { languages };
   const selected = input.selectedKeys ?? resolveSelectedKeys(
     input.keys ?? [],
     input.syncResult.mergedKeysByKeyByNamespace,
@@ -13525,11 +13577,301 @@ function getSyncQuestionScope(input) {
   const keyIds = Object.values(input.syncResult.mergedKeysByKeyByNamespace).flatMap((keys) => Object.values(keys)).filter(
     (key) => key.server && selected.has(getComparisonKey(key)) && (!input.onlyExisting || key.local) && (!input.keyIds?.length || input.keyIds.includes(key.server.id))
   ).flatMap((key) => key.server ? [key.server.id] : []);
-  return { keyIds, languages: input.languages ?? input.targetLanguages };
+  return { keyIds, languages };
+}
+
+function printTranslationBlockers(blocked, full) {
+  if (!blocked.length) return;
+  console.info(`
+${blocked.length} key(s) have blocked translations:`);
+  const reasons = {
+    missing_approval: "source needs AI review or explicit approval bypass",
+    unresolved_concern: "source has unresolved quality concerns",
+    missing_source: "source wording is missing",
+    primary_source_required: "choose a source with --primary-language"
+  };
+  for (const item of blocked.slice(0, full ? void 0 : 10)) {
+    console.info(
+      `  ${item.namespace ? `${item.namespace}:` : ""}${item.key} \u2192 ${item.languages.join(", ")}: ${reasons[item.reason]}`
+    );
+  }
+  if (!full && blocked.length > 10)
+    console.info("  Use --full to show all blocked keys.");
+}
+
+function sourceApprovalActions() {
+  return [
+    {
+      id: "review_sources",
+      label: "Review sources with AI",
+      recommended: true,
+      flag: "--review-sources",
+      requires: ["--max-credits"],
+      paid: true
+    },
+    {
+      id: "allow_unapproved_sources",
+      label: "Skip source approval and translate",
+      recommended: false,
+      flag: "--allow-unapproved-sources",
+      requires: [],
+      paid: true,
+      description: "Translation still costs credits; no source-review charge is added."
+    }
+  ];
+}
+
+function sourceReviewApi(context) {
+  const receipt = objectType({
+    runId: stringType().uuid(),
+    requestId: stringType().uuid(),
+    creditUnits: numberType().int().nonnegative()
+  });
+  const post = async (path, body) => requestCliJson(
+    `${context.host}/api/cli/${context.projectId}/quality/${path}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${context.accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    }
+  );
+  return {
+    find: async (requestId) => objectType({ receipt: receipt.nullable() }).parse(
+      await requestCliJson(
+        `${context.host}/api/cli/${context.projectId}/quality/requests/${requestId}`,
+        { headers: { Authorization: `Bearer ${context.accessToken}` } }
+      )
+    ).receipt,
+    estimate: async (translationIds) => objectType({
+      credit_units: numberType().int().nonnegative(),
+      targets: arrayType(objectType({ translation_id: stringType() })),
+      skipped: arrayType(objectType({ reason: stringType() }).passthrough())
+    }).parse(
+      await post("estimate", { scope: "source_wording", translationIds })
+    ),
+    submit: async (translationIds, requestId, maxCreditUnits) => receipt.parse(
+      await post("runs", {
+        scope: "source_wording",
+        translationIds,
+        requestId,
+        maxCreditUnits
+      })
+    )
+  };
+}
+
+async function prepareSyncSources(input) {
+  let plan = input.plan;
+  let allowUnapprovedSources = input.allowUnapprovedSources === true;
+  let remainingCreditUnits = input.maxCreditUnits;
+  let review;
+  let stop = false;
+  const missingApproval = plan.blocked.filter(
+    (item) => item.reason === "missing_approval"
+  );
+  const translationIds = [
+    ...new Set(
+      missingApproval.flatMap(
+        (item) => item.sources.map((source) => source.translationId)
+      )
+    )
+  ].sort();
+  if (!input.flags.json)
+    printTranslationBlockers(plan.blocked, input.flags.full);
+  const result = () => ({
+    plan,
+    allowUnapprovedSources,
+    remainingCreditUnits,
+    review,
+    stop,
+    choices: (!review?.run_id || review.status === "complete") && plan.blocked.some((item) => item.reason === "missing_approval") ? sourceApprovalActions() : []
+  });
+  if (!translationIds.length && !input.sourceReviewRun && !input.sourceReviewRequestId)
+    return result();
+  let reviewSources = input.reviewSources === true || Boolean(input.sourceReviewRun);
+  let requestId = input.sourceReviewRequestId;
+  let runId = input.sourceReviewRun;
+  let creditUnits = 0;
+  try {
+    if ((runId || requestId) && input.flags.noInteraction && remainingCreditUnits === void 0) {
+      throw new Error(
+        "Resume source review with the original --max-credits total limit."
+      );
+    }
+    const api = sourceReviewApi(input);
+    if (requestId) {
+      const receipt = await api.find(requestId);
+      if (receipt) {
+        runId = receipt.runId;
+        creditUnits = receipt.creditUnits;
+        reviewSources = true;
+      }
+    }
+    if (!translationIds.length && !runId) return result();
+    let estimate;
+    if (!reviewSources && !allowUnapprovedSources) {
+      if (input.flags.noInteraction) {
+        stop = true;
+        return result();
+      }
+      const choice = await select({
+        message: `${missingApproval.length} source(s) need approval. How should sync continue?`,
+        choices: [
+          { name: "Review sources with AI (recommended)", value: "review" },
+          { name: "Skip source approval and translate", value: "skip" },
+          { name: "Stop and keep translations blocked", value: "stop" }
+        ]
+      });
+      if (choice === "stop") {
+        stop = true;
+        return result();
+      }
+      allowUnapprovedSources = choice === "skip";
+      reviewSources = choice === "review";
+      if (allowUnapprovedSources) {
+        plan = await input.refreshPlan(true);
+        return result();
+      }
+    }
+    if (!reviewSources) return result();
+    if (!runId) {
+      if (input.flags.noInteraction && remainingCreditUnits === void 0) {
+        throw new Error(
+          "AI source review requires --max-credits covering review and translation together."
+        );
+      }
+      estimate = await api.estimate(translationIds);
+      if (!input.flags.json)
+        console.info(
+          `AI source review: ${estimate.credit_units / 100} credits; ${estimate.targets.length} source(s). Translation uses the remaining budget.`
+        );
+      if (remainingCreditUnits !== void 0 && estimate.credit_units > remainingCreditUnits) {
+        throw new Error(
+          `Source review requires ${estimate.credit_units} credit units, exceeding the remaining limit of ${remainingCreditUnits}.`
+        );
+      }
+      if (!input.flags.noInteraction && !await confirm({
+        message: `Spend up to ${estimate.credit_units / 100} credits on AI source review?`,
+        default: true
+      })) {
+        stop = true;
+        return result();
+      }
+      requestId ?? (requestId = randomUUID());
+      process.stderr.write(
+        `Source review request ID: ${requestId}. Reuse --review-sources --source-review-request-id ${requestId} with identical arguments if submission is interrupted.
+`
+      );
+      const receipt = await api.submit(
+        translationIds,
+        requestId,
+        estimate.credit_units
+      );
+      runId = receipt.runId;
+      creditUnits = receipt.creditUnits;
+      process.stderr.write(
+        `Source review run: ${runId}. Resume this sync with --source-review-run ${runId} and the original --max-credits limit.
+`
+      );
+    }
+    if (!input.flags.json)
+      console.info(`Waiting for AI source review ${runId}...`);
+    const inspected = objectType({
+      status: enumType(["complete", "failed", "timeout"]),
+      request_id: stringType().uuid(),
+      credits: objectType({ charged_units: numberType().int().nonnegative() })
+    }).passthrough().parse(await inspectQualityRun(input, runId, true, input.timeout));
+    creditUnits = inspected.credits.charged_units;
+    if (remainingCreditUnits !== void 0 && creditUnits > remainingCreditUnits) {
+      throw new Error(
+        `The existing source review charged ${creditUnits} credit units, exceeding the supplied total limit of ${remainingCreditUnits}.`
+      );
+    }
+    remainingCreditUnits = remainingCreditUnits === void 0 ? void 0 : Math.max(0, remainingCreditUnits - creditUnits);
+    review = {
+      status: inspected.status,
+      run_id: runId,
+      request_id: inspected.request_id,
+      credit_units: creditUnits,
+      resume_with: ["--source-review-run", runId],
+      next_actions: [
+        {
+          command: ["babli", "quality", "show", runId, "--wait", "--json"],
+          paid: false
+        }
+      ]
+    };
+    if (inspected.status !== "complete") {
+      stop = true;
+      return result();
+    }
+    plan = await input.refreshPlan(false);
+    if (!input.flags.json)
+      printTranslationBlockers(plan.blocked, input.flags.full);
+    return result();
+  } catch (error) {
+    stop = true;
+    review = {
+      status: "failed",
+      run_id: runId,
+      request_id: requestId,
+      credit_units: creditUnits,
+      error: serializeCliError(error),
+      ...runId ? { resume_with: ["--source-review-run", runId] } : {}
+    };
+    if (!input.flags.json)
+      console.error(`Source review failed: ${review.error?.message}`);
+    return result();
+  }
+}
+
+async function resolveSyncPrimaryLanguage(input) {
+  const { sourceLanguages, primaryLanguage } = input;
+  if (primaryLanguage !== void 0) {
+    if (!sourceLanguages.includes(primaryLanguage))
+      throw new CliRequestError({
+        code: "invalid_primary_language",
+        message: "--primary-language must name a configured source language.",
+        details: { source_languages: sourceLanguages }
+      });
+    return primaryLanguage;
+  }
+  if (sourceLanguages.length === 1) return unwrap(sourceLanguages[0]);
+  if (!sourceLanguages.length || input.noInteraction)
+    throw new CliRequestError({
+      code: "source_selection_required",
+      message: sourceLanguages.length ? "Choose --primary-language before source review or translation." : "Configure a source language before source review or translation.",
+      details: { source_languages: sourceLanguages }
+    });
+  return select({
+    message: "Which source language should this sync review and translate from?",
+    choices: sourceLanguages.map((language) => ({
+      name: language,
+      value: language
+    }))
+  });
+}
+
+function translationBlockers(blocked) {
+  return blocked.map((item) => ({
+    key_id: item.keyId,
+    key: item.key,
+    namespace: item.namespace,
+    missing_languages: item.languages,
+    reason: item.reason,
+    sources: item.sources.map((source) => ({
+      translation_id: source.translationId,
+      language: source.language
+    }))
+  }));
 }
 
 async function syncAndTranslate(input) {
   const { host, projectId, accessToken, flags } = input;
+  validateSourceApprovalOptions(input);
   const json = flags.json;
   let { syncResult } = input;
   const selectedKeys = input.keys.length > 0 || input.namespaces.length > 0 ? resolveSelectedKeys(
@@ -13591,7 +13933,8 @@ ${Bold}  Sync & Translate${Reset}
   if (pushStatus === "pushed") {
     syncResult = await input.reFetchAndSync();
   }
-  const workSet = computeTranslationWork({
+  let primaryLanguage = input.primaryLanguage;
+  const planWork = (allowUnapprovedSources) => computeTranslationPlan({
     mergedKeysByKeyByNamespace: syncResult.mergedKeysByKeyByNamespace,
     targetLanguages: input.targetLanguages,
     strategy: "missing",
@@ -13600,8 +13943,28 @@ ${Bold}  Sync & Translate${Reset}
     languages: input.languages,
     keys: input.keys,
     namespaces: input.namespaces,
-    selectedKeys
+    selectedKeys,
+    allowUnapprovedSources,
+    primaryLanguage
   });
+  const initialPlan = planWork(input.allowUnapprovedSources === true);
+  if (initialPlan.work.length || initialPlan.blocked.length || primaryLanguage !== void 0)
+    primaryLanguage = await resolveSyncPrimaryLanguage({
+      sourceLanguages: input.sourceLanguages,
+      primaryLanguage,
+      noInteraction: flags.noInteraction
+    });
+  const preparation = await prepareSyncSources({
+    ...input,
+    primaryLanguage,
+    plan: planWork(input.allowUnapprovedSources === true),
+    refreshPlan: async (allowUnapprovedSources) => {
+      syncResult = await input.reFetchAndSync();
+      return planWork(allowUnapprovedSources);
+    }
+  });
+  const blocked = preparation.plan.blocked;
+  const workSet = preparation.stop ? [] : preparation.plan.work;
   const workKeyIds = new Set(workSet.map((w) => w.keyId));
   const workLanguages = [
     ...new Set(workSet.flatMap((item) => item.languages))
@@ -13626,10 +13989,12 @@ ${Bold}  Sync & Translate${Reset}
       questionKeyIds: workKeyIds,
       languages: input.languages,
       model: input.model,
-      maxCreditUnits: input.maxCreditUnits,
+      maxCreditUnits: preparation.remainingCreditUnits,
+      allowUnapprovedSources: preparation.allowUnapprovedSources,
+      primaryLanguage,
       timeout: input.timeout
     });
-  } else if (!json) {
+  } else if (!json && !blocked.length && !preparation.stop) {
     console.info(`
   No translations needed.`);
   }
@@ -13687,8 +14052,8 @@ ${Bold}  Sync & Translate${Reset}
     translateSummary?.status === "timeout"
   );
   if (!json) printTranslationFollowUp(followUp);
+  const overallStatus = preparation.review?.status === "failed" || translateSummary?.status === "failed" ? "failed" : preparation.review?.status === "timeout" || translateSummary?.status === "timeout" ? "timeout" : blocked.length || preparation.stop ? translateSummary ? "partial" : "blocked" : "complete";
   if (json) {
-    const overallStatus = translateSummary?.status === "failed" ? "failed" : translateSummary?.status === "timeout" ? "timeout" : "complete";
     console.info(
       JSON.stringify(
         {
@@ -13696,8 +14061,11 @@ ${Bold}  Sync & Translate${Reset}
           command: "sync-and-translate",
           follow_up: followUp,
           status: overallStatus,
+          blocked: translationBlockers(blocked),
+          source_approval_choices: preparation.choices,
           job_id: translateSummary?.jobId,
           phases: {
+            source_review: preparation.review,
             push: {
               status: pushStatus,
               counts: {
@@ -13746,13 +14114,27 @@ ${Bold}  Sync & Translate${Reset}
         2
       )
     );
-    return translateSummary?.status === "failed" || translateSummary?.status === "timeout" ? 2 : 0;
+    return overallStatus === "complete" ? 0 : 2;
   }
   if (translateSummary?.status === "failed" || translateSummary?.status === "timeout") {
     const message = translateSummary.status === "timeout" ? "Translation is still running; completed results were pulled." : "Translation could not be started or finished; available results were pulled.";
     console.info(`
 ${FgYellow}${Bold}  ${message}${Reset}
 `);
+  } else if (overallStatus !== "complete") {
+    console.info(
+      `
+Sync ${overallStatus}: ${blocked.length} key(s) remain blocked.`
+    );
+    if (preparation.review?.run_id && preparation.review.status !== "complete") {
+      console.info(
+        `Inspect the source review with babli quality show ${preparation.review.run_id} --wait. Resume this scoped sync with --source-review-run ${preparation.review.run_id} and the original total credit cap.`
+      );
+    } else if (preparation.choices.length) {
+      console.info(
+        "Choose --review-sources (recommended) with --max-credits, or --allow-unapproved-sources to skip approval."
+      );
+    }
   } else {
     console.info(
       `
@@ -13760,7 +14142,7 @@ ${FgGreen}${Bold}  Done \u2014 your changes are synced.${Reset}
 `
     );
   }
-  return translateSummary?.status === "failed" || translateSummary?.status === "timeout" ? 2 : 0;
+  return overallStatus === "complete" ? 0 : 2;
 }
 function buildScoreMap(reviews) {
   const map = /* @__PURE__ */ new Map();
@@ -13822,7 +14204,19 @@ async function questionTranslateLoop(input) {
         keyId,
         languages
       }));
-      response = remainingCreditUnits === void 0 ? await requestTranslation(
+      const quality = {
+        ...input.allowUnapprovedSources ? { allowUnapprovedSources: true } : {},
+        ...input.primaryLanguage ? { primaryLanguage: input.primaryLanguage } : {}
+      };
+      response = Object.keys(quality).length ? await requestTranslation(
+        host,
+        projectId,
+        accessToken,
+        apiWork,
+        input.model,
+        remainingCreditUnits,
+        quality
+      ) : remainingCreditUnits === void 0 ? await requestTranslation(
         host,
         projectId,
         accessToken,
@@ -14060,13 +14454,16 @@ async function translateCommand(input) {
     return reportFailure(input, void 0, error);
   }
   let work;
+  let blocked;
   try {
     validateLanguages(input);
-    work = computeWork(input);
+    ({ work, blocked } = computeWork(input));
   } catch (error) {
     return reportFailure(input, void 0, error);
   }
   const summary = summarize(work, input.strategy);
+  const blockedOutput = blocked.length ? translationBlockers(blocked) : void 0;
+  if (!input.flags.json) printTranslationBlockers(blocked, input.flags.full);
   if (work.length === 0) {
     const followUp2 = input.dryRun || input.estimate ? void 0 : await readTranslationFollowUp(input, getSyncQuestionScope(input));
     if (followUp2 && !input.flags.json) printTranslationFollowUp(followUp2);
@@ -14074,14 +14471,15 @@ async function translateCommand(input) {
       emitJson({
         version: 1,
         command: "translate",
-        status: "skipped",
+        status: blocked.length ? "blocked" : "skipped",
+        blocked: blockedOutput,
         follow_up: followUp2,
         summary
       });
-    } else {
+    } else if (!blocked.length) {
       console.info(`${FgGreen}No missing translations to process.${Reset}`);
     }
-    return 0;
+    return blocked.length && !input.dryRun && !input.estimate ? 2 : 0;
   }
   if (input.dryRun) {
     if (input.flags.json) {
@@ -14089,6 +14487,7 @@ async function translateCommand(input) {
         version: 1,
         command: "translate",
         status: "dry_run",
+        blocked: blockedOutput,
         summary,
         work_items: serializeWorkItems(work)
       });
@@ -14098,7 +14497,7 @@ async function translateCommand(input) {
     return 0;
   }
   if (input.estimate) {
-    return runEstimate(input, work, summary);
+    return runEstimate(input, work, summary, blocked);
   }
   if (!input.flags.json) {
     console.info(
@@ -14150,6 +14549,7 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
         version: 1,
         command: "translate",
         status: "started",
+        blocked: blockedOutput,
         follow_up: await readTranslationFollowUp(
           input,
           { jobId: response.jobId },
@@ -14168,7 +14568,7 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
         `Run ${Bold}babli job ${response.jobId} --wait${Reset} to wait for completion.`
       );
     }
-    return 0;
+    return blocked.length ? 2 : 0;
   }
   if (!input.flags.json) {
     console.info(
@@ -14199,7 +14599,8 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
       version: 1,
       command: "translate",
       follow_up: followUp,
-      status: finalStatus.status,
+      status: finalStatus.status === "complete" && blocked.length ? "partial" : finalStatus.status,
+      blocked: blockedOutput,
       job_id: response.jobId,
       counts: {
         total: finalStatus.total,
@@ -14219,7 +14620,7 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
     });
   } else if (finalStatus.status === "complete") {
     console.info(
-      `${FgGreen}Translation complete: ${finalStatus.finished}/${finalStatus.total} processes finished.${Reset}`
+      `${FgGreen}Translation ${blocked.length ? "partially complete" : "complete"}: ${finalStatus.finished}/${finalStatus.total} processes finished; ${blocked.length} key(s) blocked.${Reset}`
     );
   } else if (finalStatus.status === "failed") {
     console.info(
@@ -14237,9 +14638,9 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
     );
   }
   if (!input.flags.json) reportFormatWarnings(finalStatus.formatWarningCount);
-  return finalStatus.status === "failed" || finalStatus.status === "timeout" ? 2 : 0;
+  return blocked.length || finalStatus.status === "failed" || finalStatus.status === "timeout" ? 2 : 0;
 }
-async function runEstimate(input, work, summary) {
+async function runEstimate(input, work, summary, blocked) {
   let estimate;
   try {
     const keys = work.map(({ keyId, languages }) => ({ keyId, languages }));
@@ -14266,7 +14667,7 @@ async function runEstimate(input, work, summary) {
     work,
     summary,
     estimate,
-    blocked: []
+    blocked
   });
 }
 function translationQuality(input) {
@@ -14337,7 +14738,7 @@ function validateLanguages(input) {
 function computeWork(input) {
   if (input.keyIds && input.keyIds.length > 0) {
     const languages = input.languages ?? input.targetLanguages;
-    if (languages.length === 0) return [];
+    if (languages.length === 0) return { work: [], blocked: [] };
     const keysById = /* @__PURE__ */ new Map();
     for (const keysInNamespace of Object.values(
       input.syncResult.mergedKeysByKeyByNamespace
@@ -14356,11 +14757,19 @@ function computeWork(input) {
     if (invalidIds.length > 0) {
       throw new Error(`Invalid key id(s): ${invalidIds.join(", ")}.`);
     }
-    return [...keysById.values()];
+    const selectedKeys = new Set([...keysById.values()].map(getComparisonKey));
+    return computeTranslationPlan({
+      ...input,
+      mergedKeysByKeyByNamespace: input.syncResult.mergedKeysByKeyByNamespace,
+      selectedKeys,
+      onlyExisting: false,
+      strategy: "replace"
+    });
   }
-  return computeTranslationWork({
+  return computeTranslationPlan({
     mergedKeysByKeyByNamespace: input.syncResult.mergedKeysByKeyByNamespace,
     allowUnapprovedSources: input.allowUnapprovedSources,
+    primaryLanguage: input.primaryLanguage,
     targetLanguages: input.targetLanguages,
     strategy: input.strategy,
     onlyExisting: input.onlyExisting,
@@ -14404,6 +14813,18 @@ function validateKeyUpdateOptions(options) {
     }
   } else if (options.dryRun) {
     throw new Error("--dry-run requires --file.");
+  }
+}
+
+async function withMutedInfo(mute, operation) {
+  if (!mute) return operation();
+  const originalInfo = console.info;
+  console.info = () => {
+  };
+  try {
+    return await operation();
+  } finally {
+    console.info = originalInfo;
   }
 }
 
@@ -14857,11 +15278,30 @@ ${agentTranslationGuidance}
   "--model <model>",
   "Translation model: production | preview",
   "production"
-).option("--max-credits <amount>", "Maximum cumulative credit charge").option("--timeout <seconds>", "Max wait time when polling", "300").addHelpText(
+).option(
+  "--max-credits <amount>",
+  "Maximum combined source-review and translation charge"
+).option(
+  "--review-sources",
+  "Review unapproved sources with AI before translating (recommended)"
+).option(
+  "--allow-unapproved-sources",
+  "Skip source approval and translate; unresolved concerns still block"
+).option(
+  "--source-review-request-id <uuid>",
+  "Recover an interrupted source review by request ID"
+).option(
+  "--source-review-run <uuid>",
+  "Resume a source review without submitting or charging again"
+).option(
+  "--primary-language <code>",
+  "Primary source language to review and translate from"
+).option("--timeout <seconds>", "Max wait time when polling", "300").addHelpText(
   "after",
   'Examples:\n  babli sync-and-translate --json --no-interaction # descriptions prepared; waits automatically; inspect follow_up afterward\n  babli sync-and-translate                         # interactive\n  babli sync-and-translate --only-existing         # skip keys not in local files\n  babli sync-and-translate --prune --json          # also archive server-only keys\n  babli sync-and-translate --namespace speech --key "mosquito.*" --max-credits 7.00'
 ).action(
   async (options) => {
+    validateSourceApprovalOptions(options);
     if (options.model !== "production" && options.model !== "preview") {
       throw new Error(`Invalid --model value: "${options.model}"`);
     }
@@ -14872,6 +15312,11 @@ ${agentTranslationGuidance}
     await run({
       action: "sync-and-translate",
       options: {
+        reviewSources: options.reviewSources,
+        allowUnapprovedSources: options.allowUnapprovedSources,
+        sourceReviewRequestId: options.sourceReviewRequestId,
+        sourceReviewRun: options.sourceReviewRun,
+        primaryLanguage: options.primaryLanguage,
         onlyExisting: options.onlyExisting === true,
         prune: options.prune === true,
         allowEmptyPrune: options.allowEmptyPrune === true,
@@ -15328,7 +15773,10 @@ async function runAction(cliInput, flags) {
     emptyValueString: parsed.emptyValueString,
     defaultFilePattern: parsed.defaultFilePattern
   };
-  const doSync = (action) => performSync(syncCtx, action, translationFilesConfig, transforms);
+  const doSync = (action) => withMutedInfo(
+    flags.json && (action.action === "push" || action.action === "pull"),
+    () => performSync(syncCtx, action, translationFilesConfig, transforms)
+  );
   if (cliInput.action === "key-rename") {
     if (cliInput.options.file !== void 0) {
       if (!cliInput.options.allowUnpushed) {
@@ -15390,6 +15838,7 @@ async function runAction(cliInput, flags) {
       flags,
       syncResult: result2,
       targetLanguages,
+      sourceLanguages: projectInfo.languages.filter((language) => language.isSource).map((language) => language.code),
       prune: cliInput.action === "sync-and-translate" && cliInput.options.prune,
       emptyValueString: parsed.emptyValueString,
       onlyExisting: cliInput.action === "sync-and-translate" ? cliInput.options.onlyExisting : false,
@@ -15399,6 +15848,13 @@ async function runAction(cliInput, flags) {
       model: cliInput.action === "sync-and-translate" ? cliInput.options.model : "production",
       maxCreditUnits: cliInput.action === "sync-and-translate" ? cliInput.options.maxCreditUnits : void 0,
       timeout: cliInput.action === "sync-and-translate" ? cliInput.options.timeout : 300,
+      ...cliInput.action === "sync-and-translate" ? {
+        reviewSources: cliInput.options.reviewSources,
+        allowUnapprovedSources: cliInput.options.allowUnapprovedSources,
+        sourceReviewRequestId: cliInput.options.sourceReviewRequestId,
+        sourceReviewRun: cliInput.options.sourceReviewRun,
+        primaryLanguage: cliInput.options.primaryLanguage
+      } : {},
       doPush: (keysToRemove) => doSync({
         action: "push",
         keysToRemove,
@@ -15448,21 +15904,12 @@ async function runAction(cliInput, flags) {
     });
     return { needPush: false, needPull: false };
   }
-  const syncCliInput = cliInput.action === "translate" ? { action: "status" } : cliInput;
-  const shouldMuteOutput = flags.json && (cliInput.action === "push" || cliInput.action === "pull");
-  const originalInfo = console.info;
-  if (shouldMuteOutput) {
-    console.info = () => {
-    };
-  }
-  let result;
-  try {
-    result = await doSync(syncCliInput);
-  } finally {
-    if (shouldMuteOutput) {
-      console.info = originalInfo;
-    }
-  }
+  const syncCliInput = cliInput.action === "translate" ? {
+    action: "status",
+    keys: cliInput.options.keys,
+    namespaces: cliInput.options.namespaces
+  } : cliInput;
+  const result = await doSync(syncCliInput);
   if (cliInput.action === "status") {
     const projectInfo = await fetchProjectInfo(host, projectId, accessToken);
     const coverage = computeTranslationCoverage({

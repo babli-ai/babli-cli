@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-08
+
+### Added
+
+- Sync can review source wording before translating. Use `--review-sources` with one `--max-credits` cap for review and translation, or explicitly select `--allow-unapproved-sources`. Interrupted reviews can resume without submitting twice.
+- `quality check --sources --translation-id <id>` reviews source wording directly.
+
+### Changed
+
+- Scoped push, pull, status, translation previews and sync load selected wording and quality information while preserving matching and deletion safeguards. Older servers retain the existing fallback.
+- Translation previews and sync explain blocked keys. Commands return exit code 2 when selected work is blocked or only partially completed; automation should handle this as incomplete work.
+
+### Fixed
+
+- Keep JSON output parseable when sync uploads changes or starts translation, including use through Dashboard's Ruby wrapper.
+- Show an actionable explanation when translation inputs change during a job.
+- Resolve the primary source language before paid review: choose the sole configured source automatically, prompt when several exist, or accept `--primary-language` in automation.
+- Recover source-review receipts after a lost submission response, including completed reviews, and support polling timeouts longer than one hour.
+- Reduce large-project sync work, load scoped writes only for their input keys, and avoid putting every project key ID into follow-up question URLs.
+
 ## [0.11.2] - 2026-11-06
 
 ### Changed

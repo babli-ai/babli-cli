@@ -80,6 +80,25 @@ estimate any required regeneration, then pass the remaining authorized budget wi
 needs an explicit decision and must never be silently unapproved. Pull again after
 corrections. Report unresolved questions and `review_status: not_requested` honestly.
 
+### Choose how to handle unapproved sources
+
+Pushing saves text without approving it. Interactive sync offers **Review sources with AI (recommended)** or **Skip source approval and translate**. A current passing AI review unlocks translation automatically; findings remain visible and unresolved concerns still block both paths.
+
+Agents make the choice explicitly:
+
+When the project has multiple source languages, sync asks interactive users to choose one before paid review. Noninteractive runs require `--primary-language <code>`; a single configured source is selected automatically. The same source is used for review and translation.
+
+```bash
+babli sync-and-translate --key 'checkout.*' --review-sources --max-credits 7.00 --json
+babli sync-and-translate --key 'checkout.*' --allow-unapproved-sources --max-credits 7.00 --json
+```
+
+The cap covers review and translation together. Review submission uses a user login token (`babli login`); project API keys retain their existing inspection-only review access. Without a choice, JSON lists `blocked` keys and `source_approval_choices`, and sync exits 2. `blocked` and `partial` do not mean successful completion. Preview commands report blockers without spending.
+
+`phases.source_review` includes the run ID, charge, and `resume_with` flags. On timeout, rerun the same scoped sync with `--source-review-run <id>` and the original total cap. This inspects the existing run without resubmitting and accounts for its charge. If submission itself is interrupted, reuse the printed `--source-review-request-id` with identical arguments and the same user login. The CLI retrieves the original receipt before estimating or submitting, even if some or all sources have already passed. Review does not automatically apply suggested corrections or bypass concerns.
+
+For a separate source review, use `babli quality check --sources --translation-id <source-translation-id> --estimate --json`, then submit the same selection with `--max-credits` and `--wait`.
+
 ### Answer questions from an agent
 
 ```bash
