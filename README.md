@@ -126,7 +126,7 @@ Answer submission requires a user token from `babli login`; project API keys can
 
 The response contains remaining questions, exact `affected_pairs`, safe `next_actions`, and the legacy `retranslationRequired` hint. Inspect or review the affected wording with the new answers; regenerate only when needed and explicitly authorized. Answering a human or AI-review question records the reply without clearing scores or requesting regeneration. Generation answers clear cached scores; earlier jobs cannot restore those scores without the saved answers in their input. Answers apply only to their key and language.
 
-Generation and saving check ICU arguments, format specifiers, select branches, explicit plural selectors, rich-text component tags, and common `{{name}}` placeholders. Locale-specific plural categories may change. Invalid output is retried during generation and rejected before saving. These checks do not establish linguistic correctness; arbitrary HTML, printf syntax, and custom template formats are not covered.
+Generation and saving do not run programmatic syntax or placeholder checks. Use AI review or human review to assess wording and placeholder correctness. Missing source wording, required source approvals, and unresolved blocking concerns still affect translation eligibility.
 
 ### Request human review
 

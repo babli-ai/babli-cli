@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import yaml from 'js-yaml';
 import PO from 'pofile';
+import Papa from 'papaparse';
 import { Parser, Language, Query } from 'web-tree-sitter';
 import path$2, { join, resolve } from 'path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -59,6 +60,45 @@ function gatherTranslationsFromMaybeNestedObject(source, projectSeparator) {
     }
   }
   return translations;
+}
+
+function processCsv(content) {
+  const { data, errors } = Papa.parse(content, {
+    delimiter: ",",
+    skipEmptyLines: true
+  });
+  const error = errors[0];
+  if (error) {
+    throw new Error(`Invalid CSV: ${error.message}`);
+  }
+  const [header, ...rows] = data;
+  const columns = header?.map((column) => column.trim().toLowerCase());
+  if (!columns || !columns.includes("key") || !columns.includes("value") || new Set(columns).size !== columns.length || columns.some((column) => !["key", "value", "description"].includes(column))) {
+    throw new Error(
+      'CSV must have "key" and "value" headers, with an optional "description" column.'
+    );
+  }
+  const keys = /* @__PURE__ */ new Map();
+  for (const [index, row] of rows.entries()) {
+    if (row.length !== columns.length) {
+      throw new Error(
+        `CSV record ${index + 2} has an unexpected number of columns.`
+      );
+    }
+    const key = row[columns.indexOf("key")];
+    const value = row[columns.indexOf("value")];
+    if (!key?.trim() || value === void 0) {
+      throw new Error(
+        `CSV record ${index + 2} must have a non-empty key and a value column.`
+      );
+    }
+    if (keys.has(key)) {
+      throw new Error(`Duplicate CSV key: "${key}".`);
+    }
+    const description = row[columns.indexOf("description")];
+    keys.set(key, { value, ...description ? { description } : {} });
+  }
+  return keys;
 }
 
 let initialized = null;
@@ -155,6 +195,10 @@ function extractObject(node) {
 }
 
 const fileProcessors = {
+  csv: async (fileContent) => ({
+    keys: processCsv(fileContent),
+    fileFormat: "csv"
+  }),
   json: async (fileContent, projectSeparator) => {
     const parsed = JSON.parse(fileContent);
     return {
@@ -261,6 +305,8 @@ async function detectAndProcessTranslationFile({
   langCode
 }) {
   switch (format) {
+    case "csv":
+      return fileProcessors.csv(content, projectSeparator);
     case "json": {
       const processor = fileProcessors.json;
       return processor(content, projectSeparator, fileOptions, langCode);
@@ -5201,7 +5247,8 @@ const zFileFormat = enumType([
   "neon",
   "flutterArb",
   "typescript",
-  "po"
+  "po",
+  "csv"
 ]);
 const defaultHost = "https://www.babli.ai";
 const zYamlOptions = objectType({
@@ -5535,6 +5582,9 @@ function detectFormatFromExtension(fileName) {
   }
   if (extension === "po") {
     return "po";
+  }
+  if (extension?.toLowerCase() === "csv") {
+    return "csv";
   }
   return void 0;
 }
@@ -5964,6 +6014,8 @@ function findLanguageCodeInFileName(fileName, customLanguageCodes, limited = fal
   return null;
 }
 
+const keyDescriptionUploadFilename = "_descriptions.json";
+
 const supportedExtensions = /* @__PURE__ */ new Set([
   "json",
   "arb",
@@ -5998,6 +6050,7 @@ async function walkDirectory(fileAPI, basePath, currentPath, translationFiles, s
     }
     const pathParts = filePath.split("/");
     const fileName = pathParts[pathParts.length - 1];
+    if (fileName === keyDescriptionUploadFilename) continue;
     const directoryPath = pathParts.slice(0, -1).join("/");
     const extension = getFileExtension(fileName);
     if (extension && supportedExtensions.has(extension)) {
@@ -8712,6 +8765,9 @@ async function gatherLocalFiles(translationFilesConfig, fileAPI, cwd) {
       cwd
     });
     for (const filePath of foundFilePaths) {
+      if (filePath.split("/").pop() === keyDescriptionUploadFilename && filePath !== pathPattern) {
+        continue;
+      }
       let foundLang = null;
       if (pathPattern.includes("{{lang}}")) {
         const langRegex = langFilePathToRegex(
@@ -8950,6 +9006,8 @@ function extractPattern(filePath, languageCode) {
 function isFormatAutoDetectable(pattern, format) {
   const extension = pattern.split(".").pop();
   switch (format) {
+    case "csv":
+      return extension?.toLowerCase() === "csv";
     case "json":
       return extension === "json";
     case "yaml":
@@ -9254,6 +9312,17 @@ function makeGetLangCode(languages) {
   return getLangCode;
 }
 
+function generateCsv(keys, fileOptions) {
+  const data = keys.filter(
+    ([, translation]) => translation.value != null || fileOptions.pullWithEmptyValues
+  ).map(([key, translation]) => [
+    key,
+    translation.value ?? "",
+    translation.description ?? ""
+  ]);
+  return Papa.unparse({ fields: ["key", "value", "description"], data });
+}
+
 function generateFlutterArb(keys, localeCode) {
   const arbStructure = {};
   arbStructure["@@locale"] = localeCode;
@@ -9395,6 +9464,8 @@ function generateYaml(keys, localeCode, fileOptions) {
 
 function generateTranslationFile(keys, format, localeCode, fileOptions) {
   switch (format) {
+    case "csv":
+      return generateCsv(keys, fileOptions);
     case "json":
       return generateJson(keys, localeCode, fileOptions);
     case "yaml":

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-18
+
+### Added
+
+- Sync CSV translation files explicitly configured in `babli.json`. Use one file per language with `key,value` headers and an optional `description` column.
+
+### Fixed
+
+- Skip `_descriptions.json` during automatic discovery and when it matches a translation file pattern, so key descriptions stay separate from translations.
+
 ## [0.12.0] - 2026-11-08
 
 ### Added
