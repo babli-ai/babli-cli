@@ -4725,12 +4725,19 @@ function qualityFields(quality) {
     ...quality?.allowUnapprovedSources ? { allowUnapprovedSources: true } : {}
   };
 }
-async function fetchJobStatus(host, projectId, accessToken, jobId) {
-  const result = await requestCliJson(`${host}/api/cli/${projectId}/job/${jobId}`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
+async function fetchJobStatus(host, projectId, accessToken, jobId, includeProcesses = false) {
+  const result = await requestCliJson(
+    `${host}/api/cli/${projectId}/job/${jobId}${includeProcesses ? "?processes=1" : ""}`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      }
     }
-  });
+  );
+  if (includeProcesses && !result.processes)
+    throw new Error(
+      "This server does not support listing translation processes."
+    );
   return { ...result, failures: result.failures ?? [] };
 }
 async function fetchQuestions(host, projectId, accessToken, scope) {
@@ -11473,6 +11480,11 @@ function summarizeSyncStatus(status) {
   };
 }
 
+const jobHistoryPage = objectType({
+  limit: coerce.number().int().min(1).max(100).default(20),
+  offset: coerce.number().int().min(0).max(2147483647).default(0)
+});
+
 const agentTranslationGuidance = `Agents must prepare descriptions before translation.
 1. Push new keys and source changes first: babli push --json --no-interaction.
 2. Export current context: babli key export --language <source-code> --output keys.json.
@@ -11954,7 +11966,7 @@ Next steps:`);
 ${agentTranslationGuidance}`);
 }
 
-async function pollTranslationJob(host, projectId, accessToken, jobId, timeoutSeconds, flags) {
+async function pollTranslationJob(host, projectId, accessToken, jobId, timeoutSeconds, flags, includeProcesses = false) {
   const startTime = Date.now();
   const timeoutMs = timeoutSeconds * 1e3;
   let interval = 2e3;
@@ -11973,10 +11985,18 @@ async function pollTranslationJob(host, projectId, accessToken, jobId, timeoutSe
         creditsCharged: lastStatus?.creditsCharged,
         creditsRefunded: lastStatus?.creditsRefunded,
         creditsNet: lastStatus?.creditsNet,
-        resultCounts: lastStatus?.resultCounts
+        resultCounts: lastStatus?.resultCounts,
+        failedKeys: lastStatus?.failedKeys,
+        processes: lastStatus?.processes
       };
     }
-    const status = await fetchJobStatus(host, projectId, accessToken, jobId);
+    const status = await fetchJobStatus(
+      host,
+      projectId,
+      accessToken,
+      jobId,
+      includeProcesses
+    );
     lastStatus = status;
     if (!flags.json) {
       process.stdout.write(
@@ -11996,6 +12016,14 @@ async function pollTranslationJob(host, projectId, accessToken, jobId, timeoutSe
 }
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function printJobProcesses(processes) {
+  for (const process of processes) {
+    console.info(
+      `  ${process.process_id}  ${process.status}  ${process.created_at ?? "unknown start"}${process.finished_at ? ` \u2192 ${process.finished_at}` : ""}`
+    );
+  }
 }
 
 function printTranslationFollowUp(followUp) {
@@ -12137,6 +12165,10 @@ function serializeChargedCredits(credits) {
 function serializeTranslationJobReport(status) {
   return {
     result_counts: status.resultCounts,
+    failed_keys: status.failedKeys?.map(({ keyId, languageCode }) => ({
+      key_id: keyId,
+      language_code: languageCode
+    })),
     credits_charged: serializeChargedCredits(status.creditsCharged),
     credits_refunded: serializeChargedCredits(status.creditsRefunded),
     credits_net: serializeChargedCredits(status.creditsNet)
@@ -12150,12 +12182,14 @@ async function jobCommand(ctx, options) {
     ctx.accessToken,
     options.jobId,
     options.timeout,
-    ctx.flags
+    ctx.flags,
+    options.processes
   ) : await fetchJobStatus(
     ctx.host,
     ctx.projectId,
     ctx.accessToken,
-    options.jobId
+    options.jobId,
+    options.processes
   );
   const followUp = await readTranslationFollowUp(
     ctx,
@@ -12177,6 +12211,7 @@ async function jobCommand(ctx, options) {
             failed: status.failed,
             progress: status.progress
           },
+          processes: options.processes ? status.processes : void 0,
           process_counts: {
             total: status.total,
             finished: status.finished,
@@ -12219,9 +12254,40 @@ async function jobCommand(ctx, options) {
       console.info(`  ${failure.process_id}: ${failure.message}`);
     }
   }
+  if (options.processes && status.processes)
+    printJobProcesses(status.processes);
   printTranslationJobReport(status);
   reportFormatWarnings(status.formatWarningCount);
   return status.status === "failed" || status.status === "timeout" ? 2 : 0;
+}
+
+async function jobListCommand(ctx, options) {
+  const query = new URLSearchParams({
+    limit: String(options.limit),
+    offset: String(options.offset)
+  });
+  if (options.processes) query.set("processes", "1");
+  const page = await requestCliJson(
+    `${ctx.host}/api/cli/${ctx.projectId}/job?${query}`,
+    {
+      headers: { Authorization: `Bearer ${ctx.accessToken}` }
+    }
+  );
+  if (ctx.flags.json) {
+    printJson({ version: 1, command: "job_list", status: "ok", ...page });
+    return;
+  }
+  if (!page.jobs.length) console.info("No translation jobs on this page.");
+  for (const job of page.jobs) {
+    const scope = job.scope ? `  ${job.scope.keys} keys (${job.scope.languages.join(", ")})` : "";
+    const counts = job.process_counts;
+    console.info(
+      `${job.job_id}  ${job.created_at ?? "unknown date"}  ${job.status}  ${counts.finished}/${counts.total} processes finished, ${counts.failed} failed${scope}`
+    );
+    if (job.processes) printJobProcesses(job.processes);
+  }
+  if (page.next_offset !== null)
+    console.info(`Next page: --offset ${page.next_offset}`);
 }
 
 var __defProp = Object.defineProperty;
@@ -14962,7 +15028,8 @@ Commands:
 
   translate                    Request AI translations for missing translations
   translate --key-id <id>      Request AI translations for one remote key
-  job <jobId>                  Check the status of a translation job
+  job list                     List recent translation jobs
+  job <jobId>                  Check status, add --processes to list batches
 
   quality check|show|decide|retry  Review translations through your coding agent
   questions                    Show and answer translation questions
@@ -15232,7 +15299,10 @@ ${agentTranslationGuidance}
     });
   }
 );
-program.command("job").description("Check the status of a translation job").argument("<jobId>", "Job id returned by translate").option("--wait", "Block and poll until the job finishes").option("--timeout <seconds>", "Max wait time when polling", "300").addHelpText(
+const jobs = program.command("job").description("Check the status of a translation job").argument("<jobId>", "Job id returned by translate").option(
+  "--processes",
+  "Include individual process IDs, statuses, and timestamps"
+).option("--wait", "Block and poll until the job finishes").option("--timeout <seconds>", "Max wait time when polling", "300").addHelpText(
   "after",
   "\nExamples:\n  babli job job_123             # check status once\n  babli job job_123 --wait      # poll until finished\n  babli job job_123 --json      # JSON output for agents"
 ).action(
@@ -15243,10 +15313,24 @@ program.command("job").description("Check the status of a translation job").argu
     }
     await run({
       action: "job",
-      options: { jobId, timeout, wait: options.wait === true }
+      options: {
+        jobId,
+        timeout,
+        wait: options.wait === true,
+        processes: options.processes === true
+      }
     });
   }
 );
+withGlobalOptions(jobs.command("list")).description("List recent translation jobs in the configured project").option("--limit <count>", "Jobs per page (1\u2013100, default 20)").option("--offset <count>", "Start at this offset (default 0)").option("--processes", "Include the individual processes in each job").action(async (options, command) => {
+  await run({
+    action: "job-list",
+    options: {
+      ...jobHistoryPage.parse(options),
+      processes: command.optsWithGlobals().processes === true
+    }
+  });
+});
 const keyCommand = program.command("key").description("Manage remote project keys");
 withGlobalOptions(keyCommand.command("list")).description("List remote keys").option("--query <text>", "Filter by key text").option("--include-archived", "Include archived keys").action(async (options) => {
   await run({
@@ -15770,6 +15854,10 @@ async function runAction(cliInput, flags) {
       );
     const exitCode = await qualityCommand(surgicalCtx, cliInput.input);
     return { needPush: false, needPull: false, exitCode };
+  }
+  if (cliInput.action === "job-list") {
+    await jobListCommand(surgicalCtx, cliInput.options);
+    return { needPush: false, needPull: false };
   }
   if (cliInput.action === "job") {
     const exitCode = await jobCommand(surgicalCtx, cliInput.options);

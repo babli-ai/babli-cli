@@ -63,6 +63,15 @@ coverage. Push new local keys before requesting an exact estimate. If waiting ti
 out, use the returned job id with `babli job <job_id> --wait`; do not dispatch
 `translate` again.
 
+Use `babli job list --json` to find recent translation submissions in the configured
+project, newest first. Each job shows its ID, creation time, status, process counts,
+and the requested key count and target languages when available. The default page has 20 jobs.
+Set `--limit` (1–100) and pass `next_offset` to `--offset` for the next page.
+
+Use `babli job <job_id> --processes --json` to see each batch’s ID, status, and
+timestamps. Add `--processes` to `job list` to include those batches under every
+job on the page. Both commands also support human-readable output.
+
 With `translate --wait --json`, the submitted job ID is printed immediately to
 stderr; stdout remains one final JSON object. `result_counts` counts unique
 key/language pairs: `saved` includes `changed`, `unchanged`, `unapplied` (stored
@@ -71,6 +80,15 @@ Unsaved pairs are `pending`, `failed`, or `missing` (finished processes with no
 stored result). Identical translations reuse their existing version and remain
 billable; an old version timestamp does not mean the result was lost. Do not
 retry unchanged results merely to obtain a new version.
+
+`failed_keys` lists one `{ "key_id": "...", "language_code": "es" }` per failed
+key/language pair. Its length equals `result_counts.failed`. For a scoped retry,
+group these IDs by language and pass each group to `translate --key-ids` with
+its matching `--languages` value. Keep the original strategy (including
+`--strategy replace` for replacements), source language, and source-approval
+settings. Pass the remaining budget to `--max-credits` for each retry.
+An empty list means zero failed pairs. Older servers and jobs with
+unidentifiable scope may omit the field.
 
 `credits_charged` is the original debit, `credits_refunded` is the cumulative
 refund, and `credits_net` is the remaining charge. Waited commands report the

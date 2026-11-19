@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-20
+
+### Added
+
+- Use `babli job list` to find recent translation jobs in the configured project. Results include job IDs, statuses, batch counts, and the requested translation scope when available. Use `--limit` and `--offset` to browse older jobs.
+- Add `--processes` to `babli job <job_id>` or `babli job list` to show each batch’s ID, status, and timestamps.
+- JSON reports from `babli job` and `babli translate --wait` include failed key and language pairs when available, so you can retry only the affected translations.
+
 ## [0.14.1] - 2026-11-19
 
 ### Fixed
