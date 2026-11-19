@@ -11970,7 +11970,10 @@ async function pollTranslationJob(host, projectId, accessToken, jobId, timeoutSe
         failed: lastStatus?.failed ?? 0,
         failures: lastStatus?.failures ?? [],
         formatWarningCount: lastStatus?.formatWarningCount,
-        creditsCharged: lastStatus?.creditsCharged
+        creditsCharged: lastStatus?.creditsCharged,
+        creditsRefunded: lastStatus?.creditsRefunded,
+        creditsNet: lastStatus?.creditsNet,
+        resultCounts: lastStatus?.resultCounts
       };
     }
     const status = await fetchJobStatus(host, projectId, accessToken, jobId);
@@ -12005,6 +12008,20 @@ function printTranslationFollowUp(followUp) {
     );
   }
   for (const action of followUp.next_actions) console.info(action.reason);
+}
+
+function printTranslationJobReport(status) {
+  const counts = status.resultCounts;
+  if (counts) {
+    console.info(
+      `Results: ${counts.saved}/${counts.total} key/language pairs saved (${counts.changed} changed, ${counts.unchanged} unchanged, ${counts.unapplied} unapplied, ${counts.unknown} unknown); ${counts.pending} pending, ${counts.failed} failed, ${counts.missing} missing.`
+    );
+  }
+  if (status.creditsCharged && status.creditsRefunded && status.creditsNet) {
+    console.info(
+      `Credits: ${(status.creditsCharged.total / 100).toFixed(2)} charged, ${(status.creditsRefunded.total / 100).toFixed(2)} refunded, ${(status.creditsNet.total / 100).toFixed(2)} net.`
+    );
+  }
 }
 
 function buildTranslationFollowUp(questions, scope = {}) {
@@ -12106,6 +12123,26 @@ function reportFormatWarnings(count) {
   }
 }
 
+function serializeChargedCredits(credits) {
+  if (!credits) return void 0;
+  return {
+    units: credits.total,
+    monthly_units: credits.monthly,
+    persistent_units: credits.persistent,
+    unit_scale: 100,
+    display: credits.total / 100
+  };
+}
+
+function serializeTranslationJobReport(status) {
+  return {
+    result_counts: status.resultCounts,
+    credits_charged: serializeChargedCredits(status.creditsCharged),
+    credits_refunded: serializeChargedCredits(status.creditsRefunded),
+    credits_net: serializeChargedCredits(status.creditsNet)
+  };
+}
+
 async function jobCommand(ctx, options) {
   const status = options.wait ? await pollTranslationJob(
     ctx.host,
@@ -12145,13 +12182,7 @@ async function jobCommand(ctx, options) {
             finished: status.finished,
             failed: status.failed
           },
-          credits_charged: status.creditsCharged ? {
-            units: status.creditsCharged.total,
-            monthly_units: status.creditsCharged.monthly,
-            persistent_units: status.creditsCharged.persistent,
-            unit_scale: 100,
-            display: status.creditsCharged.total / 100
-          } : void 0,
+          ...serializeTranslationJobReport(status),
           failures: status.failures.length > 0 ? status.failures : void 0,
           format_warning_count: status.formatWarningCount ?? 0
         },
@@ -12188,6 +12219,7 @@ async function jobCommand(ctx, options) {
       console.info(`  ${failure.process_id}: ${failure.message}`);
     }
   }
+  printTranslationJobReport(status);
   reportFormatWarnings(status.formatWarningCount);
   return status.status === "failed" || status.status === "timeout" ? 2 : 0;
 }
@@ -14638,7 +14670,9 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
     }
     return blocked.length ? 2 : 0;
   }
-  if (!input.flags.json) {
+  if (input.flags.json) {
+    console.error(`Job started: ${response.jobId}`);
+  } else {
     console.info(
       `${Dim}Job started: ${response.jobId} (${response.numberOfProcesses} processes)${Reset}`
     );
@@ -14682,7 +14716,10 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
       },
       summary,
       billing: response.numberOfBillableProcesses === void 0 ? void 0 : { billable_processes: response.numberOfBillableProcesses },
-      credits_charged: serializeChargedCredits(response.creditsCharged),
+      ...serializeTranslationJobReport({
+        ...finalStatus,
+        creditsCharged: finalStatus.creditsCharged ?? response.creditsCharged
+      }),
       failures: finalStatus.failures.length > 0 ? finalStatus.failures : void 0,
       format_warning_count: finalStatus.formatWarningCount ?? 0
     });
@@ -14705,7 +14742,10 @@ ${Bold}Translating ${summary.keys} key(s), ${summary.language_pairs} language pa
       `Run ${Bold}babli job ${response.jobId} --wait${Reset} to keep waiting.`
     );
   }
-  if (!input.flags.json) reportFormatWarnings(finalStatus.formatWarningCount);
+  if (!input.flags.json) {
+    printTranslationJobReport(finalStatus);
+    reportFormatWarnings(finalStatus.formatWarningCount);
+  }
   return blocked.length || finalStatus.status === "failed" || finalStatus.status === "timeout" ? 2 : 0;
 }
 async function runEstimate(input, work, summary, blocked) {
@@ -14746,16 +14786,6 @@ function translationQuality(input) {
     referenceMode: input.referenceMode,
     ...input.allowUnapprovedSources ? { allowUnapprovedSources: true } : {},
     ...input.strategy === "replace" ? { replaceExisting: true } : {}
-  };
-}
-function serializeChargedCredits(credits) {
-  if (!credits) return void 0;
-  return {
-    units: credits.total,
-    monthly_units: credits.monthly,
-    persistent_units: credits.persistent,
-    unit_scale: 100,
-    display: credits.total / 100
   };
 }
 function reportFailure(input, jobId, err) {

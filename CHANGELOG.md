@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-19
+
+### Fixed
+
+- Show saved, changed, unchanged, unapplied, pending, failed, and missing translation counts in `translate --wait` and `job`. Identical translations reuse their existing version instead of appearing lost; legacy results without application evidence are reported as unknown.
+- Report refunded credits and net charges alongside the original charge, including the last observed amounts when waiting times out.
+- Print the submitted job ID immediately to stderr in JSON wait mode, so interrupted waits can resume without submitting another paid job. Stdout remains a single JSON object.
+
 ## [0.14.0] - 2026-11-19
 
 ### Changed

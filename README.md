@@ -1,4 +1,5 @@
-> Read-only mirror of the published `babli` CLI. Source lives in the monorepo (infi-pc/babli). Install with `npm i -g babli`.
+> Read-only mirror of the published `babli` CLI. Source lives in the monorepo
+> (infi-pc/babli). Install with `npm i -g babli`.
 
 # Babli CLI
 
@@ -61,6 +62,20 @@ This is required agent guidance; the CLI does not automatically enforce descript
 coverage. Push new local keys before requesting an exact estimate. If waiting times
 out, use the returned job id with `babli job <job_id> --wait`; do not dispatch
 `translate` again.
+
+With `translate --wait --json`, the submitted job ID is printed immediately to
+stderr; stdout remains one final JSON object. `result_counts` counts unique
+key/language pairs: `saved` includes `changed`, `unchanged`, `unapplied` (stored
+candidates), and `unknown` (legacy results without application evidence).
+Unsaved pairs are `pending`, `failed`, or `missing` (finished processes with no
+stored result). Identical translations reuse their existing version and remain
+billable; an old version timestamp does not mean the result was lost. Do not
+retry unchanged results merely to obtain a new version.
+
+`credits_charged` is the original debit, `credits_refunded` is the cumulative
+refund, and `credits_net` is the remaining charge. Waited commands report the
+latest observed amounts, including on timeout. Older servers may omit the new
+fields; legacy jobs without identifiable scope may omit `result_counts`.
 
 `translate --wait`, `job`, and `sync-and-translate` return `follow_up`. Generation
 completion does not mean questions are resolved or linguistic review happened.
