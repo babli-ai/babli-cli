@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-19
+
+### Changed
+
+- CSV sync uses exactly `key` and `value` columns. Remove the legacy `description` column before syncing existing CSV files.
+
 ## [0.13.0] - 2026-11-18
 
 ### Added

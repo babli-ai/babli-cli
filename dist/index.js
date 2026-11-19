@@ -73,9 +73,11 @@ function processCsv(content) {
   }
   const [header, ...rows] = data;
   const columns = header?.map((column) => column.trim().toLowerCase());
-  if (!columns || !columns.includes("key") || !columns.includes("value") || new Set(columns).size !== columns.length || columns.some((column) => !["key", "value", "description"].includes(column))) {
+  const keyColumn = columns?.indexOf("key") ?? -1;
+  const valueColumn = columns?.indexOf("value") ?? -1;
+  if (columns?.length !== 2 || keyColumn < 0 || valueColumn < 0) {
     throw new Error(
-      'CSV must have "key" and "value" headers, with an optional "description" column.'
+      'CSV must have exactly "key" and "value" headers. Remove other columns before importing.'
     );
   }
   const keys = /* @__PURE__ */ new Map();
@@ -85,8 +87,8 @@ function processCsv(content) {
         `CSV record ${index + 2} has an unexpected number of columns.`
       );
     }
-    const key = row[columns.indexOf("key")];
-    const value = row[columns.indexOf("value")];
+    const key = row[keyColumn];
+    const value = row[valueColumn];
     if (!key?.trim() || value === void 0) {
       throw new Error(
         `CSV record ${index + 2} must have a non-empty key and a value column.`
@@ -95,8 +97,7 @@ function processCsv(content) {
     if (keys.has(key)) {
       throw new Error(`Duplicate CSV key: "${key}".`);
     }
-    const description = row[columns.indexOf("description")];
-    keys.set(key, { value, ...description ? { description } : {} });
+    keys.set(key, { value });
   }
   return keys;
 }
@@ -9315,12 +9316,8 @@ function makeGetLangCode(languages) {
 function generateCsv(keys, fileOptions) {
   const data = keys.filter(
     ([, translation]) => translation.value != null || fileOptions.pullWithEmptyValues
-  ).map(([key, translation]) => [
-    key,
-    translation.value ?? "",
-    translation.description ?? ""
-  ]);
-  return Papa.unparse({ fields: ["key", "value", "description"], data });
+  ).map(([key, translation]) => [key, translation.value ?? ""]);
+  return Papa.unparse({ fields: ["key", "value"], data });
 }
 
 function generateFlutterArb(keys, localeCode) {
